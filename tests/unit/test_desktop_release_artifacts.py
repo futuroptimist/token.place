@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import plistlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -16,7 +18,7 @@ def _load_release_artifact_validator():
     import importlib.util
 
     script_path = Path('scripts/validate_desktop_tauri_release_artifacts.py')
-    spec = importlib.util.spec_from_file_location('validate_desktop_tauri_release_artifacts', script_path)
+    spec = importlib.util.spec_from_file_location('scripts.validate_desktop_tauri_release_artifacts', script_path)
     assert spec is not None
     assert spec.loader is not None
     validator = importlib.util.module_from_spec(spec)
@@ -54,7 +56,7 @@ def test_build_job_caches_runner_pip_only_on_macos_without_masking_failures() ->
     required_fail_closed_steps = (
         'Setup Python',
         'Build Tauri bundles',
-        'Validate macOS staged artifact guardrails',
+        'Validate macOS signed and notarized artifacts',
         'Validate Windows MSI and NSIS artifact contents',
     )
     assert all('continue-on-error' not in steps_by_name[name] for name in required_fail_closed_steps)
@@ -86,55 +88,296 @@ def test_tauri_icon_set_references_expected_files() -> None:
     assert expected.issubset(icons)
 
 
-def test_workflow_sets_explicit_dmg_volume_name() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
+def test_release_script_sets_explicit_dmg_volume_name() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
     assert 'hdiutil create -volname "token.place desktop"' in text
 
 
-def test_workflow_stages_dmg_directory_with_app_readme_and_applications_symlink() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"' in text
-    assert 'cp -R "${app_path}" "${dmg_stage_dir}/"' in text
-    assert 'cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"' in text
-    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in text
-    assert '-srcfolder "${dmg_stage_dir}"' in text
-    assert '-srcfolder "${app_path}"' not in text
+def test_release_script_uses_macos_base64_decode_flag() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'decode_base64()' in text
+    assert text.count('/usr/bin/base64 -D') == 1
+    assert text.count('| decode_base64 >') == 2
+    assert 'base64 --decode' not in text
+
+
+def test_workflow_stages_dmg_with_stapled_app_and_applications_symlink() -> None:
+    workflow = WORKFLOW.read_text(encoding='utf-8')
+    script = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"' in workflow
+    assert 'ditto "${app_path}" "${dmg_stage_dir}/$(basename "${app_path}")"' in script
+    assert script.index('xcrun stapler staple "${app_path}"') < script.index('ditto "${app_path}"')
+    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in script
+    assert '-srcfolder "${dmg_stage_dir}"' in script
 
 
 def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'Expected exactly one staged macOS .dmg in release-artifacts' in text
+    assert 'exactly one staged macOS .dmg' in text
 
 
-def test_workflow_uses_ad_hoc_signing_fallback_without_paid_secrets() -> None:
+def test_workflow_fails_closed_and_runs_notarization_before_checksums() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
-    assert "export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" in text
-    assert "export APPLE_SIGNING_IDENTITY='-'" in text
-    assert 'using ad-hoc signing for preview/dev-only macOS artifacts' in text
+    script = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert "TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" not in text
+    for secret in (
+        'APPLE_SIGNING_IDENTITY', 'APPLE_CERTIFICATE_P12_BASE64',
+        'APPLE_CERTIFICATE_PASSWORD', 'APPLE_NOTARY_KEY_P8_BASE64',
+        'APPLE_NOTARY_KEY_ID', 'APPLE_NOTARY_ISSUER_ID',
+    ):
+        assert f'secrets.{secret}' in text
+        assert secret in script
+    assert text.index('sign_and_notarize_macos_release.sh') < text.index('Generate SHA256 checksums')
+    assert '--require-gatekeeper-ready' in text
+    assert "if: always() && runner.os == 'macOS'" in text
+    assert 'apple-notarization-logs' in text
 
 
-def test_workflow_does_not_gate_release_on_notary_profile() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed' in text
-    assert 'skipping strict Gatekeeper notarization enforcement' in text
-    assert 'signing_flag="--expect-signing"' in text
+def test_macos_release_script_signs_inside_out_and_staples_app_and_dmg() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'codesign --deep' not in text
+    assert '--options runtime --timestamp' in text
+    for extension in ('framework', 'xpc', 'appex', 'bundle', 'plugin', 'app'):
+        assert f"-name '*.{extension}'" in text
+    assert 'file -b "${candidate}"' in text
+    assert text.count('xcrun stapler staple') == 2
+    assert text.count('xcrun stapler validate') == 2
+    assert text.count('submit_and_record') == 3  # definition plus app and final DMG
+    assert 'status}" != "Accepted"' in text
+    assert 'trap cleanup EXIT' in text
+    assert 'rm -rf "${private_dir}"' in text
 
 
-def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'preview_notice_name="README BEFORE OPENING.txt"' in text
-    assert 'README-macos-apple-silicon-preview.txt' in text
-    assert 'This preview build is ad-hoc signed and not notarized.' in text
-    assert 'This preview build is signed with the configured Apple signing identity, but it is not notarized.' in text
-    assert 'This preview build is ad-hoc signed and not notarized for public Gatekeeper trust.' not in text
-    assert 'Apple could not verify' in text
-    assert 'token.place desktop' in text
-    assert 'click Done' in text
-    assert 'System Settings -> Privacy & Security' in text
-    assert 'Open Anyway / Allow / Open for token.place desktop' in text
-    assert 'Control-click (right-click) the app and choose Open when available.' in text
-    assert 'System Settings -> Privacy & Security' in text
-    assert 'paid Developer ID signing + notarization' in text
+def test_macos_release_script_requires_apple_notarization_log() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    log_command = 'xcrun notarytool log "${submission_id}" --output-format json'
+    assert f'if ! {log_command}' in text
+    assert f'{log_command}' in text
+    assert '> "${notary_log_dir}/${label}-log.json"; then' in text
+    assert 'Failed to retain the Apple notarization log' in text
+    assert 'log.json" || true' not in text
+
+
+def test_validator_enforces_gatekeeper_release_evidence() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert '--require-gatekeeper-ready' in text
+    assert 'Authority=Developer ID Application:' in text
+    assert 'hardened runtime is missing' in text
+    assert 'secure timestamp is missing' in text
+    assert 'com.apple.security.get-task-allow' in text
+    assert '["xcrun", "stapler", "validate", str(app_path)]' in text
+    assert 'context:primary-signature' in text
+
+
+@pytest.mark.parametrize('timestamp_line', ['Timestamp=Sep 19, 2026 at 05:00:00', 'Signed Time=Sep 19, 2026 at 05:00:00'])
+def test_gatekeeper_validation_accepts_codesign_timestamp_formats(monkeypatch, tmp_path, timestamp_line) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: (
+        f'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\n{timestamp_line}'
+        if cmd[:3] == ['codesign', '--display', '--verbose=4'] else ''
+    ))
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_rejects_missing_secure_timestamp(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)',
+    )
+
+    with pytest.raises(SystemExit, match='secure timestamp is missing'):
+        validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_discovers_macho_leaf_and_excludes_non_code_and_symlink(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    macho = app / 'helper'
+    macho.write_bytes(b'macho')
+    non_code = app / 'README.txt'
+    non_code.write_text('documentation', encoding='utf-8')
+    symlink = app / 'helper-link'
+    symlink.symlink_to(macho.name)
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    subprocess_calls = []
+    tool_calls = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        subprocess_calls.append(cmd)
+        if cmd[0] == 'file':
+            description = 'Mach-O 64-bit executable' if Path(cmd[-1]) == macho else 'ASCII text'
+            return subprocess.CompletedProcess(cmd, 0, description, '')
+        return subprocess.CompletedProcess(cmd, 0, b'', b'')
+
+    def fake_tool(cmd):
+        tool_calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_subprocess_run)
+    monkeypatch.setattr(validator, '_run', fake_tool)
+
+    validator._validate_gatekeeper_ready(app)
+
+    displayed_paths = [Path(call[-1]) for call in tool_calls if call[:3] == ['codesign', '--display', '--verbose=4']]
+    assert set(displayed_paths) == {app, macho}
+    assert len(displayed_paths) == 2
+    inspected_paths = [Path(call[-1]) for call in subprocess_calls if call[0] == 'file']
+    assert set(inspected_paths) == {macho, non_code}
+    assert len(inspected_paths) == 2
+    assert symlink not in inspected_paths
+
+
+@pytest.mark.parametrize(
+    ('details', 'message'),
+    [
+        ('flags=0x10000(runtime)\nTimestamp=now', 'not signed by Developer ID Application'),
+        ('Authority=Developer ID Application: Example\nTimestamp=now', 'hardened runtime is missing'),
+        ('Authority=Developer ID Application: Example\nflags=0x10000(runtime)', 'secure timestamp is missing'),
+    ],
+)
+def test_gatekeeper_validation_rejects_invalid_codesign_evidence(monkeypatch, tmp_path, details, message) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: details)
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    ('returncode', 'entitlement_bytes', 'message'),
+    [
+        (1, b'', 'unable to inspect release entitlements'),
+        (0, b'not a plist', 'invalid release entitlements'),
+        (
+            0,
+            plistlib.dumps({'com.apple.security.get-task-allow': True}),
+            'forbidden get-task-allow entitlement',
+        ),
+    ],
+)
+def test_gatekeeper_validation_rejects_unsafe_entitlements(
+    monkeypatch, tmp_path, returncode, entitlement_bytes, message,
+) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, returncode, entitlement_bytes, b''),
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    'entitlement_bytes',
+    [b'', plistlib.dumps({}), plistlib.dumps({'com.apple.security.get-task-allow': False})],
+)
+def test_gatekeeper_validation_permits_empty_or_false_entitlements(monkeypatch, tmp_path, entitlement_bytes) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, entitlement_bytes, b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_checks_app_and_dmg_with_exact_commands(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    dmg = tmp_path / 'Example.dmg'
+    dmg.write_bytes(b'dmg')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    calls = []
+
+    def fake_tool(cmd):
+        calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator, '_run', fake_tool)
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app, dmg)
+
+    assert calls == [
+        ['codesign', '--display', '--verbose=4', str(app)],
+        ['xcrun', 'stapler', 'validate', str(app)],
+        ['spctl', '--assess', '--verbose=4', '--type', 'execute', str(app)],
+        ['codesign', '--verify', '--strict', '--verbose=4', str(dmg)],
+        ['xcrun', 'stapler', 'validate', str(dmg)],
+        [
+            'spctl', '--assess', '--verbose=4', '--type', 'open',
+            '--context', 'context:primary-signature', str(dmg),
+        ],
+    ]
+
+
+def test_gatekeeper_validation_rejects_non_macos(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+
+    with pytest.raises(SystemExit, match='requires macOS'):
+        validator._validate_gatekeeper_ready(tmp_path / 'Example.app')
+
+
+def test_validator_parser_accepts_gatekeeper_ready_flag(monkeypatch) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'validator', '--app-path', 'Example.app', '--tauri-config', 'tauri.json',
+            '--expected-icon', 'icon.icns', '--require-gatekeeper-ready',
+        ],
+    )
+
+    assert validator._parse_args().require_gatekeeper_ready is True
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
@@ -146,20 +389,6 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'DMG_PREVIEW_REQUIRED_PHRASES' in text
     assert 'platform.system()' in text
     assert 'hdiutil' in text
-
-
-def test_workflow_writes_preview_notice_via_printf() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert "printf '%s\\n' \\" in text
-    assert '> "${preview_notice}"' in text
-
-
-def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}' in text
-    assert 'APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}' in text
-    assert 'APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}' in text
-    assert 'if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then' in text
 
 
 def test_validator_retries_transient_hdiutil_attach_errors(monkeypatch) -> None:
@@ -1054,7 +1283,7 @@ def test_release_workflow_uses_explicit_windows_x86_64_target_and_bundle_paths()
 def test_release_workflow_installs_pytest_before_macos_probe() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     install_index = workflow.index('- name: Install macOS validation test dependencies')
-    validate_index = workflow.index('- name: Validate macOS staged artifact guardrails')
+    validate_index = workflow.index('- name: Validate macOS signed and notarized artifacts')
     assert install_index < validate_index
     install_step = workflow[install_index:validate_index]
     assert "if: runner.os == 'macOS'" in install_step
@@ -1409,12 +1638,13 @@ def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_depende
     validator._validate_macho_linkage(binary, app)
 
 
-def test_workflow_validates_app_before_creating_dmg() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    app_only_index = text.index('--app-only')
+def test_workflow_notarizes_and_staples_app_before_creating_dmg() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    app_submit_index = text.index('submit_and_record "${app_zip}" app')
+    app_staple_index = text.index('xcrun stapler staple "${app_path}"')
     hdiutil_index = text.index('hdiutil create -volname "token.place desktop"')
-    final_validator_index = text.rindex('--dmg-path "${dmg_path}"')
-    assert app_only_index < hdiutil_index < final_validator_index
+    dmg_submit_index = text.index('submit_and_record "${dmg_path}" dmg')
+    assert app_submit_index < app_staple_index < hdiutil_index < dmg_submit_index
 
 def test_validate_macho_linkage_allows_bundle_without_install_id_and_skips_otool_d(monkeypatch, tmp_path):
     validator = _load_release_artifact_validator()
@@ -1528,6 +1758,7 @@ def test_validator_parse_otool_libraries_rejects_structural_errors(tmp_path) -> 
     owner = tmp_path / 'Example.app' / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
     valid_header = f'{owner} (architecture arm64):'
     cases = [
+        f'{tmp_path / "unexpected.dylib"}:\n',
         f'{valid_header}\n{valid_header}\n',
         '\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
         f'{valid_header}\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
@@ -1585,6 +1816,7 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
 
     validator._validate_macho_ref('', owner, app)
     assert validator._macho_file_kind('plain text') == 'other'
+    assert validator._macho_file_kind('Mach-O 64-bit executable') == 'executable'
     try:
         validator._validate_macho_ref('/usr/lib/libSystem.B.dylib', owner, app, install_id=True)
         assert False
@@ -1595,6 +1827,96 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
         assert False
     except SystemExit as exc:
         assert 'forbidden external Mach-O LC_RPATH' in str(exc)
+
+    with pytest.raises(SystemExit, match='forbidden external Mach-O linkage'):
+        validator._validate_macho_ref('/unapproved/location/libexample.dylib', owner, app)
+
+    outside = tmp_path / 'outside.dylib'
+    assert validator._macho_relative(outside, app) == Path('outside.dylib')
+
+
+def test_validator_accepts_resolved_in_app_macho_reference(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    owner = app / 'Contents' / 'MacOS' / 'example'
+    dependency = app / 'Contents' / 'Frameworks' / 'libexample.dylib'
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b'macho')
+    reference = 'Contents/Frameworks/libexample.dylib'
+    original_resolve = Path.resolve
+
+    def resolve_reference(path, *args, **kwargs):
+        if str(path) == reference:
+            return dependency
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', resolve_reference)
+
+    validator._validate_macho_ref(reference, owner, app)
+
+
+def test_validator_macho_reference_resolution_failure_still_fails_closed(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    owner = app / 'Contents' / 'MacOS' / 'example'
+    reference = '/Volumes/external/libexample.dylib'
+    original_resolve = Path.resolve
+
+    def fail_reference_resolution(path, *args, **kwargs):
+        if str(path) == reference:
+            raise OSError('unreadable reference')
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', fail_reference_resolution)
+
+    with pytest.raises(SystemExit, match='forbidden external Mach-O linkage'):
+        validator._validate_macho_ref(reference, owner, app)
+
+
+def test_validator_macho_linkage_skips_non_macos_and_non_macho(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    candidate = tmp_path / 'helper'
+    candidate.write_bytes(b'not macho')
+    subprocess_calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *args, **kwargs: subprocess_calls.append(args[0]))
+
+    validator._validate_macho_linkage(candidate, tmp_path)
+    assert subprocess_calls == []
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, 'ASCII text', ''),
+    )
+    validator._validate_macho_linkage(candidate, tmp_path)
+
+
+def test_validator_macho_linkage_rejects_dylib_without_install_id(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    candidate = tmp_path / 'libexample.dylib'
+    candidate.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, f'{candidate}: Mach-O 64-bit dynamically linked shared library', '',
+        ),
+    )
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if '-L' in cmd:
+            return f'{candidate} (architecture arm64):\n'
+        return ''
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    with pytest.raises(SystemExit, match='missing LC_ID_DYLIB'):
+        validator._validate_macho_linkage(candidate, tmp_path)
 
 
 def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
@@ -1610,9 +1932,111 @@ def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
     except SystemExit as exc:
         assert 'Command failed (bad)' in str(exc)
 
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, 'out', 'err'),
+    )
+    assert validator._run(['good']) == 'out\nerr'
+
     payload = tmp_path / 'payload'
     payload.write_bytes(b'abc')
     assert validator._sha256(payload) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+
+
+def test_validator_path_matching_accepts_equivalent_resolved_dmg_path(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg = tmp_path / 'release' / 'token.place.dmg'
+    equivalent = dmg.parent / '..' / dmg.parent.name / dmg.name
+
+    assert str(equivalent) != str(dmg)
+    assert validator._path_matches_dmg(str(equivalent), dmg)
+
+
+def test_validator_app_path_redaction_tolerates_resolution_failures(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+
+    monkeypatch.setattr(Path, 'resolve', lambda self: (_ for _ in ()).throw(OSError('unresolvable app')))
+    monkeypatch.setattr(
+        validator.os.path,
+        'realpath',
+        lambda path: (_ for _ in ()).throw(OSError('unresolvable app')),
+    )
+
+    assert validator._redact_allowed_app_locations(str(app / 'Contents'), app) == '<app-bundle>/Contents'
+
+
+def test_validator_app_tree_fingerprint_classifies_special_file(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    special = app / 'unexpected.pipe'
+    special.touch()
+    original_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        'is_file',
+        lambda self: False if self == special else original_is_file(self),
+    )
+
+    fingerprint = validator._app_tree_fingerprint(app)
+
+    assert fingerprint['unexpected.pipe'].kind == 'other'
+
+
+def test_validator_script_entrypoint_rejects_unknown_argument(monkeypatch) -> None:
+    script = Path('scripts/validate_desktop_tauri_release_artifacts.py').resolve()
+    monkeypatch.setattr(sys, 'argv', [str(script), '--unknown-release-option'])
+
+    with pytest.raises(SystemExit, match='2'):
+        runpy.run_path(str(script), run_name='__main__')
+
+
+def test_validator_mutation_guard_reraises_probe_failure_when_tree_is_unchanged(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+
+    def fail_probe():
+        raise RuntimeError('probe failed')
+
+    with pytest.raises(RuntimeError, match='probe failed'):
+        validator._run_with_app_mutation_guard(app, 'runtime probe', fail_probe)
+
+
+def test_validator_describes_file_type_change() -> None:
+    validator = _load_release_artifact_validator()
+    before = {'payload': validator.AppTreeEntry('file', None, False, None)}
+    after = {'payload': validator.AppTreeEntry('dir', None, False, None)}
+
+    assert validator._describe_app_tree_changes(before, after) == ['type changed: payload (file -> dir)']
+
+
+def test_validator_macho_linkage_redacts_rejected_rpath(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    binary = app / 'Contents' / 'MacOS' / 'helper'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, f'{binary}: Mach-O 64-bit executable', ''),
+    )
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if '-L' in cmd:
+            return f'{binary} (architecture arm64):\n'
+        return 'Load command 0\ncmd LC_RPATH\ncmdsize 32\npath /opt/private/lib (offset 12)\n'
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    with pytest.raises(SystemExit, match=r'native audit failed.*category=rpath ref=lib'):
+        validator._validate_macho_linkage(binary, app)
 
 
 def test_validate_macho_linkage_rejects_file_and_lipo_failures(monkeypatch, tmp_path) -> None:
@@ -1732,6 +2156,70 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     assert handle.cleaned is True
 
 
+@pytest.mark.parametrize(
+    ('readme_text', 'expect_signing', 'message'),
+    [
+        (None, False, 'must include one preview README'),
+        ('unrelated preview instructions', False, 'missing required phrases'),
+        (
+            'This build is not notarized. Apple could not verify. '
+            'Open Privacy & Security. Developer ID notarization.',
+            False,
+            'ad-hoc signing guidance',
+        ),
+    ],
+)
+def test_validator_dmg_preview_fail_closed(monkeypatch, tmp_path, readme_text, expect_signing, message) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mount.mkdir()
+    (mount / 'token.place desktop.app').mkdir()
+    if readme_text is not None:
+        (mount / 'README BEFORE OPENING.txt').write_text(readme_text, encoding='utf-8')
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=expect_signing)
+
+
+def test_validator_dmg_gatekeeper_ready_checks_mounted_app(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mounted_app = mount / 'token.place desktop.app'
+    mounted_app.mkdir(parents=True)
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+    monkeypatch.setattr(validator, '_codesign_verify', lambda app: None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd) or '')
+
+    validator._validate_dmg_contents(
+        tmp_path / 'release.dmg', expect_signing=True, require_gatekeeper_ready=True,
+    )
+
+    assert calls == [
+        ['xcrun', 'stapler', 'validate', str(mounted_app)],
+        ['spctl', '--assess', '--verbose=4', '--type', 'execute', str(mounted_app)],
+    ]
+
+
 def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
@@ -1790,6 +2278,38 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
     assert dmg_calls == [(dmg, True)]
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
+
+
+def test_validator_main_dispatches_gatekeeper_ready_validation(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    gatekeeper_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=True,
+            require_embedded_python_runtime=False,
+            expect_notarization=True,
+            require_gatekeeper_ready=True,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64' if cmd[:2] == ['lipo', '-archs'] else '')
+    monkeypatch.setattr(validator, '_codesign_verify', lambda path: None)
+    monkeypatch.setattr(
+        validator,
+        '_validate_gatekeeper_ready',
+        lambda app_path, dmg_path: gatekeeper_calls.append((app_path, dmg_path)),
+    )
+
+    validator.main()
+
+    assert gatekeeper_calls == [(app, None)]
 
 
 def test_codesign_verify_fails_on_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:
@@ -1940,6 +2460,160 @@ def test_validator_main_rejects_app_and_dmg_shape_errors(monkeypatch, tmp_path) 
         assert False
     except SystemExit as exc:
         assert 'expected icon missing' in str(exc)
+
+
+@pytest.mark.parametrize(
+    ('case', 'message'),
+    [
+        ('missing_info', 'missing Info.plist'),
+        ('stale_product_name', 'stale app bundle name'),
+        ('stale_display_name', 'stale app display name'),
+        ('missing_config_icon', 'tauri icon list missing required entries'),
+        ('missing_bundled_icon', 'bundled icon not found'),
+        ('mismatched_bundled_icon', 'bundled icon hash does not match'),
+        ('missing_macos_dir', 'missing app executable directory'),
+        ('missing_executable_name', 'CFBundleExecutable is missing'),
+        ('missing_executable', 'CFBundleExecutable not found'),
+        ('wrong_architecture', 'binary is not Apple Silicon'),
+    ],
+)
+def test_validator_main_rejects_invalid_app_metadata(monkeypatch, tmp_path, case, message) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    info_path = app / 'Contents' / 'Info.plist'
+    info = validator.plistlib.loads(info_path.read_bytes())
+
+    if case == 'missing_info':
+        info_path.unlink()
+    elif case == 'stale_product_name':
+        info['CFBundleName'] = 'tokenplace Desktop'
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'stale_display_name':
+        info['CFBundleDisplayName'] = 'tokenplace Desktop'
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'missing_config_icon':
+        tauri_config.write_text(json.dumps({'bundle': {'icon': []}}), encoding='utf-8')
+    elif case == 'missing_bundled_icon':
+        (app / 'Contents' / 'Resources' / 'token-icon.icns').unlink()
+    elif case == 'mismatched_bundled_icon':
+        (app / 'Contents' / 'Resources' / 'token-icon.icns').write_bytes(b'other')
+    elif case == 'missing_macos_dir':
+        shutil.rmtree(app / 'Contents' / 'MacOS')
+    elif case == 'missing_executable_name':
+        del info['CFBundleExecutable']
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'missing_executable':
+        (app / 'Contents' / 'MacOS' / info['CFBundleExecutable']).unlink()
+
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'x86_64')
+
+    with pytest.raises(SystemExit, match=message):
+        validator.main()
+
+
+def test_validator_main_rejects_stale_artifact_name(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(tmp_path / 'Tokenplace Desktop.app'),
+            dmg_path=None,
+            app_only=True,
+            tauri_config='unused',
+            expected_icon='unused',
+            expect_signing=False,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+
+    with pytest.raises(SystemExit, match='stale Electron branding'):
+        validator.main()
+
+
+def test_validator_main_warns_when_signing_lacks_notarization(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=True,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda _cmd: 'arm64')
+
+    validator.main()
+
+    assert 'Signing configured without notarization credentials' in capsys.readouterr().out
+
+
+def test_validator_dmg_contents_skips_mounting_outside_macos(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(
+        validator,
+        '_attach_dmg_with_retries',
+        lambda _path: pytest.fail('DMG must not be mounted outside macOS'),
+    )
+
+    validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=False)
+
+    assert 'Skipping DMG mounted-content checks outside macOS' in capsys.readouterr().out
+
+
+def test_validator_dmg_contents_rejects_multiple_root_apps(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    (mount / 'First.app').mkdir(parents=True)
+    (mount / 'Second.app').mkdir()
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda _dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda *_args: None)
+
+    with pytest.raises(SystemExit, match=r'exactly one \.app at root; found 2'):
+        validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=False)
+
+
+def test_validator_hdiutil_info_plist_rejects_non_mapping(monkeypatch) -> None:
+    validator = _load_release_artifact_validator()
+    payload = validator.plistlib.dumps(['not', 'a', 'mapping'])
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, payload, b''),
+    )
+
+    assert validator._hdiutil_info_plist() == {}
 
 
 def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None:
@@ -2497,7 +3171,7 @@ def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(m
 
     validator.main()
 
-    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
+    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True, 'require_gatekeeper_ready': False})]
     assert runtime_apps == []
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
 
@@ -2600,7 +3274,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.20') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.21') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -2660,7 +3334,7 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.20']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.21']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
@@ -2675,7 +3349,7 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.20'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.21'])
 
 
 def _extract_workflow_job_block(text: str, job_key: str) -> str:
@@ -3950,7 +4624,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
     monkeypatch, tmp_path, probe_result, capsys,
 ) -> None:
     guard = _load_windows_installer_identity()
-    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe', 'nsis', '0.1.20')
+    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
     events = []
@@ -3986,7 +4660,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 
     with pytest.raises(guard.InstallerIdentityError) as raised:
         guard.run_scenario(
-            guard.Scenario('clean-nsis-0.1.20', installer),
+            guard.Scenario('clean-nsis-0.1.21', installer),
             'abcdef123456',
             tokenizer_boundary_model=model,
         )
@@ -3998,7 +4672,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 
 def test_windows_installer_identity_admission_success_skips_native_probe(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe', 'nsis', '0.1.20')
+    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
     events = []
@@ -4028,7 +4702,7 @@ def test_windows_installer_identity_admission_success_skips_native_probe(monkeyp
     )
 
     guard.run_scenario(
-        guard.Scenario('clean-nsis-0.1.20', installer),
+        guard.Scenario('clean-nsis-0.1.21', installer),
         'abcdef123456',
         tokenizer_boundary_model=model,
     )
@@ -5550,10 +6224,10 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
 
 def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.19-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.19-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
@@ -6442,20 +7116,20 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.19-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.19-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = [guard.Scenario('clean-nsis-0.1.20', guard.Installer(current_nsis, 'nsis', '0.1.20'))]
+    scenarios = [guard.Scenario('clean-nsis-0.1.21', guard.Installer(current_nsis, 'nsis', '0.1.21'))]
     artifacts_seen = []
     def fake_runner(scenario, build_id):
         artifacts_seen.append((scenario.name, build_id))
 
     guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
-    assert artifacts_seen == [('clean-nsis-0.1.20', 'abcdef123456')]
+    assert artifacts_seen == [('clean-nsis-0.1.21', 'abcdef123456')]
 
     old_argv = sys.argv
     monkeypatch.setattr(guard.sys, 'platform', 'win32')

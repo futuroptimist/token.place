@@ -1,10 +1,15 @@
 codecov:
   require_ci_to_pass: yes
+github_checks:
+  annotations: true
 coverage:
   status:
     project:
       default:
         target: 90
+        threshold: 0
+        base: auto
+        informational: false
     patch:
       default:
         target: 90

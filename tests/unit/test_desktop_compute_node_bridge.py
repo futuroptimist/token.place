@@ -149,7 +149,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.20",
+        "TOKENPLACE_APP_VERSION": "0.1.21",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -366,7 +366,14 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
-    assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    if expected == "model_identity_mismatch" and mutation in {"model", "artifact_hash", "unmanaged"}:
+        assert len(evidence["artifact"]["artifact_sha256"]) == 64
+    elif mutation not in {
+        "identity", "blank_identity", "missing_model", "cpu_mode", "fallback", "mock", "profile_missing",
+    }:
+        assert len(evidence["artifact"]["artifact_sha256"]) == 64
+    else:
+        assert evidence["artifact"]["artifact_sha256"] == "unknown"
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
@@ -838,6 +845,8 @@ def test_api_v1_recovery_backoff_seconds_parses_valid_values_and_defaults(
 
 
 class FakeModelManager:
+    allow_test_model_path_override = True
+
     def __init__(self):
         self.model_path = ''
         self.default_n_gpu_layers = -1
@@ -3522,6 +3531,7 @@ class _RelayClient:
 
 class _ModelManager:
     model_path = ""
+    allow_test_model_path_override = True
 
 
 class ComputeNodeRuntime:

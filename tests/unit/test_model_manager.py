@@ -304,6 +304,107 @@ class TestModelManager:
         assert metadata['maximum_validated_context_tokens'] == 65536
         assert metadata['supported_context_tiers'] == ['8k-fast', '64k-full']
 
+    def test_reconcile_legacy_flat_model_path_moves_valid_pinned_artifact(
+        self, monkeypatch, tmp_path
+    ):
+        data = b'GGUFcanonical-fixture'
+        digest = hashlib.sha256(data).hexdigest()
+        manager = self._build_manager_with_model_config({})
+        manager.models_dir = str(tmp_path / 'models')
+        manager.model_path = str(Path(manager.models_dir) / manager.file_name)
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = digest
+        expected = dict(manager.model_profile)
+        monkeypatch.setattr('utils.llm.model_profiles.get_default_model_profile', lambda: expected)
+        legacy = tmp_path / manager.file_name
+        legacy.write_bytes(data)
+
+        resolved = manager.reconcile_configured_model_path(str(legacy))
+
+        assert resolved == manager.model_path
+        assert Path(manager.model_path).read_bytes() == data
+        assert not legacy.exists()
+        assert manager._is_managed_canonical_model_path()
+
+    @pytest.mark.parametrize(
+        ('field', 'value', 'error'),
+        [
+            ('profile_id', 'unsafe-profile', 'configured_model_identity_mismatch'),
+            ('api_model_id', 'unsafe-model', 'configured_model_identity_mismatch'),
+            ('file_name', 'unsafe.gguf', 'configured_model_identity_mismatch'),
+        ],
+    )
+    def test_reconcile_configured_model_path_rejects_identity_mismatch(
+        self, monkeypatch, tmp_path, field, value, error
+    ):
+        manager = self._build_manager_with_model_config({})
+        manager.models_dir = str(tmp_path / 'models')
+        manager.model_path = str(Path(manager.models_dir) / manager.file_name)
+        expected = dict(manager.model_profile)
+        monkeypatch.setattr('utils.llm.model_profiles.get_default_model_profile', lambda: expected)
+        setattr(manager, field, value)
+
+        with pytest.raises(ValueError, match=error):
+            manager.reconcile_configured_model_path(str(tmp_path / manager.file_name))
+
+    def test_reconcile_configured_model_path_rolls_back_failed_post_move_validation(
+        self, monkeypatch, tmp_path
+    ):
+        data = b'GGUFcanonical-fixture'
+        manager = self._build_manager_with_model_config({})
+        manager.models_dir = str(tmp_path / 'models')
+        manager.model_path = str(Path(manager.models_dir) / manager.file_name)
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = hashlib.sha256(data).hexdigest()
+        expected = dict(manager.model_profile)
+        monkeypatch.setattr('utils.llm.model_profiles.get_default_model_profile', lambda: expected)
+        legacy = tmp_path / manager.file_name
+        legacy.write_bytes(data)
+        monkeypatch.setattr(manager, '_validate_existing_model_artifact', lambda **_kwargs: (False, 'forced'))
+
+        with pytest.raises(ValueError, match='configured_model_post_move_mismatch'):
+            manager.reconcile_configured_model_path(str(legacy))
+
+        assert legacy.read_bytes() == data
+        assert not Path(manager.model_path).exists()
+
+    @pytest.mark.parametrize(
+        ('mutation', 'error'),
+        [
+            ('size', 'configured_model_size_mismatch'),
+            ('sha', 'configured_model_sha256_mismatch'),
+            ('path', 'configured_model_path_mismatch'),
+        ],
+    )
+    def test_reconcile_configured_model_path_rejects_unsafe_artifact(
+        self, monkeypatch, tmp_path, mutation, error
+    ):
+        data = b'GGUFcanonical-fixture'
+        manager = self._build_manager_with_model_config({})
+        manager.models_dir = str(tmp_path / 'models')
+        manager.model_path = str(Path(manager.models_dir) / manager.file_name)
+        manager.model_profile['artifact_size_bytes'] = len(data)
+        manager.model_profile['artifact_sha256'] = hashlib.sha256(data).hexdigest()
+        expected = dict(manager.model_profile)
+        monkeypatch.setattr('utils.llm.model_profiles.get_default_model_profile', lambda: expected)
+        configured = tmp_path / manager.file_name
+        configured.write_bytes(data)
+        if mutation == 'size':
+            configured.write_bytes(data + b'x')
+        elif mutation == 'sha':
+            configured.write_bytes(b'GGUF' + b'x' * (len(data) - 4))
+        else:
+            unsafe = tmp_path / 'elsewhere'
+            unsafe.mkdir()
+            configured = unsafe / manager.file_name
+            configured.write_bytes(data)
+
+        with pytest.raises(ValueError, match=error):
+            manager.reconcile_configured_model_path(str(configured))
+
+        assert configured.exists()
+        assert not Path(manager.model_path).exists()
+
     def test_profile_artifacts_follow_selected_profile_when_defaults_are_seeded(self):
         """Selecting a profile should replace seeded Llama artifact defaults."""
         from utils.config_schema import DEFAULT_CONFIG

@@ -6540,6 +6540,82 @@ class ModelManager:
             and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
         )
 
+    def reconcile_configured_model_path(self, configured_path: str) -> str:
+        """Reconcile the desktop's legacy flat model path into managed storage.
+
+        Older desktop configuration stored the selected GGUF directly below the
+        application data directory.  Runtime identity, however, is anchored to
+        ``models_dir / file_name``.  Admit only that one legacy sibling path,
+        validate it against the active pinned profile, and atomically move it to
+        the canonical location.  A failed post-move validation is rolled back.
+        """
+        from utils.llm.model_profiles import get_default_model_profile
+
+        expected_profile = get_default_model_profile()
+        required_identity = (
+            ('profile_id', self.profile_id),
+            ('api_model_id', self.api_model_id),
+            ('filename', self.file_name),
+            ('artifact_size_bytes', self.model_profile.get('artifact_size_bytes')),
+            ('artifact_sha256', str(self.model_profile.get('artifact_sha256') or '').lower()),
+        )
+        expected_identity = dict(
+            (key, str(expected_profile.get(key) or '').lower() if key == 'artifact_sha256'
+             else expected_profile.get(key))
+            for key, _value in required_identity
+        )
+        if any(value != expected_identity[key] for key, value in required_identity):
+            raise ValueError('configured_model_identity_mismatch')
+        if not self._is_managed_canonical_model_path():
+            raise ValueError('configured_model_path_mismatch')
+
+        configured = Path(str(configured_path))
+        if not configured.is_absolute() or configured.name != self.file_name:
+            raise ValueError('configured_model_path_mismatch')
+        canonical = Path(self.models_dir) / self.file_name
+        configured_resolved = configured.resolve(strict=False)
+        canonical_resolved = canonical.resolve(strict=False)
+        if configured_resolved == canonical_resolved:
+            return str(canonical)
+
+        legacy_flat = Path(self.models_dir).parent / self.file_name
+        if configured_resolved != legacy_flat.resolve(strict=False) or configured.is_symlink():
+            raise ValueError('configured_model_path_mismatch')
+        if not configured.is_file():
+            raise ValueError('configured_model_missing')
+
+        expected_size = int(self.model_profile['artifact_size_bytes'])
+        if configured.stat().st_size != expected_size:
+            raise ValueError('configured_model_size_mismatch')
+        digest = hashlib.sha256()
+        try:
+            with configured.open('rb') as artifact:
+                if artifact.read(4) != GGUF_MAGIC:
+                    raise ValueError('configured_model_magic_mismatch')
+                artifact.seek(0)
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise ValueError('configured_model_unavailable') from exc
+        if digest.hexdigest().lower() != str(self.model_profile['artifact_sha256']).lower():
+            raise ValueError('configured_model_sha256_mismatch')
+
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        if canonical.exists():
+            valid, _reason = self._validate_existing_model_artifact(hash_if_suspect=True)
+            if valid:
+                return str(canonical)
+            raise ValueError('configured_model_destination_mismatch')
+        os.replace(configured, canonical)
+        valid, _reason = self._validate_existing_model_artifact(hash_if_suspect=True)
+        if not valid:
+            try:
+                os.replace(canonical, configured)
+            except OSError as exc:
+                raise RuntimeError('configured_model_rollback_failed') from exc
+            raise ValueError('configured_model_post_move_mismatch')
+        return str(canonical)
+
     def _artifact_verification_receipt_path(self) -> str:
         return f"{self.model_path}.sha256.verified.json"
 

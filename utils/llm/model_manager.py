@@ -6592,7 +6592,10 @@ class ModelManager:
             if not self._is_managed_canonical_model_path():
                 raise ValueError('configured model path is outside the managed identity contract')
             if canonical_path.exists():
-                valid, _reason = self._validate_existing_model_artifact(hash_if_suspect=True)
+                # Trust a stat-bound verification receipt on ordinary desktop
+                # startup. Missing or stale receipts still cause the validator
+                # to hash the artifact before accepting it.
+                valid, _reason = self._validate_existing_model_artifact()
                 if not valid:
                     raise ValueError('configured model artifact does not match pinned identity')
         except Exception:

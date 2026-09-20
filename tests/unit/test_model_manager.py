@@ -14747,6 +14747,26 @@ def test_reconcile_configured_model_path_adopts_flat_absolute_canonical_path(tmp
     assert manager._is_managed_canonical_model_path() is True
 
 
+def test_reconcile_configured_model_path_uses_valid_verification_receipt(tmp_path, monkeypatch):
+    artifact = b'GGUFdesktop-fixture'
+    manager, profile = _canonical_reconciliation_manager(tmp_path, monkeypatch, artifact)
+    configured = tmp_path / 'flat' / profile['filename']
+    configured.parent.mkdir()
+    configured.write_bytes(artifact)
+    manager.models_dir = str(configured.parent.resolve())
+    manager.model_path = str(configured.resolve())
+    manager._write_artifact_verification_receipt(profile['artifact_sha256'])
+
+    def unexpected_hash(*_args, **_kwargs):
+        raise AssertionError('receipt-backed reconciliation must not hash the artifact')
+
+    monkeypatch.setattr(hashlib, 'sha256', unexpected_hash)
+
+    manager.reconcile_configured_model_path(str(configured))
+
+    assert manager.model_path == str(configured.resolve())
+
+
 @pytest.mark.parametrize('mismatch', ['profile', 'api_model', 'filename', 'size', 'sha', 'path'])
 def test_reconcile_configured_model_path_rejects_identity_mismatch_and_rolls_back(
         tmp_path, monkeypatch, mismatch):

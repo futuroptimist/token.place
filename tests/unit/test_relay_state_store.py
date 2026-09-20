@@ -238,6 +238,7 @@ RELAY_STATE_STORE_OPERATIONS = frozenset(
         "unregister",
         "unregister_node_and_transition_work",
         "set_scheduler_state",
+        "inspect_eligibility",
         "select_and_reserve",
         "enqueue_encrypted_request",
         "list_reservations",

@@ -47,6 +47,22 @@ class RelayStateConflict(RelayStateStoreError):
 class RelayStateNoCapacity(RelayStateStoreError):
     """No live compatible node has bounded scheduler capacity."""
 
+AVAILABILITY_REASONS = frozenset({"available", "no_registered_compute_nodes", "no_healthy_compute_nodes", "no_matching_compute_node", "no_available_capacity", "state_backend_unavailable"})
+
+@dataclass(frozen=True, slots=True)
+class EligibilitySnapshot:
+    """Bounded, identity-free view of scheduler eligibility."""
+    reason: str
+    registered_compute_nodes: int
+    healthy_compute_nodes: int
+    matching_compute_nodes: int
+    schedulable_compute_nodes: int
+
+    def __post_init__(self) -> None:
+        counts = (self.registered_compute_nodes, self.healthy_compute_nodes, self.matching_compute_nodes, self.schedulable_compute_nodes)
+        if self.reason not in AVAILABILITY_REASONS - {"state_backend_unavailable"} or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in counts) or not counts[3] <= counts[2] <= counts[1] <= counts[0]:
+            raise RelayStateStoreError("availability snapshot is invalid")
+
 
 class RelayStateInvalidReservation(RelayStateStoreError):
     """A reservation token is invalid, expired, consumed, or wrongly bound."""
@@ -866,6 +882,7 @@ class RelayStateStore(Protocol):
     def set_scheduler_state(
         self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
     ) -> bool: ...
+    def inspect_eligibility(self, requested_model_id: str, requested_context_tier: str) -> EligibilitySnapshot: ...
     def select_and_reserve(
         self,
         client_public_key: str,
@@ -1223,6 +1240,32 @@ class InMemoryRelayStateStore:
             self._require_digest(record, control_credential_digest)
             self._scheduler_states[node_id] = state
             return True
+
+    def inspect_eligibility(self, requested_model_id: str, requested_context_tier: str) -> EligibilitySnapshot:
+        """Inspect current capacity without reaping or changing scheduler state."""
+        model_id = self._model_id(requested_model_id)
+        tier = self._context_tier(requested_context_tier)
+        requested_tokens = CONTEXT_TIER_TOKEN_BOUNDS[tier]
+        with self._lock:
+            now = self._now()
+            live = {node_id: record for node_id, record in self._records.items() if record.lease_expires_at_epoch > now}
+            healthy = {node_id: record for node_id, record in live.items() if (state := self._scheduler_states.get(node_id)) is not None and state.healthy and not state.draining}
+            matching = {node_id: record for node_id, record in healthy.items() if model_id in record.capabilities.supported_model_ids and CONTEXT_TIER_TOKEN_BOUNDS[record.capabilities.active_context_tier] >= requested_tokens and record.capabilities.maximum_total_context_tokens >= requested_tokens}
+            reservations, queued = {}, {}
+            for item in self._reservations.values():
+                if item.reservation_expires_at_epoch > now and item.request_deadline_epoch > now:
+                    reservations[item.selected_node_id] = reservations.get(item.selected_node_id, 0) + 1
+            for item in self._queued.values():
+                if item.request_deadline_epoch > now:
+                    queued[item.selected_node_id] = queued.get(item.selected_node_id, 0) + 1
+            schedulable = 0
+            for node_id, record in matching.items():
+                reserved, waiting = reservations.get(node_id, 0), queued.get(node_id, 0)
+                if reserved + waiting + self._scheduler_states[node_id].claimed_work < record.capabilities.max_concurrency and reserved < self.config.max_reservations_per_node and reserved + waiting < self.config.max_queue_depth_per_node:
+                    schedulable += 1
+            counts = (len(live), len(healthy), len(matching), schedulable)
+            reason = "no_registered_compute_nodes" if not counts[0] else "no_healthy_compute_nodes" if not counts[1] else "no_matching_compute_node" if not counts[2] else "no_available_capacity" if not counts[3] else "available"
+            return EligibilitySnapshot(reason, *counts)
 
     def select_and_reserve(
         self,

@@ -1173,6 +1173,46 @@ class InMemoryRelayStateStore:
                 replace(self._records[node_id]) for node_id in sorted(self._records)
             )
 
+    def runtime_metrics_snapshot(self) -> tuple[
+        tuple[ComputeNodeRegistration, ...], tuple[QueuedRequest, ...],
+        tuple[ClaimRecord, ...], tuple[NodeTombstoneRecord, ...],
+    ]:
+        """Return one non-mutating snapshot for runtime gauges."""
+        with self._lock:
+            now = self._now()
+            registrations = tuple(
+                replace(record) for record in self._records.values()
+                if record.lease_expires_at_epoch > now
+            )
+            queued = tuple(
+                replace(record) for identity, record in self._queued.items()
+                if record.request_deadline_epoch > now
+                and not (
+                    (claim := self._claims.get(identity)) is not None
+                    and claim.lease_expires_at_epoch > now
+                )
+            )
+            claims = tuple(
+                replace(record) for record in self._claims.values()
+                if record.lease_expires_at_epoch > now
+                and record.request_deadline_epoch > now
+            )
+            tombstones = [
+                replace(record) for record in self._node_tombstones.values()
+                if record.expires_at_epoch > now
+            ]
+            tombstones.extend(
+                NodeTombstoneRecord(
+                    self._node_digest(record.node_id),
+                    record.control_credential_digest,
+                    "registration_lease_expired", "completed", now, True,
+                    now + self.config.node_tombstone_ttl_seconds,
+                )
+                for record in self._records.values()
+                if record.lease_expires_at_epoch <= now
+            )
+            return registrations, queued, claims, tuple(tombstones)
+
     def health_snapshot(self) -> tuple[
         tuple[ComputeNodeRegistration, ...],
         dict[str, int],
@@ -1206,12 +1246,22 @@ class InMemoryRelayStateStore:
                     and claim.request_deadline_epoch > now
                     for claim in self._claims.values()
                 )
-            tombstones = tuple(
+            tombstones = [
                 replace(record)
                 for record in self._node_tombstones.values()
                 if record.expires_at_epoch > now
+            ]
+            tombstones.extend(
+                NodeTombstoneRecord(
+                    self._node_digest(record.node_id),
+                    record.control_credential_digest,
+                    "registration_lease_expired", "completed", now, True,
+                    now + self.config.node_tombstone_ttl_seconds,
+                )
+                for record in self._records.values()
+                if record.lease_expires_at_epoch <= now
             )
-            return registrations, queue_depths, in_flight_counts, tombstones
+            return registrations, queue_depths, in_flight_counts, tuple(tombstones)
 
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         with self._lock:
@@ -1294,17 +1344,97 @@ class InMemoryRelayStateStore:
                 and record.capabilities.maximum_total_context_tokens
                 >= requested_tokens
             )
-            # Match the scheduler's retained lifecycle population. Bounded cleanup can
-            # intentionally leave expired entries in these mappings, and those entries
-            # continue to consume admission capacity until a mutating operation reaps
-            # them. A read-only probe must not advertise capacity the scheduler rejects.
-            retained_reservations = tuple(self._reservations.values())
-            retained_queued = tuple(self._queued.values())
+            # Predict the scheduler's bounded cleanup without mutating authority.
+            # Deadline-due work remains capacity-consuming only when terminal or
+            # control-tombstone capacity would defer its authoritative transition.
+            retained_terminals = [
+                item for item in self._terminals.values()
+                if item.expires_at_epoch > now
+            ]
+            retained_tombstones = [
+                item for item in self._control_tombstones.values()
+                if item.expires_at_epoch > now
+            ]
+            retained_reservations = []
+            retained_queued = []
+            due = list(self._reservations.items()) + list(self._queued.items())
+            for identity, item in due:
+                if item.request_deadline_epoch <= now:
+                    client_terminal_count = sum(
+                        terminal.client_identity_digest == identity[0]
+                        for terminal in retained_terminals
+                    )
+                    claim = self._claims.get(identity)
+                    needs_tombstone = claim is not None and (
+                        claim.lease_expires_at_epoch >= item.request_deadline_epoch
+                    )
+                    node_tombstone_count = sum(
+                        tombstone.selected_node_id == item.selected_node_id
+                        for tombstone in retained_tombstones
+                    )
+                    can_terminalize = (
+                        len(retained_terminals) < self.config.max_terminal_records
+                        and client_terminal_count
+                        < self.config.max_terminal_records_per_client
+                        and (
+                            not needs_tombstone
+                            or (
+                                len(retained_tombstones)
+                                < self.config.max_control_tombstones
+                                and node_tombstone_count
+                                < self.config.max_control_tombstones_per_node
+                            )
+                        )
+                    )
+                    if can_terminalize:
+                        retained_terminals.append(
+                            TerminalOutcomeRecord(
+                                identity[0], identity[1], item.selected_node_id,
+                                "", "", 0, "", now, now,
+                                now + self.config.terminal_retention_seconds,
+                            )
+                        )
+                        if needs_tombstone:
+                            retained_tombstones.append(
+                                ControlTombstoneRecord(
+                                    identity[0], identity[1], item.selected_node_id,
+                                    "", "", 0, "expired",
+                                    "request_deadline_expired", now, False,
+                                    now + self.config.control_tombstone_ttl_seconds,
+                                )
+                            )
+                        continue
+                if isinstance(item, ReservationRecord):
+                    if item.reservation_expires_at_epoch <= now and item.request_deadline_epoch > now:
+                        continue
+                    retained_reservations.append(item)
+                else:
+                    retained_queued.append(item)
             global_capacity = (
                 len(retained_reservations) < self.config.max_reservations
                 and len(retained_reservations) + len(retained_queued)
                 < self.config.max_request_lifecycles
             )
+            fingerprint = self._scheduler_fingerprint(model_id, tier)
+            active_fingerprints = {
+                item.scheduler_fingerprint for item in retained_reservations
+            }
+            active_fingerprints.update(
+                self._scheduler_fingerprint(
+                    item.requested_model_id, item.requested_context_tier
+                )
+                for item in retained_queued
+            )
+            fingerprint_capacity = (
+                fingerprint in self._fairness_cursors
+                or len(self._fairness_cursors)
+                < self.config.max_scheduler_fingerprints
+                or any(
+                    existing not in active_fingerprints
+                    for existing in self._fairness_cursors
+                )
+            )
+            global_capacity = global_capacity and fingerprint_capacity
             reservation_counts: dict[str, int] = {}
             queued_counts: dict[str, int] = {}
             for item in retained_reservations:

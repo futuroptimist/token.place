@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 import relay
-from relay_state_store import RelayStateStoreError
+from relay_state_store import EligibilitySnapshot, RelayStateStoreError
 from valkey_relay_state import (
     ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
@@ -955,3 +955,37 @@ def test_availability_route_drain_short_circuits_state_backend(monkeypatch):
     }
     assert response.headers["Cache-Control"] == "no-store"
     backend.assert_not_called()
+
+
+def test_availability_metrics_are_fixed_bounded_and_probe_is_quota_safe(monkeypatch):
+    """Availability owns fixed metric labels and bypasses public API quotas."""
+
+    store = Mock()
+    store.inspect_eligibility.return_value = EligibilitySnapshot(
+        "no_registered_compute_nodes", 0, 0, 0, 0
+    )
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+    client = relay.app.test_client()
+    for _ in range(65):
+        response = client.get("/api/v1/relay/availability")
+        assert response.status_code == 503
+        assert response.get_json()["reason"] == "no_registered_compute_nodes"
+
+    from prometheus_client import generate_latest
+
+    body = generate_latest(relay.RELAY_METRICS_REGISTRY).decode()
+    for name in (
+        "tokenplace_relay_chat_available",
+        "tokenplace_relay_schedulable_compute_nodes",
+        "tokenplace_relay_chat_availability_state",
+        "tokenplace_relay_state_store_up",
+        "tokenplace_relay_state_store_operation_duration_seconds",
+        "tokenplace_relay_state_store_errors_total",
+    ):
+        assert name in body
+    observed = {
+        line.split('state="', 1)[1].split('"', 1)[0]
+        for line in body.splitlines()
+        if line.startswith("tokenplace_relay_chat_availability_state{")
+    }
+    assert observed == set(relay.AVAILABILITY_STATE_ENUM)

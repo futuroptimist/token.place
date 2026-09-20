@@ -633,10 +633,17 @@ SCHEDULER_STATE_SCRIPT = ReviewedScript(
 )
 
 INSPECT_ELIGIBILITY_SOURCE = """\
-local leases, deadlines, expiries = KEYS[1], KEYS[2], KEYS[3]
+local leases, deadlines, expiries, cursor = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local prefix, model, requested_tokens = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local max_nodes, max_res, max_lifecycles, max_node_res, max_depth =
   tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8])
+local fingerprint, max_fingerprints = ARGV[11], tonumber(ARGV[12])
+if not requested_tokens or not max_nodes or not max_res or not max_lifecycles or
+   not max_node_res or not max_depth or not max_fingerprints or
+   requested_tokens < 1 or max_nodes < 1 or max_res < 1 or max_lifecycles < 1 or
+   max_node_res < 1 or max_depth < 1 or max_fingerprints < 1 or
+   string.len(model) < 1 or string.len(model) > 128 or
+   string.len(fingerprint) ~= 64 or string.find(fingerprint, '[^0-9a-f]') then return {'schema'} end
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local nodes = redis.call('ZRANGEBYSCORE', leases, '(' .. now, '+inf', 'LIMIT', 0, max_nodes + 1)
@@ -646,44 +653,78 @@ if #nodes > max_nodes then return {'schema'} end
 -- mutating scheduler operation; availability must remain conservative meanwhile.
 local lifecycle = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
 if #lifecycle > max_lifecycles then return {'schema'} end
-local node_reservations, node_queued, live_reservations = {}, {}, 0
+local node_reservations, node_queued, active_fingerprints, live_reservations = {}, {}, {}, 0
 for _, member in ipairs(lifecycle) do
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
   if string.len(c) ~= 64 or string.len(q) ~= 64 or string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
   local values = redis.call('HMGET', prefix .. 'request:' .. c .. ':' .. q,
-    'state', 'client', 'request', 'node_digest', 'deadline', 'reservation_expires', 'token_digest')
+    'state', 'client', 'request', 'node_digest', 'deadline', 'reservation_expires', 'token_digest', 'fingerprint')
+  local lifecycle_deadline, indexed_deadline = tonumber(values[5]), redis.call('ZSCORE', deadlines, member)
   if not values[1] or values[2] ~= c or values[3] ~= q or not values[4] or
-     tonumber(values[5]) == nil then return {'schema'} end
+     string.len(values[4]) ~= 64 or string.find(values[4], '[^0-9a-f]') or
+     not lifecycle_deadline or not indexed_deadline or tonumber(indexed_deadline) ~= lifecycle_deadline or
+     redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], '!schema:1') ~= '0' or
+     redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], member) ~= '1' or
+     not values[8] or string.len(values[8]) ~= 64 or string.find(values[8], '[^0-9a-f]') then return {'schema'} end
+  active_fingerprints[values[8]] = true
   if values[1] == 'reserved' then
     if not values[6] or not values[7] or tonumber(values[6]) == nil then return {'schema'} end
     local indexed = redis.call('ZSCORE', expiries, values[7])
     if not indexed or tonumber(indexed) ~= tonumber(values[6]) then return {'schema'} end
-    live_reservations = live_reservations + 1
-    node_reservations[values[4]] = (node_reservations[values[4]] or 0) + 1
+    local r = redis.call('HMGET', prefix .. 'reservation:' .. values[7], 'client', 'request',
+      'node_digest', 'deadline', 'reservation_expires', 'token_digest')
+    for _, value in ipairs(r) do if not value then return {'schema'} end end
+    if r[1] ~= c or r[2] ~= q or r[3] ~= values[4] or tonumber(r[4]) ~= lifecycle_deadline or
+       tonumber(r[5]) ~= tonumber(values[6]) or r[6] ~= values[7] then return {'schema'} end
+    if tonumber(values[6]) > now or lifecycle_deadline <= now then
+      live_reservations = live_reservations + 1
+      node_reservations[values[4]] = (node_reservations[values[4]] or 0) + 1
+    end
   elseif values[1] == 'queued' or values[1] == 'claimed' then
     node_queued[values[4]] = (node_queued[values[4]] or 0) + 1
   else return {'schema'} end
 end
+local count_raw = redis.call('HGET', cursor, '_count')
+local cursor_count = count_raw and tonumber(count_raw) or 0
+if cursor_count < 0 or cursor_count > max_fingerprints or cursor_count ~= math.floor(cursor_count) then return {'schema'} end
+local fingerprint_present, evictable, occupied = false, false, 0
+local seen = {}
+for slot=1,max_fingerprints do
+  local fp = redis.call('HGET', cursor, '_fp:' .. slot)
+  if fp then
+    if string.len(fp) ~= 64 or string.find(fp, '[^0-9a-f]') or seen[fp] or
+       not redis.call('HGET', cursor, fp) or not tonumber(redis.call('HGET', cursor, 'a:' .. fp)) then return {'schema'} end
+    seen[fp], occupied = true, occupied + 1
+    if fp == fingerprint then fingerprint_present = true end
+    if not active_fingerprints[fp] then evictable = true end
+  end
+end
+if occupied ~= cursor_count then return {'schema'} end
+local fingerprint_capacity = fingerprint_present or cursor_count < max_fingerprints or evictable
 local registered, healthy, matching, schedulable = #nodes, 0, 0, 0
-local global_capacity = live_reservations < max_res and #lifecycle < max_lifecycles
+local global_capacity = live_reservations < max_res and #lifecycle < max_lifecycles and fingerprint_capacity
 for _, digest in ipairs(nodes) do
   if string.len(digest) ~= 64 or string.find(digest, '[^0-9a-f]') then return {'schema'} end
-  local v = redis.call('HMGET', prefix .. 'node:' .. digest, 'supported_model_ids',
+  local v = redis.call('HMGET', prefix .. 'node:' .. digest, 'node_id', 'lease_expires_at_epoch', 'supported_model_ids',
     'active_context_tier', 'maximum_total_context_tokens', 'max_concurrency',
     'scheduler_healthy', 'scheduler_draining', 'scheduler_claimed_work')
   for _, value in ipairs(v) do if not value then return {'schema'} end end
-  local ok, models = pcall(cjson.decode, v[1])
-  local context, concurrency, claimed = tonumber(v[3]), tonumber(v[4]), tonumber(v[7])
+  local lease_score = redis.call('ZSCORE', leases, digest)
+  if string.len(v[1]) < 1 or string.len(v[1]) > 4096 or not lease_score or
+     tonumber(lease_score) ~= tonumber(v[2]) then return {'schema'} end
+  local ok, models = pcall(cjson.decode, v[3])
+  local context, concurrency, claimed = tonumber(v[5]), tonumber(v[6]), tonumber(v[9])
   if not ok or type(models) ~= 'table' or not context or not concurrency or not claimed or
-     (v[2] ~= '8k-fast' and v[2] ~= '64k-full') or
-     (v[5] ~= '0' and v[5] ~= '1') or (v[6] ~= '0' and v[6] ~= '1') then return {'schema'} end
-  if v[5] == '1' and v[6] == '0' then
+     context < 1 or concurrency < 1 or concurrency > 1000000 or claimed < 0 or claimed > 1000000 or
+     (v[4] ~= '8k-fast' and v[4] ~= '64k-full') or
+     (v[7] ~= '0' and v[7] ~= '1') or (v[8] ~= '0' and v[8] ~= '1') then return {'schema'} end
+  if v[7] == '1' and v[8] == '0' then
     healthy = healthy + 1
     local supports = false
     for _, candidate in ipairs(models) do if candidate == model then supports = true end end
-    local tier_tokens = v[2] == '8k-fast' and tonumber(ARGV[9]) or tonumber(ARGV[10])
+    local tier_tokens = v[4] == '8k-fast' and tonumber(ARGV[9]) or tonumber(ARGV[10])
     if supports and tier_tokens >= requested_tokens and context >= requested_tokens then
       matching = matching + 1
       local reservations, queued = node_reservations[digest] or 0, node_queued[digest] or 0
@@ -705,7 +746,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "078a15d0b6b41c7e8cbf9eed1a82a4fd6ab5813112bfb32b396a00b4fcdf76eb",  # pragma: allowlist secret
+    "b436ec2484178e32b2408cb831c628c0a241b72748a8079a2096b97dc516fade",  # pragma: allowlist secret
     False,
 )
 
@@ -3668,6 +3709,41 @@ class ValkeyRegistrationStore:
             records.append(self._decode_record(record))
         return tuple(sorted(records, key=lambda record: record.node_id))
 
+    def runtime_metrics_snapshot(self) -> tuple[
+        tuple[ComputeNodeRegistration, ...], tuple[QueuedRequest, ...],
+        tuple[ClaimRecord, ...], tuple[NodeTombstoneRecord, ...],
+    ]:
+        """Return bounded read-only records used by runtime gauges."""
+        registrations = self.list()
+        queued = tuple(
+            item for record in registrations
+            for item in self.queued_requests(record.node_id)
+        )
+        claims = tuple(
+            item for record in registrations
+            for item in self.active_claims(record.node_id)
+        )
+        return registrations, queued, claims, self.node_tombstones()
+
+    def health_snapshot(self) -> tuple[
+        tuple[ComputeNodeRegistration, ...],
+        dict[str, int],
+        dict[str, int],
+        tuple[NodeTombstoneRecord, ...],
+    ]:
+        """Return a bounded read-only diagnostic snapshot."""
+
+        registrations = self.list()
+        queue_depths = {
+            record.node_id: len(self.queued_requests(record.node_id))
+            for record in registrations
+        }
+        in_flight_counts = {
+            record.node_id: len(self.active_claims(record.node_id))
+            for record in registrations
+        }
+        return registrations, queue_depths, in_flight_counts, self.node_tombstones()
+
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
@@ -4012,11 +4088,14 @@ class ValkeyRegistrationStore:
         model, tier, _ = self._model_tier_deadline(
             requested_model_id, requested_context_tier, 0.0
         )
+        # Probes must fail closed unless the namespace is compatible and the
+        # connected endpoint is the writable primary; readiness is read-only.
+        self._foundation.readiness()
         cfg = self._foundation.config
         status, values = self._ascii_status(
             self._foundation.execute(
                 INSPECT_ELIGIBILITY_SCRIPT.name,
-                (cfg.key("nodes:lease"), cfg.key("requests:deadline"), cfg.key("reservations:expiry")),
+                (cfg.key("nodes:lease"), cfg.key("requests:deadline"), cfg.key("reservations:expiry"), cfg.key("cursor")),
                 (
                     cfg.key_prefix.encode(), model.encode(),
                     str(CONTEXT_TIER_TOKEN_BOUNDS[tier]).encode(),
@@ -4027,6 +4106,8 @@ class ValkeyRegistrationStore:
                     str(self.config.max_queue_depth_per_node).encode(),
                     str(CONTEXT_TIER_TOKEN_BOUNDS["8k-fast"]).encode(),
                     str(CONTEXT_TIER_TOKEN_BOUNDS["64k-full"]).encode(),
+                    hashlib.sha256(f"{model}\0{tier}".encode()).hexdigest().encode(),
+                    str(self.config.max_scheduler_fingerprints).encode(),
                 ),
             )
         )

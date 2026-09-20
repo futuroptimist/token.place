@@ -5364,7 +5364,7 @@ def test_inspect_eligibility_is_side_effect_free_and_classifies_fixed_states(
 def test_inspect_eligibility_counts_retained_expired_lifecycles(
     store_factory, capabilities
 ):
-    """A probe must not advertise capacity still occupied before bounded cleanup."""
+    """A probe predicts ordinary short-expiry cleanup without mutating state."""
 
     clock = EpochClock()
     store = store_factory(
@@ -5378,6 +5378,6 @@ def test_inspect_eligibility_counts_retained_expired_lifecycles(
 
     snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
 
-    assert snapshot.reason == "no_available_capacity"
-    assert snapshot.schedulable_compute_nodes == 0
+    assert snapshot.reason == "available"
+    assert snapshot.schedulable_compute_nodes == 1
     assert len(store._reservations) == 1

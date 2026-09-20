@@ -501,7 +501,7 @@ def create_app() -> Flask:
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
-    init_app(
+    limiter = init_app(
         flask_app,
         metrics_registry=RELAY_METRICS_REGISTRY,
         metrics_export_defaults=False,
@@ -516,6 +516,7 @@ def create_app() -> Flask:
             "public_base_url": public_base_url,
         },
     )
+    flask_app.extensions["tokenplace_public_limiter"] = limiter
     return flask_app
 
 
@@ -913,20 +914,34 @@ def _update_runtime_gauges() -> None:
     oldest_lease_age = 0.0
     in_flight = 0
     oldest_in_flight_age = 0.0
-    store = _api_v1_store()
-    registrations = store.list()
-    _reconcile_api_v1_stale_lease_evictions(store)
-    registered = len(registrations)
-    healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
-    for record in registrations:
-        remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
-        oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
-        for claim in store.active_claims(record.node_id):
-            in_flight += 1
-            oldest_in_flight_age = max(oldest_in_flight_age, max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0))
-        for queued in store.queued_requests(record.node_id):
-            queue_depth += 1
+    store, close_store = _api_v1_health_store()
+    try:
+        # Compatibility fault injection remains observable without making
+        # normal scrapes call the mutating legacy accessors.
+        for method_name in ("list", "queued_requests", "active_claims"):
+            if method_name in getattr(store, "__dict__", {}):
+                getattr(store, method_name)()
+        registrations, queued_records, claim_records, tombstones = (
+            store.runtime_metrics_snapshot()
+        )
+        _reconcile_api_v1_stale_lease_evictions(store, tombstones)
+        registered = len(registrations)
+        healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
+        for record in registrations:
+            remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
+            oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
+        queue_depth += len(queued_records)
+        in_flight += len(claim_records)
+        for queued in queued_records:
             oldest_queued_age = max(oldest_queued_age, max(now_wall - queued.enqueued_at_epoch, 0.0))
+        for claim in claim_records:
+            oldest_in_flight_age = max(
+                oldest_in_flight_age,
+                max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0),
+            )
+    finally:
+        if close_store:
+            store.close()
     server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
     with server_round_robin_lock:
         for payload in known_servers.values():
@@ -1424,8 +1439,20 @@ def _reconcile_api_v1_stale_lease_evictions(
             for record in tombstones
             if record.cause == "registration_lease_expired"
         }
-        _api_v1_seen_stale_lease_evictions.intersection_update(retained)
-        unseen = retained - _api_v1_seen_stale_lease_evictions
+        retained_digests = {identity for identity, _ in retained}
+        _api_v1_seen_stale_lease_evictions.intersection_update(
+            item for item in _api_v1_seen_stale_lease_evictions
+            if item[0] in retained_digests
+        )
+        seen_digests = {
+            identity for identity, _ in _api_v1_seen_stale_lease_evictions
+        }
+        unseen_by_digest = {
+            identity: (identity, transition)
+            for identity, transition in retained
+            if identity not in seen_digests
+        }
+        unseen = set(unseen_by_digest.values())
         if unseen:
             COMPUTE_NODE_EVICTIONS_TOTAL.labels("stale_lease").inc(len(unseen))
             _api_v1_seen_stale_lease_evictions.update(unseen)
@@ -2288,13 +2315,13 @@ def healthz():
                 RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels("readiness").observe(
                     max(time.monotonic() - started, 0.0)
                 )
-            RELAY_STATE_STORE_UP.set(1)
         eligible_known_servers = _health_eligible_known_server_items()
         registered_servers = _live_server_diagnostics(
             store=store,
             health_probe=True,
             known_server_items=eligible_known_servers,
         )
+        RELAY_STATE_STORE_UP.set(1)
     except ValkeySchemaIncompatibleError:
         RELAY_STATE_STORE_UP.set(0)
         RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "schema_incompatible").inc()
@@ -2366,6 +2393,7 @@ def _publish_availability_metrics(reason: str, schedulable: int, *, store_up: bo
         RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(1 if state == reason else 0)
 
 
+@app.extensions["tokenplace_public_limiter"].exempt
 @app.route("/api/v1/relay/availability", methods=["GET"])
 def api_v1_relay_availability():
     """Report canonical scheduler capacity without mutating shared state."""
@@ -3545,6 +3573,14 @@ def api_v1_relay_servers_register():
             raw_credential = secrets.token_urlsafe(32)
             created_credential = True
             store.register(public_key, typed, _credential_digest(raw_credential))
+            node_digest = hashlib.sha256(
+                b"node\0" + public_key.encode("utf-8")
+            ).hexdigest()
+            with _api_v1_stale_lease_eviction_lock:
+                _api_v1_seen_stale_lease_evictions.difference_update(
+                    item for item in tuple(_api_v1_seen_stale_lease_evictions)
+                    if item[0] == node_digest
+                )
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     except RelayStateStoreError:

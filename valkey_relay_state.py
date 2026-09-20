@@ -18,7 +18,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 import redis
-from redis.exceptions import NoScriptError, RedisError, ResponseError
+from redis.exceptions import NoScriptError, RedisError, ResponseError, WatchError
 from redis.sentinel import Sentinel
 
 from relay_state_store import (
@@ -2793,6 +2793,83 @@ PENDING_TRANSITION_READ_SCRIPT = ReviewedScript(
     False,
 )
 
+OWNER_AUTHORITY_SOURCE = """\
+local node,leases=KEYS[1],KEYS[2]
+local node_digest,owner=ARGV[1],ARGV[2]
+local function constant_time_equal(left,right)
+  if string.len(left)~=string.len(right) then return false end
+  local difference=0
+  for index=1,string.len(left) do
+    if string.byte(left,index)~=string.byte(right,index) then difference=difference+1 end
+  end
+  return difference==0
+end
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local lease=redis.call('ZSCORE',leases,node_digest)
+if lease and tonumber(lease)>now then
+  local values=redis.call('HMGET',node,'control_credential_digest','lease_expires_at_epoch')
+  if not values[1] or not values[2] or tonumber(values[2])~=tonumber(lease) then return {'schema'} end
+  if constant_time_equal(values[1],owner) then return {'authenticated'} end
+end
+if #KEYS==3 and redis.call('EXISTS',KEYS[3])==1 then
+  local control=KEYS[3]
+  local values=redis.call('HMGET',control,'control_credential_digest','expires_at_epoch')
+  if not values[1] or not values[2] then return {'schema'} end
+  if tonumber(values[2])>now and constant_time_equal(values[1],owner) then return {'authenticated'} end
+end
+return {'unknown'}
+"""
+OWNER_AUTHORITY_SCRIPT = ReviewedScript(
+    "owner_authority_v1", OWNER_AUTHORITY_SOURCE,
+    "b421ee18a4aecd467239607215cf129961f88057d3ad585fa3e68e6b4f778fce",  # pragma: allowlist secret
+    False,
+)
+
+RATE_LIMIT_SOURCE = """\
+local operation,expiry,amount=ARGV[1],tonumber(ARGV[2]),tonumber(ARGV[3])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local window=math.floor(now/expiry); local key=KEYS[1]..window
+if operation=='hit' then
+  local value=redis.call('INCRBY',key,amount)
+  if value==amount then redis.call('PEXPIREAT',key,math.ceil((window+1)*expiry*1000)+1000) end
+  return {'ok',tostring(value),tostring((window+1)*expiry)}
+elseif operation=='get' then
+  return {'ok',redis.call('GET',key) or '0',tostring((window+1)*expiry)}
+elseif operation=='decr' then
+  local value=tonumber(redis.call('GET',key) or '0'); if value>0 then value=redis.call('DECR',key) end
+  return {'ok',tostring(value),tostring((window+1)*expiry)}
+end
+return {'invalid'}
+"""
+RATE_LIMIT_SCRIPT = ReviewedScript(
+    "rate_limit_v1", RATE_LIMIT_SOURCE,
+    "c8cad9c4082bdb322630fc76c892be61ec8af6884b6ecefe0433ba3dca91986d",  # pragma: allowlist secret
+    True,
+)
+
+RATE_LIMIT_MULTI_SOURCE = """\
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local resolved={}
+for index=1,#KEYS do
+  local offset=(index-1)*3; local expiry=tonumber(ARGV[offset+1])
+  local amount=tonumber(ARGV[offset+2]); local maximum=tonumber(ARGV[offset+3])
+  local window=math.floor(now/expiry); local key=KEYS[index]..window
+  local value=tonumber(redis.call('GET',key) or '0')
+  if value+amount>maximum then return {'limited',tostring(index),tostring(math.max(1,math.ceil((window+1)*expiry-now)))} end
+  resolved[index]={key,window,expiry,value,amount}
+end
+for index,item in ipairs(resolved) do
+  local value=redis.call('INCRBY',item[1],item[5])
+  if value==item[5] then redis.call('PEXPIREAT',item[1],math.ceil((item[2]+1)*item[3]*1000)+1000) end
+end
+return {'ok'}
+"""
+RATE_LIMIT_MULTI_SCRIPT = ReviewedScript(
+    "rate_limit_multi_v1", RATE_LIMIT_MULTI_SOURCE,
+    "4b56072d5b81ee6b0ea41af1c8c6a9243323861df186062dbbe3f04aaf74146c",  # pragma: allowlist secret
+    True,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -2809,10 +2886,16 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
         NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
         PENDING_TRANSITION_READ_SCRIPT.name: PENDING_TRANSITION_READ_SCRIPT,
+        OWNER_AUTHORITY_SCRIPT.name: OWNER_AUTHORITY_SCRIPT,
+        RATE_LIMIT_SCRIPT.name: RATE_LIMIT_SCRIPT,
+        RATE_LIMIT_MULTI_SCRIPT.name: RATE_LIMIT_MULTI_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
     {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
+)
+_SHARED_LIMIT_SCRIPT_NAMES = frozenset(
+    {OWNER_AUTHORITY_SCRIPT.name, RATE_LIMIT_SCRIPT.name, RATE_LIMIT_MULTI_SCRIPT.name}
 )
 
 
@@ -2949,6 +3032,58 @@ class ValkeyFoundation:
         if stored is None:
             raise ValkeyUnavailableError("state backend command failed")
         manifest = SchemaManifest.decode(stored)
+        self.check_read_compatible(manifest)
+        self.check_write_compatible(manifest)
+        return manifest
+
+    def migrate_shared_rate_limit_manifest(self, *, namespace_stopped: bool) -> SchemaManifest:
+        """CAS an exact pre-shared-limiter manifest while the namespace is stopped.
+
+        This is deliberately never called by initialization or request paths.  An
+        operator must stop every namespace writer and explicitly acknowledge that
+        condition; any drift from the one reviewed predecessor fails closed.
+        """
+
+        if namespace_stopped is not True:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expected = self.expected_manifest
+        legacy = SchemaManifest(
+            schema_major=expected.schema_major,
+            active_schema_revision=expected.active_schema_revision,
+            active_writer_revision=expected.active_writer_revision,
+            reader_min=expected.reader_min,
+            reader_max=expected.reader_max,
+            writer_min=expected.writer_min,
+            writer_max=expected.writer_max,
+            script_digests={
+                name: digest for name, digest in expected.script_digests.items()
+                if name not in _SHARED_LIMIT_SCRIPT_NAMES
+            },
+            migration_epoch=expected.migration_epoch,
+        )
+        key = self.config.key("schema")
+        pipeline = self._client.pipeline()
+        try:
+            pipeline.watch(key)
+            stored = self._call(pipeline.get, key)
+            if stored is None or SchemaManifest.decode(stored) != legacy:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            pipeline.multi()
+            pipeline.set(key, expected.encode())
+            result = self._call(pipeline.execute)
+            if result != [True]:
+                raise ValkeyUnavailableError("state backend command failed")
+        except WatchError:
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        except ResponseError as exc:
+            if "READONLY" in str(exc).upper():
+                raise ValkeyReadOnlyError("state backend is not writable") from None
+            raise ValkeyUnavailableError("state backend command failed") from None
+        except RedisError:
+            raise ValkeyUnavailableError("state backend unavailable") from None
+        finally:
+            pipeline.reset()
+        manifest = self.read_manifest()
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
         return manifest
@@ -3100,6 +3235,33 @@ class ValkeyRegistrationStore:
         """Verify the shared backend without reading protocol state."""
 
         self._foundation.readiness()
+
+    def authenticates_owner(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        client_public_key: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        node_digest = self._node_digest(node_id)
+        keys = [self._foundation.config.key("node", node_digest),
+                self._foundation.config.key("nodes:lease")]
+        if client_public_key is not None and request_id is not None:
+            keys.append(self._foundation.config.key(
+                "control", node_digest, *self._identity(client_public_key, request_id)
+            ))
+        result = self._foundation.execute(
+            OWNER_AUTHORITY_SCRIPT.name,
+            tuple(keys),
+            (node_digest.encode(), control_credential_digest.encode()),
+        )
+        if result == [b"authenticated"]:
+            return True
+        if result == [b"unknown"]:
+            return False
+        raise ValkeyScriptError("invalid owner authority result")
 
     @staticmethod
     def _node_digest(node_id: str) -> str:

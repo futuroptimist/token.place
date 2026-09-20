@@ -88,6 +88,39 @@ def test_registration_store_readiness_delegates_without_protocol_reads():
     assert foundation.method_calls == [call.readiness()]
 
 
+def test_owner_authentication_uses_cluster_safe_retained_control_key():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"authenticated"]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.authenticates_owner(
+        "node-a", "a" * 64, "client-a", "request-a"
+    )
+
+    keys = foundation.execute.call_args.args[1]
+    assert keys[2] == foundation.config.key(
+        "control", store._node_digest("node-a"), *store._identity("client-a", "request-a")
+    )
+    assert all("{test:unit}" in key for key in keys)
+
+
+def test_owner_authentication_without_tombstone_uses_two_cluster_safe_keys():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"unknown"]
+    store = registration_store_with_foundation(foundation)
+
+    assert not store.authenticates_owner("node-a", "a" * 64)
+
+    keys = foundation.execute.call_args.args[1]
+    assert keys == (
+        foundation.config.key("node", store._node_digest("node-a")),
+        foundation.config.key("nodes:lease"),
+    )
+    assert all("{test:unit}" in key for key in keys)
+
+
 def test_response_serialization_is_canonical_sorted_utf8():
     envelope = EncryptedResponseEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"

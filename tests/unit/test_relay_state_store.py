@@ -229,6 +229,7 @@ RELAY_STATE_LIFECYCLE_CONTRACT = (
 RELAY_STATE_STORE_OPERATIONS = frozenset(
     {
         "config",
+        "authenticates_owner",
         "register",
         "renew",
         "get",
@@ -2401,6 +2402,32 @@ def test_authenticated_cancellation_and_owner_bound_acknowledgement(
     assert control.acknowledged
     with pytest.raises(RelayStateConflict):
         accept_response(store, claim)
+
+
+def test_owner_authentication_is_exact_for_live_and_retained_authority(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    assert store.authenticates_owner("node-a", digest("owner"))
+    assert not store.authenticates_owner("node-a", digest("former-owner"))
+    claimed_work(store)
+    store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+    store.unregister("node-a", digest("owner"))
+
+    assert store.authenticates_owner(
+        "node-a", digest("owner"), "client-key", "request-a"
+    )
+    assert not store.authenticates_owner(
+        "node-a", digest("owner"), "wrong-client", "request-a"
+    )
+    assert not store.authenticates_owner(
+        "node-a", digest("owner"), "client-key", "wrong-request"
+    )
+    assert not store.authenticates_owner(
+        "node-a", digest("former-owner"), "client-key", "request-a"
+    )
 
 
 def test_live_claim_control_read_renews_without_creating_tombstone(

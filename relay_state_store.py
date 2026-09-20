@@ -830,6 +830,14 @@ class RelayStateStore(Protocol):
     @property
     def config(self) -> RelayStateStoreConfig: ...
 
+    def authenticates_owner(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        client_public_key: str | None = None,
+        request_id: str | None = None,
+    ) -> bool: ...
+
     def register(
         self,
         node_id: str,
@@ -997,6 +1005,42 @@ class InMemoryRelayStateStore:
     @property
     def config(self) -> RelayStateStoreConfig:
         return self._config
+
+    def authenticates_owner(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        client_public_key: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Authenticate current or request-retained authority without exposing it."""
+
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        with self._lock:
+            now = self._now()
+            record = self._records.get(node_id)
+            if (
+                record is not None
+                and record.lease_expires_at_epoch > now
+                and hmac.compare_digest(
+                    record.control_credential_digest, control_credential_digest
+                )
+            ):
+                return True
+            if client_public_key is None or request_id is None:
+                return False
+            tombstone = self._control_tombstones.get(
+                self._identity(client_public_key, request_id)
+            )
+            return bool(
+                tombstone is not None
+                and tombstone.selected_node_id == node_id
+                and tombstone.expires_at_epoch > now
+                and hmac.compare_digest(
+                    tombstone.control_credential_digest, control_credential_digest
+                )
+            )
 
     def register(
         self,

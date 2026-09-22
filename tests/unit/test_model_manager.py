@@ -14807,3 +14807,34 @@ def test_reconcile_configured_model_path_rejects_bad_artifact_and_rolls_back(tmp
         manager.reconcile_configured_model_path(str(configured))
 
     assert (manager.models_dir, manager.model_path) == original
+
+
+def test_reconcile_rejects_matching_configured_and_mutable_unapproved_filename(
+        tmp_path, monkeypatch):
+    manager, _profile = _canonical_reconciliation_manager(tmp_path, monkeypatch)
+    manager.file_name = 'renamed.gguf'
+    configured = tmp_path / 'flat' / manager.file_name
+    configured.parent.mkdir()
+    configured.write_bytes(b'GGUFdesktop-fixture')
+    original = (manager.models_dir, manager.model_path, manager.file_name)
+
+    with pytest.raises(ValueError, match='pinned profile'):
+        manager.reconcile_configured_model_path(str(configured))
+
+    assert (manager.models_dir, manager.model_path, manager.file_name) == original
+
+
+def test_reconcile_rejects_raw_symlink_and_rolls_back(tmp_path, monkeypatch):
+    manager, profile = _canonical_reconciliation_manager(tmp_path, monkeypatch)
+    target = tmp_path / 'target' / profile['filename']
+    target.parent.mkdir()
+    target.write_bytes(b'GGUFdesktop-fixture')
+    configured = tmp_path / 'flat' / profile['filename']
+    configured.parent.mkdir()
+    configured.symlink_to(target)
+    original = (manager.models_dir, manager.model_path, manager.file_name)
+
+    with pytest.raises(ValueError, match='symlink'):
+        manager.reconcile_configured_model_path(str(configured))
+
+    assert (manager.models_dir, manager.model_path, manager.file_name) == original

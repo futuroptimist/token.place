@@ -19,7 +19,7 @@ import requests
 import yaml
 
 from utils import compute_node_runtime
-from utils.llm import model_manager
+from utils.llm import model_manager, model_profiles
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -79,12 +79,15 @@ class _CompletionPreflightManager:
         self.model_path = str(model_path)
         self.models_dir = str(model_path.parent)
         self.last_compute_diagnostics = {}
+        self.validation_calls = 0
+        self.reconcile_validation_flags = []
         self.worker_diagnostics = {
             "observed_backend": "cuda",
             "observed_offloaded_layers": "all_supported_layers",
         }
         fixture = b"fixture"
         self.model_profile = {
+            "filename": self.file_name,
             "artifact_size_bytes": len(fixture),
             "artifact_sha256": hashlib.sha256(fixture).hexdigest(),
         }
@@ -96,6 +99,7 @@ class _CompletionPreflightManager:
         return dict(self.worker_diagnostics)
 
     def _validate_existing_model_artifact(self, **_kwargs):
+        self.validation_calls += 1
         actual_sha256 = hashlib.sha256(Path(self.model_path).read_bytes()).hexdigest()
         valid = actual_sha256 == self.model_profile["artifact_sha256"]
         return valid, "valid" if valid else "sha256_mismatch"
@@ -103,7 +107,10 @@ class _CompletionPreflightManager:
     def _is_managed_canonical_model_path(self):
         return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
 
-    def reconcile_configured_model_path(self, configured_path):
+    def reconcile_configured_model_path(self, configured_path, *, validate_artifact=True):
+        self.reconcile_validation_flags.append(validate_artifact)
+        if Path(configured_path).is_symlink():
+            raise ValueError("symlink rejected")
         self.models_dir = str(Path(configured_path).parent.resolve())
         self.model_path = str(Path(self.models_dir, self.file_name))
 
@@ -153,7 +160,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.20",
+        "TOKENPLACE_APP_VERSION": "0.1.21",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -165,6 +172,14 @@ def _completion_preflight_environment(monkeypatch):
         compute_node_bridge,
         "_ensure_desktop_llama_runtime_for_context",
         lambda *_args: {"selected_backend": "cuda", "runtime_action": "already_supported"},
+    )
+    monkeypatch.setattr(
+        model_profiles, "get_model_profile",
+        lambda _profile_id: {
+            "filename": "Qwen3-8B-Q4_K_M.gguf",
+            "artifact_size_bytes": len(b"fixture"),
+            "artifact_sha256": hashlib.sha256(b"fixture").hexdigest(),
+        },
     )
 
 
@@ -269,12 +284,13 @@ def test_subprocess_worker_execution_diagnostics_are_observed(lines, expected):
         ("missing_model", "model_missing"),
         ("cpu_mode", "gpu_mode_required"),
         ("model", "model_identity_mismatch"),
+        ("raw_symlink", "model_identity_mismatch"),
         ("artifact_hash", "model_identity_mismatch"),
         ("fallback", "gpu_runtime_unavailable"),
         ("mock", "mock_runtime_rejected"),
         ("unmanaged", "model_identity_mismatch"),
         ("validator_missing", "model_identity_validation_unavailable"),
-        ("profile_missing", "model_identity_validation_unavailable"),
+        ("profile_missing", "model_identity_mismatch"),
         ("generation_missing", "generation_boundary_missing"),
         ("completion_missing", "completion_count_invalid"),
         ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
@@ -302,6 +318,11 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     elif mutation == "model":
         model = tmp_path / "unapproved.gguf"
         model.write_bytes(b"fixture")
+    elif mutation == "raw_symlink":
+        target = tmp_path / "target" / model.name
+        target.parent.mkdir()
+        model.replace(target)
+        model.symlink_to(target)
     elif mutation == "missing_model":
         model.unlink()
     elif mutation == "fallback":
@@ -372,10 +393,8 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert evidence["failure_code"] == expected
     if mutation in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback"}:
         assert evidence["artifact"]["artifact_sha256"] == "unknown"
-    elif mutation == "profile_missing":
-        assert evidence["artifact"]["artifact_sha256"] == "unknown"
-    elif mutation == "artifact_hash":
-        assert evidence["artifact"]["artifact_sha256"] == "0" * 64
+    elif mutation in {"profile_missing", "artifact_hash"}:
+        assert evidence["artifact"]["artifact_sha256"] == hashlib.sha256(b"fixture").hexdigest()
     else:
         assert evidence["artifact"]["artifact_sha256"] == hashlib.sha256(b"fixture").hexdigest()
     if mutation not in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback"}:
@@ -387,6 +406,23 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
+
+
+def test_pinned_ci_fixture_admission_is_test_only(monkeypatch, tmp_path):
+    fixture = tmp_path / compute_node_bridge.CI_TINY_GGUF_FILENAME
+    fixture.write_bytes(b"GGUFfixture")
+    monkeypatch.setattr(compute_node_bridge, "CI_TINY_GGUF_SIZE_BYTES", fixture.stat().st_size)
+    monkeypatch.setattr(
+        compute_node_bridge, "CI_TINY_GGUF_SHA256", hashlib.sha256(fixture.read_bytes()).hexdigest()
+    )
+    manager = SimpleNamespace(model_profile={})
+
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
+    assert compute_node_bridge._admit_pinned_ci_model_fixture(manager, str(fixture)) is False
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    assert compute_node_bridge._admit_pinned_ci_model_fixture(manager, str(fixture)) is True
+    assert manager.model_path == str(fixture)
+    assert manager.model_profile["artifact_sha256"] == hashlib.sha256(fixture.read_bytes()).hexdigest()
 
 
 def test_gpu_preflight_bounded_call_enforces_deadline():
@@ -423,6 +459,8 @@ def test_installed_gpu_completion_preflight_starts_independent_generation_deadli
     # receive concrete independently capped deadlines; readiness alone follows
     # the callable that switches from model-load to generation at the boundary.
     assert sum(not callable(deadline) for deadline in seen_deadlines) >= 6
+    assert runtime.model_manager.reconcile_validation_flags == [False]
+    assert runtime.model_manager.validation_calls == 1
 
 
 @pytest.mark.parametrize(("termination_result", "worker_alive"), [(False, False), (True, True)])
@@ -3540,7 +3578,9 @@ class _RelayClient:
 
 class _ModelManager:
     model_path = ""
-    desktop_test_fixture_model_override = True
+
+    def reconcile_configured_model_path(self, configured_path):
+        self.model_path = configured_path
 
 
 class ComputeNodeRuntime:

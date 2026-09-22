@@ -6540,7 +6540,8 @@ class ModelManager:
             and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
         )
 
-    def reconcile_configured_model_path(self, configured_path: str) -> None:
+    def reconcile_configured_model_path(
+            self, configured_path: str, *, validate_artifact: bool = True) -> None:
         """Adopt a desktop-selected flat model path without bypassing identity.
 
         Desktop launchers persist an absolute path to the managed GGUF.  The
@@ -6570,6 +6571,8 @@ class ModelManager:
                 for field in required_identity
             ):
                 raise ValueError('configured model identity does not match the pinned profile')
+            if self.file_name != pinned_profile.get('filename'):
+                raise ValueError('configured model filename does not match the pinned profile')
             if self.api_model_id != pinned_profile.get('api_model_id'):
                 raise ValueError('configured API model does not match the pinned profile')
             expected_size = pinned_profile.get('artifact_size_bytes')
@@ -6591,7 +6594,7 @@ class ModelManager:
             self.model_path = str(canonical_path)
             if not self._is_managed_canonical_model_path():
                 raise ValueError('configured model path is outside the managed identity contract')
-            if canonical_path.exists():
+            if validate_artifact and canonical_path.exists():
                 # Trust a stat-bound verification receipt on ordinary desktop
                 # startup. Missing or stale receipts still cause the validator
                 # to hash the artifact before accepting it.

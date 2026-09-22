@@ -425,6 +425,46 @@ def test_pinned_ci_fixture_admission_is_test_only(monkeypatch, tmp_path):
     assert manager.model_profile["artifact_sha256"] == hashlib.sha256(fixture.read_bytes()).hexdigest()
 
 
+def test_mock_operator_fixture_admits_real_manager_only_for_named_harness(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_TEST_FIXTURE", "packaged_operator_e2e")
+    monkeypatch.setenv("USE_MOCK_LLM", "1")
+    manager = model_manager.ModelManager({"paths.models_dir": str(tmp_path)})
+
+    assert compute_node_bridge._admit_mock_operator_fixture(manager, "mock.gguf") is True
+    assert manager.model_path == "mock.gguf"
+
+
+def test_mock_operator_fixture_admits_checksum_pinned_packaged_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKEN_PLACE_ENV", "testing")
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_TEST_FIXTURE", "packaged_operator_e2e")
+    monkeypatch.setenv("USE_MOCK_LLM", "1")
+    fixture = tmp_path / "fake model standard resources.gguf"
+    fixture.write_bytes(b"GGUF fake packaged bridge regression model")
+    manager = model_manager.ModelManager({"paths.models_dir": str(tmp_path)})
+
+    assert compute_node_bridge._admit_mock_operator_fixture(manager, str(fixture)) is True
+    assert manager.model_path == str(fixture)
+
+
+@pytest.mark.parametrize(
+    ("environment", "fixture_context", "configured_path"),
+    [
+        ("production", "packaged_operator_e2e", "mock.gguf"),
+        ("testing", "desktop_operator_ui_e2e", "mock.gguf"),
+        ("testing", "packaged_operator_e2e", "arbitrary.gguf"),
+    ],
+)
+def test_mock_operator_fixture_rejects_unapproved_context_or_identity(
+        monkeypatch, tmp_path, environment, fixture_context, configured_path):
+    monkeypatch.setenv("TOKEN_PLACE_ENV", environment)
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_TEST_FIXTURE", fixture_context)
+    monkeypatch.setenv("USE_MOCK_LLM", "1")
+    manager = model_manager.ModelManager({"paths.models_dir": str(tmp_path)})
+
+    assert compute_node_bridge._admit_mock_operator_fixture(manager, configured_path) is False
+
+
 def test_gpu_preflight_bounded_call_enforces_deadline():
     with pytest.raises(TimeoutError):
         compute_node_bridge._gpu_preflight_bounded_call(

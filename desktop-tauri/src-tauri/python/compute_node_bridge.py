@@ -55,6 +55,10 @@ from pathlib import Path, PureWindowsPath
 CI_TINY_GGUF_FILENAME = "stories15M-q4_0.gguf"
 CI_TINY_GGUF_SIZE_BYTES = 19077344
 CI_TINY_GGUF_SHA256 = "6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04"
+PACKAGED_MOCK_GGUF_SHA256 = {
+    "7ebd59bbd16d104cd744c85e492ecfdd60af395beb1f7efc527237d8463cb938",
+    "9cd370a98d1c86378a9ec51572557de0bd6298158d329371fbb968375a956375",
+}
 
 try:
     from desktop_runtime_setup import (
@@ -1105,6 +1109,25 @@ def _admit_pinned_ci_model_fixture(manager: Any, configured_path: str) -> bool:
     return True
 
 
+def _admit_mock_operator_fixture(manager: Any, configured_path: str) -> bool:
+    """Admit only checksum-pinned or filename-only packaged mock fixtures."""
+    path = Path(configured_path)
+    if (os.environ.get("TOKEN_PLACE_ENV") != "testing"
+            or os.environ.get("TOKENPLACE_DESKTOP_TEST_FIXTURE")
+            not in {"packaged_operator_e2e", "relay_operator_parity_e2e"}
+            or path.is_symlink()):
+        return False
+    filename_only_mock = (os.environ.get("USE_MOCK_LLM") == "1"
+                          and path.name == "mock.gguf" and not path.exists())
+    pinned_file_mock = path.is_file() and __import__("hashlib").sha256(
+        path.read_bytes()
+    ).hexdigest() in PACKAGED_MOCK_GGUF_SHA256
+    if not (filename_only_mock or pinned_file_mock):
+        return False
+    manager.model_path = configured_path
+    return True
+
+
 def _admit_in_memory_unit_test_manager(manager: Any, configured_path: str) -> bool:
     """Keep lightweight bridge doubles usable without weakening ModelManager."""
     manager_module = str(type(manager).__module__)
@@ -1322,11 +1345,13 @@ def run(args: argparse.Namespace) -> int:
             reconcile_model_path(args.model)
         except (OSError, TypeError, ValueError):
             if not (_admit_pinned_ci_model_fixture(runtime.model_manager, args.model)
+                    or _admit_mock_operator_fixture(runtime.model_manager, args.model)
                     or _admit_in_memory_unit_test_manager(runtime.model_manager, args.model)):
                 setattr(args, "startup_error_code", "model_identity_mismatch")
                 emit_startup_error("configured model failed canonical identity validation")
                 return 1
     elif (_admit_pinned_ci_model_fixture(runtime.model_manager, args.model)
+          or _admit_mock_operator_fixture(runtime.model_manager, args.model)
           or _admit_in_memory_unit_test_manager(runtime.model_manager, args.model)):
         # The real-inference CI harness uses one immutable, checksum-pinned
         # tiny GGUF. This path is unavailable outside the testing environment.

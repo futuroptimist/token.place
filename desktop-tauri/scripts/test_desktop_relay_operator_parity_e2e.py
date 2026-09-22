@@ -92,6 +92,8 @@ def _packaged_env(tmp_root: Path, resources_root: Path, relay_url: str, *, sessi
             "TOKEN_PLACE_PYTHON_IMPORT_ROOT": str(resources_root),
             "PYTHONPATH": os.pathsep.join([str(resources_root / "python"), str(resources_root)]),
             "USE_MOCK_LLM": "1",
+            "TOKEN_PLACE_ENV": "testing",
+            "TOKENPLACE_DESKTOP_TEST_FIXTURE": "relay_operator_parity_e2e",
             "TOKENPLACE_DESKTOP_WARM_LOAD": "1",
             "TOKENPLACE_DESKTOP_API_V1_WARM_LOAD_WAIT_SECONDS": "30",
             "TOKENPLACE_OPERATOR_SESSION_ID": session_id,

@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import secrets
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
 from threading import Barrier
@@ -5496,3 +5497,86 @@ def test_inspect_eligibility_allows_projected_expired_node_transition(
         1100,
     )
     assert selection.selected_node_id == "node-live"
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected_reason"),
+    [(1, "no_available_capacity"), (2, "available")],
+)
+def test_inspect_eligibility_carries_pending_capacity_across_expiry_sweep(
+    store_factory, capabilities, batch_size, expected_reason
+):
+    clock = EpochClock(1000)
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=30,
+        reservation_ttl_seconds=60,
+        max_pending_node_transitions=1,
+        node_transition_batch_size=batch_size,
+    )
+    owners = {node_id: digest(f"owner-{node_id}") for node_id in (
+        "a-busy", "b-idle", "z-live"
+    )}
+    for node_id, owner in owners.items():
+        store.register(node_id, capabilities, owner)
+    for node_id in ("b-idle", "z-live"):
+        store.set_scheduler_state(
+            node_id, owners[node_id], SchedulerNodeState(draining=True)
+        )
+    reserve(store, "busy-a", request_deadline_epoch=1100)
+    reserve(store, "busy-b", request_deadline_epoch=1100)
+    for node_id in ("b-idle", "z-live"):
+        store.set_scheduler_state(node_id, owners[node_id], SchedulerNodeState())
+
+    clock.value = 1020
+    store.renew("z-live", owners["z-live"])
+    clock.value = 1031
+    inspected_state = deepcopy((
+        store._records,
+        store._scheduler_states,
+        store._registration_order,
+        store._reservations,
+        store._queued,
+        store._node_queues,
+        store._claims,
+        store._terminals,
+        store._control_tombstones,
+        store._node_tombstones,
+        store._pending_node_transitions,
+        store._former_node_authorities,
+        store._node_work_identities,
+        store._deferred_deadline_identities,
+        store._fairness_cursors,
+    ))
+
+    for _ in range(2):
+        snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert snapshot.reason == expected_reason
+        assert snapshot.schedulable_compute_nodes == (expected_reason == "available")
+    assert inspected_state == (
+        store._records,
+        store._scheduler_states,
+        store._registration_order,
+        store._reservations,
+        store._queued,
+        store._node_queues,
+        store._claims,
+        store._terminals,
+        store._control_tombstones,
+        store._node_tombstones,
+        store._pending_node_transitions,
+        store._former_node_authorities,
+        store._node_work_identities,
+        store._deferred_deadline_identities,
+        store._fairness_cursors,
+    )
+
+    if batch_size == 1:
+        with pytest.raises(
+            RelayStateCapacityExceeded,
+            match="pending node-transition capacity reached",
+        ):
+            reserve(store, "new-work", request_deadline_epoch=1100)
+    else:
+        selection = reserve(store, "new-work", request_deadline_epoch=1100)
+        assert selection.selected_node_id == "z-live"

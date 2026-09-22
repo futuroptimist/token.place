@@ -1344,57 +1344,6 @@ class InMemoryRelayStateStore:
                 and record.capabilities.maximum_total_context_tokens
                 >= requested_tokens
             )
-            # Admission expires every stale registration before selecting a
-            # node.  Project the capacity consumed by those transitions so a
-            # read-only probe cannot advertise work that housekeeping would
-            # reject before selection begins.
-            retained_node_tombstones = {
-                node_digest
-                for node_digest, tombstone in self._node_tombstones.items()
-                if tombstone.expires_at_epoch > now
-            }
-            pending_authorities = {
-                transition.node_identity_digest:
-                transition.control_credential_digest
-                for transition in self._pending_node_transitions.values()
-            }
-            retained_owner_fences = {
-                (node_digest, owner_digest)
-                for node_digest, authorities
-                in self._former_node_authorities.items()
-                for owner_digest, authority in authorities.items()
-                if authority.expires_at_epoch > now
-                or pending_authorities.get(node_digest) == owner_digest
-            }
-            transition_capacity = True
-            for record in sorted(
-                (
-                    item
-                    for item in self._records.values()
-                    if item.lease_expires_at_epoch <= now
-                ),
-                key=lambda item: item.node_id,
-            ):
-                node_digest = self._node_digest(record.node_id)
-                owner = (node_digest, record.control_credential_digest)
-                if (
-                    len(self._pending_node_transitions)
-                    >= self.config.max_pending_node_transitions
-                    or (
-                        owner not in retained_owner_fences
-                        and len(retained_owner_fences)
-                        >= self.config.max_removed_owner_fences
-                    )
-                    or (
-                        node_digest not in retained_node_tombstones
-                        and len(retained_node_tombstones)
-                        >= self.config.max_node_tombstones
-                    )
-                ):
-                    transition_capacity = False
-                    break
-                retained_owner_fences.add(owner)
-                retained_node_tombstones.add(node_digest)
             # Predict the scheduler's bounded cleanup without mutating authority.
             # Deadline-due work remains capacity-consuming only when terminal or
             # control-tombstone capacity would defer its authoritative transition.
@@ -1408,6 +1357,7 @@ class InMemoryRelayStateStore:
             ]
             retained_reservations = []
             retained_queued = []
+            node_transition_work = set(self._reservations) | set(self._queued)
             due = list(self._reservations.items()) + list(self._queued.items())
             for identity, item in due:
                 if item.request_deadline_epoch <= now:
@@ -1454,6 +1404,7 @@ class InMemoryRelayStateStore:
                                     now + self.config.control_tombstone_ttl_seconds,
                                 )
                             )
+                        node_transition_work.discard(identity)
                         continue
                 if isinstance(item, ReservationRecord):
                     if item.reservation_expires_at_epoch <= now and item.request_deadline_epoch > now:
@@ -1461,6 +1412,127 @@ class InMemoryRelayStateStore:
                     retained_reservations.append(item)
                 else:
                     retained_queued.append(item)
+            # Admission expires every stale registration in node-id order.
+            # Carry the projected pending occupancy across that entire sweep:
+            # a transition that exhausts its bounded work batch keeps its slot,
+            # while a completed transition releases the slot for the next node.
+            retained_node_tombstones = {
+                node_digest
+                for node_digest, tombstone in self._node_tombstones.items()
+                if tombstone.expires_at_epoch > now
+            }
+            pending_authorities = {
+                transition.node_identity_digest:
+                transition.control_credential_digest
+                for transition in self._pending_node_transitions.values()
+            }
+            retained_owner_fences = {
+                (node_digest, owner_digest)
+                for node_digest, authorities
+                in self._former_node_authorities.items()
+                for owner_digest, authority in authorities.items()
+                if authority.expires_at_epoch > now
+                or pending_authorities.get(node_digest) == owner_digest
+            }
+            projected_pending = len(self._pending_node_transitions)
+            transition_capacity = True
+            for record in sorted(
+                (
+                    item
+                    for item in self._records.values()
+                    if item.lease_expires_at_epoch <= now
+                ),
+                key=lambda item: item.node_id,
+            ):
+                node_digest = self._node_digest(record.node_id)
+                owner = (node_digest, record.control_credential_digest)
+                if (
+                    projected_pending >= self.config.max_pending_node_transitions
+                    or (
+                        owner not in retained_owner_fences
+                        and len(retained_owner_fences)
+                        >= self.config.max_removed_owner_fences
+                    )
+                    or (
+                        node_digest not in retained_node_tombstones
+                        and len(retained_node_tombstones)
+                        >= self.config.max_node_tombstones
+                    )
+                ):
+                    transition_capacity = False
+                    break
+                projected_pending += 1
+                retained_owner_fences.add(owner)
+                retained_node_tombstones.add(node_digest)
+                work = [
+                    identity
+                    for identity in self._node_work_identities.get(
+                        record.node_id, {}
+                    )
+                    if identity in node_transition_work
+                ]
+                for identity in work[: self.config.node_transition_batch_size]:
+                    item = self._reservations.get(identity) or self._queued.get(
+                        identity
+                    )
+                    if item is None:
+                        node_transition_work.discard(identity)
+                        continue
+                    client_terminal_count = sum(
+                        terminal.client_identity_digest == identity[0]
+                        for terminal in retained_terminals
+                    )
+                    claim = self._claims.get(identity)
+                    node_tombstone_count = sum(
+                        tombstone.selected_node_id == item.selected_node_id
+                        for tombstone in retained_tombstones
+                    )
+                    if (
+                        len(retained_terminals) >= self.config.max_terminal_records
+                        or client_terminal_count
+                        >= self.config.max_terminal_records_per_client
+                        or (
+                            claim is not None
+                            and (
+                                len(retained_tombstones)
+                                >= self.config.max_control_tombstones
+                                or node_tombstone_count
+                                >= self.config.max_control_tombstones_per_node
+                            )
+                        )
+                    ):
+                        break
+                    retained_terminals.append(
+                        TerminalOutcomeRecord(
+                            identity[0], identity[1], item.selected_node_id,
+                            "", "", 0, "", now, now,
+                            now + self.config.terminal_retention_seconds,
+                        )
+                    )
+                    if claim is not None:
+                        retained_tombstones.append(
+                            ControlTombstoneRecord(
+                                identity[0], identity[1], item.selected_node_id,
+                                "", "", 0, "cancelled",
+                                "server_unregistered", now, False,
+                                now + self.config.control_tombstone_ttl_seconds,
+                            )
+                        )
+                    node_transition_work.discard(identity)
+                if not any(identity in node_transition_work for identity in work):
+                    projected_pending -= 1
+            retained_reservations = [
+                item
+                for item in retained_reservations
+                if (item.client_identity_digest, item.request_identity_digest)
+                in node_transition_work
+            ]
+            retained_queued = [
+                item
+                for item in retained_queued
+                if (item.client_identity_digest, item.request_identity_digest)
+                in node_transition_work
+            ]
             global_capacity = (
                 len(retained_reservations) < self.config.max_reservations
                 and len(retained_reservations) + len(retained_queued)

@@ -637,11 +637,12 @@ local leases, deadlines, expiries, cursor = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local prefix, model, requested_tokens = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local max_nodes, max_res, max_lifecycles, max_node_res, max_depth =
   tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8])
-local fingerprint, max_fingerprints = ARGV[11], tonumber(ARGV[12])
+local fingerprint, max_fingerprints, max_node_id_bytes =
+  ARGV[11], tonumber(ARGV[12]), tonumber(ARGV[13])
 if not requested_tokens or not max_nodes or not max_res or not max_lifecycles or
-   not max_node_res or not max_depth or not max_fingerprints or
+   not max_node_res or not max_depth or not max_fingerprints or not max_node_id_bytes or
    requested_tokens < 1 or max_nodes < 1 or max_res < 1 or max_lifecycles < 1 or
-   max_node_res < 1 or max_depth < 1 or max_fingerprints < 1 or
+   max_node_res < 1 or max_depth < 1 or max_fingerprints < 1 or max_node_id_bytes < 1 or
    string.len(model) < 1 or string.len(model) > 128 or
    string.len(fingerprint) ~= 64 or string.find(fingerprint, '[^0-9a-f]') then return {'schema'} end
 local t = redis.call('TIME')
@@ -712,7 +713,8 @@ for _, digest in ipairs(nodes) do
     'scheduler_healthy', 'scheduler_draining', 'scheduler_claimed_work')
   for _, value in ipairs(v) do if not value then return {'schema'} end end
   local lease_score = redis.call('ZSCORE', leases, digest)
-  if string.len(v[1]) < 1 or string.len(v[1]) > 4096 or not lease_score or
+  if string.len(v[1]) < 1 or string.len(v[1]) > max_node_id_bytes or not lease_score or
+     redis.call('ZSCORE', prefix .. 'node_work:' .. digest, '!schema:1') ~= '0' or
      tonumber(lease_score) ~= tonumber(v[2]) then return {'schema'} end
   local ok, models = pcall(cjson.decode, v[3])
   local context, concurrency, claimed = tonumber(v[5]), tonumber(v[6]), tonumber(v[9])
@@ -746,7 +748,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "b436ec2484178e32b2408cb831c628c0a241b72748a8079a2096b97dc516fade",  # pragma: allowlist secret
+    "2708420b658bf68874277d83ae57f8df27738820231c877f5265606c356d6174",  # pragma: allowlist secret
     False,
 )
 
@@ -4108,6 +4110,7 @@ class ValkeyRegistrationStore:
                     str(CONTEXT_TIER_TOKEN_BOUNDS["64k-full"]).encode(),
                     hashlib.sha256(f"{model}\0{tier}".encode()).hexdigest().encode(),
                     str(self.config.max_scheduler_fingerprints).encode(),
+                    str(self.config.max_node_id_bytes).encode(),
                 ),
             )
         )

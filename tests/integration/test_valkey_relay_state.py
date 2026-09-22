@@ -14242,3 +14242,141 @@ def test_availability_is_shared_authoritative_and_side_effect_free(valkey_server
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize("marker_score", (None, 1))
+def test_availability_rejects_idle_node_work_marker_corruption_without_mutation(
+    valkey_server, marker_score
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node = "availability-idle-authority"
+    digest = writer._node_digest(node)
+    cfg = writer._foundation.config
+    client = writer._foundation._client
+    keys = (
+        cfg.key("nodes:lease"),
+        cfg.key("node", digest),
+        cfg.key("node_work", digest),
+        cfg.key("requests:deadline"),
+        cfg.key("reservations:expiry"),
+        cfg.key("cursor"),
+    )
+    try:
+        writer.register(node, _capabilities(), _digest("availability-idle-owner"))
+        work = cfg.key("node_work", digest)
+        if marker_score is None:
+            client.zrem(work, "!schema:1")
+        else:
+            client.zadd(work, {"!schema:1": marker_score}, xx=True)
+        before = _read_exact_keys(client, keys)
+
+        for store in (writer, observer, writer):
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert _read_exact_keys(client, keys) == before
+    finally:
+        client.delete(*keys)
+        observer.close()
+        writer.close()
+
+
+def test_availability_uses_configured_node_id_bound_and_accepts_additive_fields(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node = "n" * 5000
+    digest = writer._node_digest(node)
+    cfg = writer._foundation.config
+    client = writer._foundation._client
+    keys = (
+        cfg.key("nodes:lease"),
+        cfg.key("node", digest),
+        cfg.key("node_work", digest),
+        cfg.key("requests:deadline"),
+        cfg.key("reservations:expiry"),
+        cfg.key("cursor"),
+    )
+    try:
+        writer.register(node, _capabilities(), _digest("availability-long-id-owner"))
+        client.hset(cfg.key("node", digest), "additive", "preserved")
+        before = _read_exact_keys(client, keys)
+
+        for store in (writer, observer, writer):
+            snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+            assert (snapshot.reason, snapshot.registered_compute_nodes,
+                    snapshot.schedulable_compute_nodes) == ("available", 1, 1)
+        assert _read_exact_keys(client, keys) == before
+    finally:
+        client.delete(*keys)
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("stored_length, valid", ((32, True), (33, False)))
+def test_availability_enforces_exact_configured_node_id_boundary_without_mutation(
+    valkey_server, stored_length, valid
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, max_node_id_bytes=32)
+    observer = _registration_store(valkey_server, namespace, max_node_id_bytes=32)
+    registered_node = "b" * 32
+    digest = writer._node_digest(registered_node)
+    cfg = writer._foundation.config
+    client = writer._foundation._client
+    keys = (
+        cfg.key("nodes:lease"), cfg.key("node", digest),
+        cfg.key("node_work", digest), cfg.key("requests:deadline"),
+        cfg.key("reservations:expiry"), cfg.key("cursor"),
+    )
+    try:
+        writer.register(registered_node, _capabilities(), _digest("boundary-owner"))
+        client.hset(cfg.key("node", digest), "node_id", "x" * stored_length)
+        before = _read_exact_keys(client, keys)
+
+        for store in (writer, observer, writer):
+            if valid:
+                snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+                assert (snapshot.reason, snapshot.schedulable_compute_nodes) == ("available", 1)
+            else:
+                with pytest.raises(ValkeySchemaIncompatibleError):
+                    store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert _read_exact_keys(client, keys) == before
+    finally:
+        client.delete(*keys)
+        observer.close()
+        writer.close()
+
+
+def test_availability_node_work_validation_is_namespace_isolated(valkey_server):
+    good = _registration_store(valkey_server, uuid.uuid4().hex)
+    bad = _registration_store(valkey_server, uuid.uuid4().hex)
+    good_node, bad_node = "isolated-good-node", "isolated-bad-node"
+    good_cfg, bad_cfg = good._foundation.config, bad._foundation.config
+    good_digest, bad_digest = good._node_digest(good_node), bad._node_digest(bad_node)
+    good_keys = (good_cfg.key("nodes:lease"), good_cfg.key("node", good_digest),
+                 good_cfg.key("node_work", good_digest), good_cfg.key("requests:deadline"),
+                 good_cfg.key("reservations:expiry"), good_cfg.key("cursor"))
+    bad_keys = (bad_cfg.key("nodes:lease"), bad_cfg.key("node", bad_digest),
+                bad_cfg.key("node_work", bad_digest), bad_cfg.key("requests:deadline"),
+                bad_cfg.key("reservations:expiry"), bad_cfg.key("cursor"))
+    try:
+        good.register(good_node, _capabilities(), _digest("isolated-good-owner"))
+        bad.register(bad_node, _capabilities(), _digest("isolated-bad-owner"))
+        bad._foundation._client.zrem(bad_cfg.key("node_work", bad_digest), "!schema:1")
+        before_good = _read_exact_keys(good._foundation._client, good_keys)
+        before_bad = _read_exact_keys(bad._foundation._client, bad_keys)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            bad.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert good.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "available"
+        assert _read_exact_keys(good._foundation._client, good_keys) == before_good
+        assert _read_exact_keys(bad._foundation._client, bad_keys) == before_bad
+    finally:
+        good._foundation._client.delete(*good_keys)
+        bad._foundation._client.delete(*bad_keys)
+        bad.close()
+        good.close()

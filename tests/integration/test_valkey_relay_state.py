@@ -957,6 +957,37 @@ def test_valkey_store_explicitly_implements_complete_protocol_inventory():
     assert_relay_state_protocol_implementation(ValkeyRegistrationStore)
 
 
+def test_availability_snapshot_is_shared_and_does_not_advance_scheduler(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node = "availability-shared-node"
+    cfg = first._foundation.config
+    keys = [
+        cfg.key("schema"),
+        cfg.key("nodes:lease"),
+        cfg.key("cursor"),
+        cfg.key("reservations:expiry"),
+        cfg.key("requests:deadline"),
+        cfg.key("node", first._node_digest(node)),
+    ]
+    try:
+        assert first.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_registered_compute_nodes"
+        first.register(node, _scheduler_policy_capabilities(), _digest("availability-owner"))
+        before = _read_exact_keys(first._foundation._client, keys)
+        one = first.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        two = second.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        after = _read_exact_keys(first._foundation._client, keys)
+        assert one == two
+        assert one.reason == "available"
+        assert one.schedulable_compute_nodes == 1
+        assert after == before
+    finally:
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
 def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_server):
     """Run the backend-neutral matrix through independent Redis clients."""
 

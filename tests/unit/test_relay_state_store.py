@@ -238,6 +238,7 @@ RELAY_STATE_STORE_OPERATIONS = frozenset(
         "unregister",
         "unregister_node_and_transition_work",
         "set_scheduler_state",
+        "inspect_eligibility",
         "select_and_reserve",
         "enqueue_encrypted_request",
         "list_reservations",
@@ -363,6 +364,33 @@ def assert_relay_state_protocol_implementation(implementation_type):
 
 def test_memory_store_explicitly_implements_complete_protocol_inventory():
     assert_relay_state_protocol_implementation(InMemoryRelayStateStore)
+
+
+def test_inspect_eligibility_is_side_effect_free_and_uses_fixed_reasons(capabilities):
+    clock = EpochClock(100.0)
+    store, _ = registered_store(
+        lambda **kwargs: InMemoryRelayStateStore(
+            RelayStateStoreConfig(
+                namespace="testing.availability",
+                **{key: value for key, value in kwargs.items() if key != "clock"},
+            ),
+            acknowledgement_key=b"a" * 32,
+            epoch_time=kwargs["clock"],
+        ),
+        capabilities,
+        clock=clock,
+    )
+    before = (store.list_reservations(), dict(store._fairness_cursors))
+
+    snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+
+    assert snapshot.reason == "available"
+    assert snapshot.schedulable_compute_nodes == 1
+    assert (store.list_reservations(), dict(store._fairness_cursors)) == before
+    store.set_scheduler_state("node-a", digest("owner"), SchedulerNodeState(healthy=False))
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_healthy_compute_nodes"
+    clock.value += store.config.lease_ttl_seconds
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_registered_compute_nodes"
 
 
 def _expire_with_required_extension(self, required_extra):

@@ -545,6 +545,12 @@ OUTCOME_ENUM = (
     "failed",
 )
 EVICTION_REASON_ENUM = ("stale_lease", "unregistered", "capacity_loss")
+AVAILABILITY_STATE_ENUM = (
+    "available", "no_registered_compute_nodes", "no_healthy_compute_nodes",
+    "no_matching_compute_node", "no_available_capacity", "state_backend_unavailable",
+)
+STATE_STORE_OPERATION_ENUM = ("inspect_eligibility",)
+STATE_STORE_ERROR_REASON_ENUM = ("backend_unavailable", "schema_incompatible")
 HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 BUILD_METADATA = get_release_metadata(None)
 
@@ -659,6 +665,30 @@ RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = _collector(
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
+RELAY_CHAT_AVAILABLE = _collector(
+    "tokenplace_relay_chat_available",
+    lambda: Gauge("tokenplace_relay_chat_available", "Whether canonical relay chat work is schedulable.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_SCHEDULABLE_COMPUTE_NODES = _collector(
+    "tokenplace_relay_schedulable_compute_nodes",
+    lambda: Gauge("tokenplace_relay_schedulable_compute_nodes", "Bounded count of compute nodes schedulable for canonical work.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_CHAT_AVAILABILITY_STATE = _collector(
+    "tokenplace_relay_chat_availability_state",
+    lambda: Gauge("tokenplace_relay_chat_availability_state", "One-hot canonical availability state.", ["state"], registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_UP = _collector(
+    "tokenplace_relay_state_store_up",
+    lambda: Gauge("tokenplace_relay_state_store_up", "Whether the latest state-store operation succeeded.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_OPERATION_DURATION_SECONDS = _collector(
+    "tokenplace_relay_state_store_operation_duration_seconds",
+    lambda: Histogram("tokenplace_relay_state_store_operation_duration_seconds", "Bounded state-store operation latency.", ["operation"], buckets=HTTP_DURATION_BUCKETS, registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_ERRORS_TOTAL = _collector(
+    "tokenplace_relay_state_store_errors_total",
+    lambda: Counter("tokenplace_relay_state_store_errors_total", "State-store errors by fixed operation and reason.", ["operation", "reason"], registry=RELAY_METRICS_REGISTRY),
+)
 BUILD_INFO = _collector(
     "tokenplace_build_info",
     lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
@@ -692,6 +722,14 @@ def _initialise_metric_labels() -> None:
             RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
         RELAY_QUEUE_DEPTH.labels("relay").set(0)
         RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
+        for state in AVAILABILITY_STATE_ENUM:
+            RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(0)
+        for operation in STATE_STORE_OPERATION_ENUM:
+            for reason in STATE_STORE_ERROR_REASON_ENUM:
+                RELAY_STATE_STORE_ERRORS_TOTAL.labels(operation, reason)
+        RELAY_CHAT_AVAILABLE.set(0)
+        RELAY_SCHEDULABLE_COMPUTE_NODES.set(0)
+        RELAY_STATE_STORE_UP.set(0)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
         _build_revision_label(BUILD_METADATA),
@@ -742,6 +780,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
         "api_v1_relay_servers_control": "/api/v1/relay/servers/control",
         "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
+        "api_v1_relay_availability": "/api/v1/relay/availability",
         "healthz": "/healthz",
         "livez": "/livez",
         "metrics": "/metrics",
@@ -2226,6 +2265,77 @@ def metrics():
         LOGGER.error("metrics.serialize_failed", extra={"reason": "serialize_failed"})
         return Response("metrics unavailable\n", status=503, mimetype="text/plain")
     return Response(payload, mimetype=CONTENT_TYPE_LATEST)
+
+
+def _record_availability_metrics(reason: str, schedulable: int, *, store_up: bool) -> None:
+    if METRICS_MODE != "normal":
+        return
+    try:
+        RELAY_CHAT_AVAILABLE.set(1 if reason == "available" else 0)
+        RELAY_SCHEDULABLE_COMPUTE_NODES.set(max(0, int(schedulable)))
+        RELAY_STATE_STORE_UP.set(1 if store_up else 0)
+        for state in AVAILABILITY_STATE_ENUM:
+            RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(1 if state == reason else 0)
+    except Exception:
+        LOGGER.debug("metrics.availability_update_failed", extra={"reason": "metric_update_failed"})
+
+
+@app.route("/api/v1/relay/availability", methods=["GET"])
+def api_v1_relay_availability():
+    """Report canonical scheduling capacity without mutating relay state."""
+
+    started = time.monotonic()
+    store = None
+    close_store = False
+    try:
+        if DRAINING.is_set():
+            reason = "no_available_capacity"
+            counts = (0, 0, 0, 0)
+        else:
+            store, close_store = _api_v1_health_store()
+            snapshot = store.inspect_eligibility(DEFAULT_MODEL_IDS[0], DEFAULT_CONTEXT_TIER)
+            reason = snapshot.reason
+            counts = (
+                snapshot.registered_compute_nodes,
+                snapshot.healthy_compute_nodes,
+                snapshot.matching_compute_nodes,
+                snapshot.schedulable_compute_nodes,
+            )
+        _record_availability_metrics(reason, counts[3], store_up=True)
+        status = 200 if reason == "available" else 503
+    except (RelayStateStoreError, ValkeyFoundationError):
+        reason = "state_backend_unavailable"
+        counts = (0, 0, 0, 0)
+        _record_availability_metrics(reason, 0, store_up=False)
+        status = 503
+        if METRICS_MODE == "normal":
+            try:
+                error_reason = "schema_incompatible" if isinstance(sys.exc_info()[1], ValkeySchemaIncompatibleError) else "backend_unavailable"
+                RELAY_STATE_STORE_ERRORS_TOTAL.labels("inspect_eligibility", error_reason).inc()
+            except Exception:
+                LOGGER.debug("metrics.state_store_error_update_failed", extra={"reason": "metric_update_failed"})
+    finally:
+        if close_store and store is not None:
+            try:
+                store.close()
+            except Exception:
+                LOGGER.warning("relay.state_backend_cleanup_failed")
+        if METRICS_MODE == "normal":
+            try:
+                RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels("inspect_eligibility").observe(max(time.monotonic() - started, 0.0))
+            except Exception:
+                LOGGER.debug("metrics.state_store_latency_update_failed", extra={"reason": "metric_update_failed"})
+    response = jsonify({
+        "available": reason == "available",
+        "reason": reason,
+        "registered_compute_nodes": counts[0],
+        "healthy_compute_nodes": counts[1],
+        "matching_compute_nodes": counts[2],
+        "schedulable_compute_nodes": counts[3],
+    })
+    response.status_code = status
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/healthz", methods=["GET"])

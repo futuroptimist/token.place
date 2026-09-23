@@ -465,6 +465,119 @@ def test_mock_operator_fixture_rejects_unapproved_context_or_identity(
     assert compute_node_bridge._admit_mock_operator_fixture(manager, configured_path) is False
 
 
+def _canonical_startup_environment(monkeypatch, tmp_path, artifact=b"GGUFtrusted fixture"):
+    for name in ("TOKEN_PLACE_ENV", "TOKENPLACE_DESKTOP_TEST_FIXTURE", "USE_MOCK_LLM"):
+        monkeypatch.delenv(name, raising=False)
+    profile = dict(model_profiles.get_model_profile("qwen3-8b-q4-k-m"))
+    profile.update(
+        artifact_size_bytes=len(artifact),
+        artifact_sha256=hashlib.sha256(artifact).hexdigest(),
+    )
+    monkeypatch.setattr(model_manager, "get_model_profile", lambda _profile_id: dict(profile))
+
+    class Runtime(FakeRuntime):
+        instances = []
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager = model_manager.ModelManager(
+                {"paths.models_dir": str(tmp_path / "original-models")}
+            )
+            self.relay_session_starts = 0
+            self.register_attempts = 0
+            type(self).instances.append(self)
+
+        def start_relay_session(self):
+            self.relay_session_starts += 1
+
+        def register_and_poll_once(self):
+            self.register_attempts += 1
+            return {"next_ping_in_x_seconds": 0, "error": None}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=Runtime)
+    monkeypatch.setattr(compute_node_bridge, "stop_requested", lambda: True)
+    args = SimpleNamespace(
+        model="", mode="cpu", relay_url="https://token.place", relay_port=None
+    )
+    return profile, Runtime, args
+
+
+def test_canonical_startup_reconciles_real_manager_and_starts_relay(
+        monkeypatch, tmp_path):
+    artifact = b"GGUFtrusted fixture"
+    profile, runtime_cls, args = _canonical_startup_environment(
+        monkeypatch, tmp_path, artifact
+    )
+    configured = tmp_path / "selected" / profile["filename"]
+    configured.parent.mkdir()
+    configured.write_bytes(artifact)
+    original_stat = configured.stat()
+    args.model = str(configured)
+    for name in (
+        "_admit_pinned_ci_model_fixture",
+        "_admit_mock_operator_fixture",
+        "_admit_in_memory_unit_test_manager",
+    ):
+        monkeypatch.setattr(
+            compute_node_bridge, name,
+            lambda *_args, _name=name: pytest.fail(f"unexpected fixture bypass: {_name}"),
+        )
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime = runtime_cls.instances[0]
+    assert runtime.model_manager.models_dir == str(configured.parent)
+    assert runtime.model_manager.model_path == str(configured.parent / profile["filename"])
+    assert configured.read_bytes() == artifact
+    assert configured.stat().st_ino == original_stat.st_ino
+    assert runtime.relay_session_starts == 1
+
+
+def test_canonical_startup_identity_rejection_restores_manager_and_never_starts_relay(
+        monkeypatch, tmp_path, capsys):
+    profile, runtime_cls, args = _canonical_startup_environment(monkeypatch, tmp_path)
+    configured = tmp_path / "selected" / profile["filename"]
+    configured.parent.mkdir()
+    configured.write_bytes(b"wrong identity")
+    args.model = str(configured)
+
+    assert compute_node_bridge.run(args) == 1
+
+    runtime = runtime_cls.instances[0]
+    assert runtime.model_manager.models_dir == str(tmp_path / "original-models")
+    assert runtime.model_manager.model_path == str(
+        tmp_path / "original-models" / profile["filename"]
+    )
+    assert runtime.relay_session_starts == 0
+    assert runtime.register_attempts == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["error_code"] == "model_identity_mismatch"
+
+
+def test_canonical_startup_validation_unavailable_fails_before_relay(
+        monkeypatch, tmp_path, capsys):
+    profile, runtime_cls, args = _canonical_startup_environment(monkeypatch, tmp_path)
+    configured = tmp_path / "selected" / profile["filename"]
+    configured.parent.mkdir()
+    configured.write_bytes(b"GGUFtrusted fixture")
+    args.model = str(configured)
+    original_init = runtime_cls.__init__
+
+    def init_without_validator(self, config):
+        original_init(self, config)
+        self.model_manager.reconcile_configured_model_path = None
+
+    monkeypatch.setattr(runtime_cls, "__init__", init_without_validator)
+
+    assert compute_node_bridge.run(args) == 1
+
+    runtime = runtime_cls.instances[0]
+    assert runtime.relay_session_starts == 0
+    assert runtime.register_attempts == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["error_code"] == "model_identity_validation_unavailable"
+
+
 def test_gpu_preflight_bounded_call_enforces_deadline():
     with pytest.raises(TimeoutError):
         compute_node_bridge._gpu_preflight_bounded_call(

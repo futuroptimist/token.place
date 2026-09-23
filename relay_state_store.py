@@ -1435,6 +1435,7 @@ class InMemoryRelayStateStore:
                 or pending_authorities.get(node_digest) == owner_digest
             }
             projected_pending = len(self._pending_node_transitions)
+            projected_fairness_cursors = dict(self._fairness_cursors)
             transition_capacity = True
             for record in sorted(
                 (
@@ -1464,6 +1465,11 @@ class InMemoryRelayStateStore:
                 projected_pending += 1
                 retained_owner_fences.add(owner)
                 retained_node_tombstones.add(node_digest)
+                projected_fairness_cursors = {
+                    fingerprint: cursor
+                    for fingerprint, cursor in projected_fairness_cursors.items()
+                    if cursor[0] != record.node_id
+                }
                 work = [
                     identity
                     for identity in self._node_work_identities.get(
@@ -1549,12 +1555,12 @@ class InMemoryRelayStateStore:
                 for item in retained_queued
             )
             fingerprint_capacity = (
-                fingerprint in self._fairness_cursors
-                or len(self._fairness_cursors)
+                fingerprint in projected_fairness_cursors
+                or len(projected_fairness_cursors)
                 < self.config.max_scheduler_fingerprints
                 or any(
                     existing not in active_fingerprints
-                    for existing in self._fairness_cursors
+                    for existing in projected_fairness_cursors
                 )
             )
             global_capacity = (

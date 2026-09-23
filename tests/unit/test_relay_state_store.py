@@ -5580,3 +5580,95 @@ def test_inspect_eligibility_carries_pending_capacity_across_expiry_sweep(
     else:
         selection = reserve(store, "new-work", request_deadline_epoch=1100)
         assert selection.selected_node_id == "z-live"
+
+
+@pytest.mark.parametrize(
+    ("renew_busy", "expected_reason"),
+    [(False, "available"), (True, "no_available_capacity")],
+)
+def test_inspect_eligibility_projects_expired_node_cursor_removal(
+    store_factory, capabilities, renew_busy, expected_reason
+):
+    clock = EpochClock(1000)
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=30,
+        reservation_ttl_seconds=60,
+        max_scheduler_fingerprints=1,
+        node_transition_batch_size=1,
+    )
+    supported_capabilities = replace(
+        capabilities,
+        supported_model_ids=("qwen3-8b-instruct", "other-model"),
+        max_concurrency=2,
+    )
+    owners = {
+        node_id: digest(f"owner-{node_id}") for node_id in ("a-busy", "z-live")
+    }
+    for node_id, owner in owners.items():
+        store.register(node_id, supported_capabilities, owner)
+    store.set_scheduler_state(
+        "z-live", owners["z-live"], SchedulerNodeState(draining=True)
+    )
+    for request_id in ("busy-a", "busy-b"):
+        reserve(
+            store,
+            request_id,
+            requested_model_id="other-model",
+            request_deadline_epoch=1100,
+        )
+    store.set_scheduler_state("z-live", owners["z-live"], SchedulerNodeState())
+
+    clock.value = 1020
+    store.renew("z-live", owners["z-live"])
+    if renew_busy:
+        store.renew("a-busy", owners["a-busy"])
+    clock.value = 1031
+    inspected_state = deepcopy((
+        store._records,
+        store._scheduler_states,
+        store._registration_order,
+        store._reservations,
+        store._queued,
+        store._node_queues,
+        store._claims,
+        store._terminals,
+        store._control_tombstones,
+        store._node_tombstones,
+        store._pending_node_transitions,
+        store._former_node_authorities,
+        store._node_work_identities,
+        store._deferred_deadline_identities,
+        store._fairness_cursors,
+        store._fairness_activity,
+    ))
+
+    for _ in range(2):
+        snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert snapshot.reason == expected_reason
+        assert snapshot.schedulable_compute_nodes == (expected_reason == "available")
+    assert inspected_state == (
+        store._records,
+        store._scheduler_states,
+        store._registration_order,
+        store._reservations,
+        store._queued,
+        store._node_queues,
+        store._claims,
+        store._terminals,
+        store._control_tombstones,
+        store._node_tombstones,
+        store._pending_node_transitions,
+        store._former_node_authorities,
+        store._node_work_identities,
+        store._deferred_deadline_identities,
+        store._fairness_cursors,
+        store._fairness_activity,
+    )
+
+    if renew_busy:
+        with pytest.raises(RelayStateNoCapacity, match="scheduler capacity"):
+            reserve(store, "new-work", request_deadline_epoch=1100)
+    else:
+        selection = reserve(store, "new-work", request_deadline_epoch=1100)
+        assert selection.selected_node_id == "z-live"

@@ -27,6 +27,7 @@ from relay_state_store import (
     ClaimRenewalResult,
     ClaimResult,
     ComputeNodeCapabilities,
+    EligibilitySnapshot,
     ComputeNodeRegistration,
     ControlTombstoneRecord,
     EncryptedRequestEnvelope,
@@ -2825,6 +2826,43 @@ OWNER_AUTHORITY_SCRIPT = ReviewedScript(
     False,
 )
 
+INSPECT_ELIGIBILITY_SOURCE = r"""
+local leases,deadlines=KEYS[1],KEYS[2]
+local prefix,model,requested_tokens,max_nodes,max_node,max_depth,max_lifecycles=ARGV[1],ARGV[2],tonumber(ARGV[3]),tonumber(ARGV[4]),tonumber(ARGV[5]),tonumber(ARGV[6]),tonumber(ARGV[7])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local members=redis.call('ZRANGE',leases,0,max_nodes); if #members>max_nodes then return {'schema'} end
+local node_reservations,node_queued={},{}
+local lifecycles=redis.call('ZRANGEBYSCORE',deadlines,'('..now,'+inf','LIMIT',0,max_lifecycles+1); if #lifecycles>max_lifecycles then return {'schema'} end
+for _,member in ipairs(lifecycles) do
+ local colon=string.find(member,':',1,true); if not colon then return {'schema'} end
+ local client,request=string.sub(member,1,colon-1),string.sub(member,colon+1)
+ if string.len(client)~=64 or string.len(request)~=64 or string.find(client,'[^0-9a-f]') or string.find(request,'[^0-9a-f]') then return {'schema'} end
+ local v=redis.call('HMGET',prefix..'request:'..client..':'..request,'state','node_digest'); if not v[1] or not v[2] then return {'schema'} end
+ if v[1]=='reserved' then node_reservations[v[2]]=(node_reservations[v[2]] or 0)+1 elseif v[1]=='queued' or v[1]=='claimed' then node_queued[v[2]]=(node_queued[v[2]] or 0)+1 elseif v[1]~='cancelled' and v[1]~='expired' and v[1]~='responded' then return {'schema'} end
+end
+local registered,healthy,matching,schedulable=0,0,0,0
+for _,digest in ipairs(members) do
+ local lease=redis.call('ZSCORE',leases,digest); local v=redis.call('HMGET',prefix..'node:'..digest,'supported_model_ids','active_context_tier','maximum_total_context_tokens','max_concurrency','scheduler_healthy','scheduler_draining','scheduler_claimed_work','lease_expires_at_epoch')
+ for _,value in ipairs(v) do if not value then return {'schema'} end end
+ if not lease or tonumber(v[8])~=tonumber(lease) then return {'schema'} end
+ if tonumber(lease)>now then
+  registered=registered+1
+  if v[5]=='1' and v[6]=='0' then
+   healthy=healthy+1; local ok,models=pcall(cjson.decode,v[1]); if not ok or type(models)~='table' then return {'schema'} end
+   local supports=false; for _,candidate in ipairs(models) do if candidate==model then supports=true end end
+   local tier_tokens=nil; if v[2]=='8k-fast' then tier_tokens=8192 elseif v[2]=='64k-full' then tier_tokens=65536 end
+   if supports and tier_tokens and tier_tokens>=requested_tokens and tonumber(v[3])>=requested_tokens then
+    matching=matching+1; local reservations=node_reservations[digest] or 0; local queued=node_queued[digest] or 0; local claimed=tonumber(v[7]); if not claimed or claimed<0 then return {'schema'} end
+    if reservations+queued+claimed<tonumber(v[4]) and reservations<max_node and reservations+queued<max_depth then schedulable=schedulable+1 end
+   end
+  elseif (v[5]~='0' and v[5]~='1') or (v[6]~='0' and v[6]~='1') then return {'schema'} end
+ end
+end
+local reason='available'; if registered==0 then reason='no_registered_compute_nodes' elseif healthy==0 then reason='no_healthy_compute_nodes' elseif matching==0 then reason='no_matching_compute_node' elseif schedulable==0 then reason='no_available_capacity' end
+return {reason,tostring(registered),tostring(healthy),tostring(matching),tostring(schedulable)}
+"""
+INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript("inspect_eligibility_v1", INSPECT_ELIGIBILITY_SOURCE, "70e761a3c0f293b5e25b0eb744bd7f46cdff8a988e9fa27ff5df492284fdb687", False)
+
 RATE_LIMIT_SOURCE = """\
 local operation,expiry,amount=ARGV[1],tonumber(ARGV[2]),tonumber(ARGV[3])
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
@@ -2887,6 +2925,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
         PENDING_TRANSITION_READ_SCRIPT.name: PENDING_TRANSITION_READ_SCRIPT,
         OWNER_AUTHORITY_SCRIPT.name: OWNER_AUTHORITY_SCRIPT,
+        INSPECT_ELIGIBILITY_SCRIPT.name: INSPECT_ELIGIBILITY_SCRIPT,
         RATE_LIMIT_SCRIPT.name: RATE_LIMIT_SCRIPT,
         RATE_LIMIT_MULTI_SCRIPT.name: RATE_LIMIT_MULTI_SCRIPT,
     }
@@ -3087,6 +3126,22 @@ class ValkeyFoundation:
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
         return manifest
+
+    def migrate_availability_manifest(self, *, namespace_stopped: bool) -> SchemaManifest:
+        """CAS the exact pre-availability manifest for a stopped namespace."""
+        if namespace_stopped is not True: raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expected = self.expected_manifest
+        predecessor = SchemaManifest(expected.schema_major, expected.active_schema_revision, expected.active_writer_revision, expected.reader_min, expected.reader_max, expected.writer_min, expected.writer_max, {name: digest for name, digest in expected.script_digests.items() if name != INSPECT_ELIGIBILITY_SCRIPT.name}, expected.migration_epoch)
+        key = self.config.key("schema"); pipeline = self._client.pipeline()
+        try:
+            pipeline.watch(key); stored = self._call(pipeline.get, key)
+            if stored is None or SchemaManifest.decode(stored) != predecessor: raise ValkeySchemaIncompatibleError("state schema incompatible")
+            pipeline.multi(); pipeline.set(key, expected.encode())
+            if self._call(pipeline.execute) != [True]: raise ValkeyUnavailableError("state backend command failed")
+        except WatchError: raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        except RedisError: raise ValkeyUnavailableError("state backend unavailable") from None
+        finally: pipeline.reset()
+        manifest = self.read_manifest(); self.check_read_compatible(manifest); self.check_write_compatible(manifest); return manifest
 
     def read_manifest(self) -> SchemaManifest:
         raw = self._call(self._client.get, self.config.key("schema"))
@@ -3887,6 +3942,22 @@ class ValkeyRegistrationStore:
         if status == "schema":
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         return status == "ok"
+
+    def inspect_eligibility(self, requested_model_id: str, requested_context_tier: str) -> EligibilitySnapshot:
+        model, tier, _ = self._model_tier_deadline(requested_model_id, requested_context_tier, 0.0)
+        cfg = self._foundation.config
+        status, values = self._ascii_status(self._foundation.execute(
+            INSPECT_ELIGIBILITY_SCRIPT.name,
+            (cfg.key("nodes:lease"), cfg.key("requests:deadline")),
+            (cfg.key_prefix.encode(), model.encode(), str(CONTEXT_TIER_TOKEN_BOUNDS[tier]).encode(), str(self.config.max_compute_nodes).encode(), str(self.config.max_reservations_per_node).encode(), str(self.config.max_queue_depth_per_node).encode(), str(self.config.max_request_lifecycles).encode()),
+        ))
+        if status == "schema": raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status not in {"available", "no_registered_compute_nodes", "no_healthy_compute_nodes", "no_matching_compute_node", "no_available_capacity"} or len(values) != 4:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            return EligibilitySnapshot(status, *(int(self._decode_text(value)) for value in values))
+        except (RelayStateStoreError, TypeError, ValueError, OverflowError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
     def select_and_reserve(
         self,

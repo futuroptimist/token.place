@@ -14244,6 +14244,79 @@ def test_availability_is_shared_authoritative_and_side_effect_free(valkey_server
         second.close()
 
 
+def test_availability_projects_short_reservation_cleanup_before_admission(valkey_server):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server,
+        namespace,
+        max_request_lifecycles=1,
+        max_reservations=1,
+        max_scheduler_fingerprints=1,
+        node_transition_batch_size=1,
+    )
+    observer = _registration_store(
+        valkey_server,
+        namespace,
+        max_request_lifecycles=1,
+        max_reservations=1,
+        max_scheduler_fingerprints=1,
+        node_transition_batch_size=1,
+    )
+    node, identity = "availability-expiry-node", ("expired-client", "expired-request")
+    cfg, client = writer._foundation.config, writer._foundation._client
+    digest = writer._node_digest(node)
+    try:
+        writer.register(
+            node,
+            _scheduler_policy_capabilities(
+                models=("qwen3-8b-instruct", "other-model")
+            ),
+            _digest("availability-expiry-owner"),
+        )
+        deadline = writer._foundation.server_time()[0] + 60
+        selection = writer.select_and_reserve(
+            *identity, "other-model", "8k-fast", deadline
+        )
+        active = observer.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert (active.reason, active.schedulable_compute_nodes) == (
+            "no_available_capacity",
+            0,
+        )
+        c, q = writer._identity(*identity)
+        token = _digest(selection.reservation_token)
+        expired = writer._foundation.server_time()[0] - 1
+        client.hset(cfg.key("request", c, q), "reservation_expires", str(expired))
+        client.hset(cfg.key("reservation", token), "reservation_expires", str(expired))
+        client.zadd(cfg.key("reservations:expiry"), {token: expired})
+        keys = (
+            cfg.key("nodes:lease"), cfg.key("node", digest), cfg.key("node_work", digest),
+            cfg.key("requests:deadline"), cfg.key("reservations:expiry"), cfg.key("cursor"),
+            cfg.key("request", c, q), cfg.key("reservation", token),
+        )
+        before = _read_exact_keys(client, keys)
+
+        for store in (writer, observer, writer):
+            snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+            assert (snapshot.reason, snapshot.schedulable_compute_nodes) == ("available", 1)
+        assert _read_exact_keys(client, keys) == before
+
+        writer.renew(node, _digest("availability-expiry-owner"))
+        fresh_deadline = writer._foundation.server_time()[0] + 30
+        admitted = observer.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", fresh_deadline
+        )
+        assert admitted.selected_node_id == node
+    finally:
+        fresh = writer._identity(*identity)
+        cleanup = list(keys) if "keys" in locals() else []
+        cleanup.extend((cfg.key("request", *fresh), cfg.key("schema")))
+        if "admitted" in locals():
+            cleanup.append(cfg.key("reservation", _digest(admitted.reservation_token)))
+        client.delete(*cleanup)
+        observer.close()
+        writer.close()
+
+
 @pytest.mark.parametrize("marker_score", (None, 1))
 def test_availability_rejects_idle_node_work_marker_corruption_without_mutation(
     valkey_server, marker_score

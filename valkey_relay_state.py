@@ -633,28 +633,29 @@ SCHEDULER_STATE_SCRIPT = ReviewedScript(
 )
 
 INSPECT_ELIGIBILITY_SOURCE = """\
-local leases, deadlines, expiries, cursor = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local leases, deadlines, expiries, cursor, terminal_expiries, control_expiries, claim_expiries = unpack(KEYS)
 local prefix, model, requested_tokens = ARGV[1], ARGV[2], tonumber(ARGV[3])
 local max_nodes, max_res, max_lifecycles, max_node_res, max_depth =
   tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8])
 local fingerprint, max_fingerprints, max_node_id_bytes =
   ARGV[11], tonumber(ARGV[12]), tonumber(ARGV[13])
+local batch, max_terminals, max_client_terminals, max_controls, max_node_controls =
+  tonumber(ARGV[14]), tonumber(ARGV[15]), tonumber(ARGV[16]), tonumber(ARGV[17]), tonumber(ARGV[18])
 if not requested_tokens or not max_nodes or not max_res or not max_lifecycles or
    not max_node_res or not max_depth or not max_fingerprints or not max_node_id_bytes or
+   not batch or not max_terminals or not max_client_terminals or not max_controls or not max_node_controls or
    requested_tokens < 1 or max_nodes < 1 or max_res < 1 or max_lifecycles < 1 or
    max_node_res < 1 or max_depth < 1 or max_fingerprints < 1 or max_node_id_bytes < 1 or
+   batch < 1 or max_terminals < 1 or max_client_terminals < 1 or max_controls < 1 or max_node_controls < 1 or
    string.len(model) < 1 or string.len(model) > 128 or
    string.len(fingerprint) ~= 64 or string.find(fingerprint, '[^0-9a-f]') then return {'schema'} end
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local nodes = redis.call('ZRANGEBYSCORE', leases, '(' .. now, '+inf', 'LIMIT', 0, max_nodes + 1)
 if #nodes > max_nodes then return {'schema'} end
--- Inspect the retained scheduler population rather than only unexpired entries.
--- Bounded cleanup may leave expired lifecycles consuming capacity until the next
--- mutating scheduler operation; availability must remain conservative meanwhile.
 local lifecycle = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
 if #lifecycle > max_lifecycles then return {'schema'} end
-local node_reservations, node_queued, active_fingerprints, live_reservations = {}, {}, {}, 0
+local records = {}
 for _, member in ipairs(lifecycle) do
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
@@ -669,7 +670,8 @@ for _, member in ipairs(lifecycle) do
      redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], '!schema:1') ~= '0' or
      redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], member) ~= '1' or
      not values[8] or string.len(values[8]) ~= 64 or string.find(values[8], '[^0-9a-f]') then return {'schema'} end
-  active_fingerprints[values[8]] = true
+  local record = {member=member, client=c, request=q, state=values[1], node=values[4],
+    deadline=lifecycle_deadline, expires=tonumber(values[6]), token=values[7], fingerprint=values[8], retained=true}
   if values[1] == 'reserved' then
     if not values[6] or not values[7] or tonumber(values[6]) == nil then return {'schema'} end
     local indexed = redis.call('ZSCORE', expiries, values[7])
@@ -679,13 +681,87 @@ for _, member in ipairs(lifecycle) do
     for _, value in ipairs(r) do if not value then return {'schema'} end end
     if r[1] ~= c or r[2] ~= q or r[3] ~= values[4] or tonumber(r[4]) ~= lifecycle_deadline or
        tonumber(r[5]) ~= tonumber(values[6]) or r[6] ~= values[7] then return {'schema'} end
-    if tonumber(values[6]) > now or lifecycle_deadline <= now then
-      live_reservations = live_reservations + 1
-      node_reservations[values[4]] = (node_reservations[values[4]] or 0) + 1
-    end
   elseif values[1] == 'queued' or values[1] == 'claimed' then
-    node_queued[values[4]] = (node_queued[values[4]] or 0) + 1
+    if values[1] == 'claimed' then
+      local claim_expiry = redis.call('ZSCORE', claim_expiries, member)
+      if not claim_expiry or not tonumber(claim_expiry) then return {'schema'} end
+      record.claim_expiry = tonumber(claim_expiry)
+    end
   else return {'schema'} end
+  table.insert(records, record)
+end
+
+-- Project the same bounded deadline bridge and final short-reservation sweep used
+-- by admission.  Projection state is carried between transitions but never stored.
+local terminal_members = redis.call('ZRANGEBYSCORE', terminal_expiries, '(' .. now, '+inf', 'LIMIT', 0, max_terminals + 1)
+local control_members = redis.call('ZRANGEBYSCORE', control_expiries, '(' .. now, '+inf', 'LIMIT', 0, max_controls + 1)
+if #terminal_members > max_terminals or #control_members > max_controls then return {'schema'} end
+local terminal_count, control_count = #terminal_members, #control_members
+local client_terminals, node_controls = {}, {}
+for _, member in ipairs(terminal_members) do
+  local colon = string.find(member, ':', 1, true)
+  if not colon then return {'schema'} end
+  local c = string.sub(member, 1, colon - 1)
+  client_terminals[c] = (client_terminals[c] or 0) + 1
+end
+for _, member in ipairs(control_members) do
+  local colon = string.find(member, ':', 1, true)
+  if not colon then return {'schema'} end
+  local n = string.sub(member, 1, colon - 1)
+  node_controls[n] = (node_controls[n] or 0) + 1
+end
+local deferred, attempts = {}, 0
+while attempts < batch + 1 do
+  local due = nil
+  for _, record in ipairs(records) do
+    if record.retained and record.deadline <= now and not deferred[record.member] then due = record; break end
+  end
+  if not due then break end
+  local needs_control = due.state == 'claimed' and due.claim_expiry >= due.deadline
+  if terminal_count >= max_terminals or (client_terminals[due.client] or 0) >= max_client_terminals or
+     (needs_control and (control_count >= max_controls or (node_controls[due.node] or 0) >= max_node_controls)) then
+    deferred[due.member] = true
+  else
+    due.retained = false
+    terminal_count = terminal_count + 1
+    client_terminals[due.client] = (client_terminals[due.client] or 0) + 1
+    if needs_control then
+      control_count = control_count + 1
+      node_controls[due.node] = (node_controls[due.node] or 0) + 1
+    end
+  end
+  attempts = attempts + 1
+end
+-- A further non-deferred deadline would exhaust the Python bridge retry bound.
+local bridge_blocked = false
+for _, record in ipairs(records) do
+  if record.retained and record.deadline <= now and not deferred[record.member] then bridge_blocked = true; break end
+end
+if not bridge_blocked then
+  local cleaned = 0
+  local expired_tokens = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, batch + 1)
+  for _, token in ipairs(expired_tokens) do
+    if cleaned < batch then
+      for _, record in ipairs(records) do
+        if record.retained and record.state == 'reserved' and record.token == token and record.deadline > now then
+          record.retained = false; cleaned = cleaned + 1; break
+        end
+      end
+    end
+  end
+end
+local node_reservations, node_queued, active_fingerprints, live_reservations, retained_lifecycles = {}, {}, {}, 0, 0
+for _, record in ipairs(records) do
+  if record.retained then
+    retained_lifecycles = retained_lifecycles + 1
+    active_fingerprints[record.fingerprint] = true
+    if record.state == 'reserved' then
+      live_reservations = live_reservations + 1
+      node_reservations[record.node] = (node_reservations[record.node] or 0) + 1
+    else
+      node_queued[record.node] = (node_queued[record.node] or 0) + 1
+    end
+  end
 end
 local count_raw = redis.call('HGET', cursor, '_count')
 local cursor_count = count_raw and tonumber(count_raw) or 0
@@ -705,7 +781,7 @@ end
 if occupied ~= cursor_count then return {'schema'} end
 local fingerprint_capacity = fingerprint_present or cursor_count < max_fingerprints or evictable
 local registered, healthy, matching, schedulable = #nodes, 0, 0, 0
-local global_capacity = live_reservations < max_res and #lifecycle < max_lifecycles and fingerprint_capacity
+local global_capacity = not bridge_blocked and live_reservations < max_res and retained_lifecycles < max_lifecycles and fingerprint_capacity
 for _, digest in ipairs(nodes) do
   if string.len(digest) ~= 64 or string.find(digest, '[^0-9a-f]') then return {'schema'} end
   local v = redis.call('HMGET', prefix .. 'node:' .. digest, 'node_id', 'lease_expires_at_epoch', 'supported_model_ids',
@@ -748,7 +824,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "2708420b658bf68874277d83ae57f8df27738820231c877f5265606c356d6174",  # pragma: allowlist secret
+    "4e664329c632cc8e247833469a5d063c52d7516e15d2e66812d12640f4fd7345",  # pragma: allowlist secret
     False,
 )
 
@@ -4097,7 +4173,8 @@ class ValkeyRegistrationStore:
         status, values = self._ascii_status(
             self._foundation.execute(
                 INSPECT_ELIGIBILITY_SCRIPT.name,
-                (cfg.key("nodes:lease"), cfg.key("requests:deadline"), cfg.key("reservations:expiry"), cfg.key("cursor")),
+                (cfg.key("nodes:lease"), cfg.key("requests:deadline"), cfg.key("reservations:expiry"), cfg.key("cursor"),
+                 cfg.key("terminals:expiry"), cfg.key("control:expiry"), cfg.key("claims:expiry")),
                 (
                     cfg.key_prefix.encode(), model.encode(),
                     str(CONTEXT_TIER_TOKEN_BOUNDS[tier]).encode(),
@@ -4111,6 +4188,11 @@ class ValkeyRegistrationStore:
                     hashlib.sha256(f"{model}\0{tier}".encode()).hexdigest().encode(),
                     str(self.config.max_scheduler_fingerprints).encode(),
                     str(self.config.max_node_id_bytes).encode(),
+                    str(self.config.node_transition_batch_size).encode(),
+                    str(self.config.max_terminal_records).encode(),
+                    str(self.config.max_terminal_records_per_client).encode(),
+                    str(self.config.max_control_tombstones).encode(),
+                    str(self.config.max_control_tombstones_per_node).encode(),
                 ),
             )
         )

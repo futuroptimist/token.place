@@ -14265,6 +14265,7 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
         lease_ttl_seconds=300,
     )
     node, identity = "availability-expiry-node", ("expired-client", "expired-request")
+    fresh_identity = ("expired-client", "fresh-request")
     cfg, client = writer._foundation.config, writer._foundation._client
     digest = writer._node_digest(node)
     try:
@@ -14302,20 +14303,94 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
             assert (snapshot.reason, snapshot.schedulable_compute_nodes) == ("available", 1)
         assert _read_exact_keys(client, keys) == before
 
-        fresh_deadline = writer._foundation.server_time()[0] + 30
-        admitted = observer.select_and_reserve(
-            *identity, "qwen3-8b-instruct", "8k-fast", fresh_deadline
-        )
-        assert admitted.selected_node_id == node
+        fresh = writer._identity(*fresh_identity)
+        assert not client.exists(cfg.key("request", *fresh))
     finally:
-        fresh = writer._identity(*identity)
+        fresh = writer._identity(*fresh_identity)
         cleanup = list(keys) if "keys" in locals() else []
         cleanup.extend((cfg.key("request", *fresh), cfg.key("schema")))
-        if "admitted" in locals():
-            cleanup.append(cfg.key("reservation", _digest(admitted.reservation_token)))
         client.delete(*cleanup)
         observer.close()
         writer.close()
+
+
+@pytest.mark.parametrize(
+    ("due_count", "short_expired", "expected_reason"),
+    ((2, False, "available"), (3, False, "no_available_capacity")),
+)
+def test_availability_projects_deadline_retry_boundary_for_fresh_admission(
+    valkey_server, due_count, short_expired, expected_reason
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(
+        _registration_store(
+            valkey_server,
+            namespace,
+            node_transition_batch_size=1,
+            max_request_lifecycles=4,
+            max_reservations=4,
+            max_reservations_per_node=4,
+            max_terminal_records=8,
+            max_terminal_records_per_client=8,
+            lease_ttl_seconds=300,
+        )
+        for _ in range(2)
+    )
+    writer, observer = stores
+    node, owner = "availability-retry-node", _digest("availability-retry-owner")
+    identities = [(f"deadline-client-{i}", f"deadline-request-{i}") for i in range(due_count)]
+    if short_expired:
+        identities.append(("short-client", "short-request"))
+    fresh = ("boundary-fresh-client", "boundary-fresh-request")
+    cfg, client = writer._foundation.config, writer._foundation._client
+    tokens = []
+    try:
+        writer.register(node, _capabilities(concurrency=4), owner)
+        seconds, micros = writer._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        for identity in identities:
+            selected = writer.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", now + 120
+            )
+            tokens.append(_digest(selected.reservation_token))
+        for index, identity in enumerate(identities[:due_count]):
+            c, q = writer._identity(*identity)
+            client.hset(cfg.key("request", c, q), "deadline", now - 1)
+            client.hset(cfg.key("reservation", tokens[index]), "deadline", now - 1)
+            client.zadd(cfg.key("requests:deadline"), {f"{c}:{q}": now - 1})
+        if short_expired:
+            c, q = writer._identity(*identities[-1])
+            client.hset(cfg.key("request", c, q), "reservation_expires", now - 1)
+            client.hset(cfg.key("reservation", tokens[-1]), "reservation_expires", now - 1)
+            client.zadd(cfg.key("reservations:expiry"), {tokens[-1]: now - 1})
+        keys = [
+            cfg.key("nodes:lease"), cfg.key("requests:deadline"),
+            cfg.key("reservations:expiry"), cfg.key("terminals:expiry"),
+            cfg.key("control:expiry"), cfg.key("cursor"),
+        ]
+        for identity, token in zip(identities, tokens):
+            c, q = writer._identity(*identity)
+            keys.extend((cfg.key("request", c, q), cfg.key("reservation", token)))
+        before = _read_exact_keys(client, keys)
+        for store in (writer, observer, writer):
+            snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+            assert snapshot.reason == expected_reason
+        assert _read_exact_keys(client, keys) == before
+        deadline = writer._foundation.server_time()[0] + 30
+        if expected_reason == "available":
+            admitted = observer.select_and_reserve(
+                *fresh, "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            assert admitted.selected_node_id == node
+        else:
+            with pytest.raises(RelayStateNoCapacity):
+                observer.select_and_reserve(
+                    *fresh, "qwen3-8b-instruct", "8k-fast", deadline
+                )
+    finally:
+        _delete_claim_fixture_state(writer, (node,), (*identities, fresh))
+        for store in stores:
+            store.close()
 
 
 @pytest.mark.parametrize("marker_score", (None, 1))

@@ -790,15 +790,18 @@ for i=1,#control_rows,2 do
   end
 end
 local deferred, attempts = {}, 0
-while attempts < batch + 1 do
-  local due = nil
+local function next_due()
   local window = 0
   for _, record in ipairs(records) do
     if record.retained and record.deadline <= now and window < batch + 1 then
       window = window + 1
-      if not deferred[record.member] then due = record; break end
+      if not deferred[record.member] then return record end
     end
   end
+  return nil
+end
+while attempts < batch + 1 do
+  local due = next_due()
   if not due then break end
   local needs_control = due.state == 'claimed' and due.claim_expiry >= due.deadline
   if terminal_count >= max_terminals or (client_terminals[due.client] or 0) >= max_client_terminals or
@@ -817,7 +820,7 @@ while attempts < batch + 1 do
 end
 -- Deferred members remain in the bounded window on every retry.  Admission
 -- proceeds once that window contains no further transition it can attempt.
-local bridge_blocked = attempts >= batch + 1 and due ~= nil
+local bridge_blocked = attempts >= batch + 1 and next_due() ~= nil
 if not bridge_blocked then
   local cleaned = 0
   -- Successful deadline cancellation removes its reservation index member;
@@ -838,6 +841,11 @@ if not bridge_blocked then
       if record.deadline > now then
         record.retained = false
         cleaned = cleaned + 1
+      elseif not deferred[record.member] then
+        -- The expiry sweep would return deadline_due here, consuming another
+        -- bridge attempt before admission can evaluate capacity.
+        bridge_blocked = true
+        break
       end
     end
   end
@@ -916,7 +924,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "f684c26a7d5271841fbc520d50a253703be9872784fd00df9088dcf48fb2d413",  # pragma: allowlist secret
+    "0ef409e2e6b25e8320f6e0376fd70c86a4366a734125d2ec4a955fb9a41ec4dd",  # pragma: allowlist secret
     False,
 )
 

@@ -662,7 +662,8 @@ for _, member in ipairs(lifecycle) do
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
   if string.len(c) ~= 64 or string.len(q) ~= 64 or string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
   local values = redis.call('HMGET', prefix .. 'request:' .. c .. ':' .. q,
-    'state', 'client', 'request', 'node_digest', 'deadline', 'reservation_expires', 'token_digest', 'fingerprint')
+    'state', 'client', 'request', 'node_digest', 'deadline', 'reservation_expires', 'token_digest', 'fingerprint',
+    'queue_entry', 'node_id', 'sequence', 'claim_generation')
   local lifecycle_deadline, indexed_deadline = tonumber(values[5]), redis.call('ZSCORE', deadlines, member)
   if not values[1] or values[2] ~= c or values[3] ~= q or not values[4] or
      string.len(values[4]) ~= 64 or string.find(values[4], '[^0-9a-f]') or
@@ -682,10 +683,22 @@ for _, member in ipairs(lifecycle) do
     if r[1] ~= c or r[2] ~= q or r[3] ~= values[4] or tonumber(r[4]) ~= lifecycle_deadline or
        tonumber(r[5]) ~= tonumber(values[6]) or r[6] ~= values[7] then return {'schema'} end
   elseif values[1] == 'queued' or values[1] == 'claimed' then
+    if not values[9] or not values[10] or not tonumber(values[11]) then return {'schema'} end
+    local entries = redis.call('XRANGE', prefix .. 'queue:' .. values[4], values[9], values[9], 'COUNT', 1)
+    if #entries ~= 1 or entries[1][1] ~= values[9] or #entries[1][2] ~= 4 or
+       entries[1][2][1] ~= 'client' or entries[1][2][2] ~= c or
+       entries[1][2][3] ~= 'request' or entries[1][2][4] ~= q then return {'schema'} end
     if values[1] == 'claimed' then
       local claim_expiry = redis.call('ZSCORE', claim_expiries, member)
-      if not claim_expiry or not tonumber(claim_expiry) then return {'schema'} end
+      local claim = redis.call('HMGET', prefix .. 'claim:' .. c .. ':' .. q,
+        'client', 'request', 'node_digest', 'node_id', 'deadline', 'sequence', 'generation', 'lease_expires')
+      for _, value in ipairs(claim) do if value == false then return {'schema'} end end
+      if not claim_expiry or not tonumber(claim_expiry) or claim[1] ~= c or claim[2] ~= q or
+         claim[3] ~= values[4] or claim[4] ~= values[10] or tonumber(claim[5]) ~= lifecycle_deadline or
+         claim[6] ~= values[11] or claim[7] ~= values[12] or tonumber(claim[8]) ~= tonumber(claim_expiry) then return {'schema'} end
       record.claim_expiry = tonumber(claim_expiry)
+    elseif values[12] or redis.call('EXISTS', prefix .. 'claim:' .. c .. ':' .. q) ~= 0 or
+           redis.call('ZSCORE', claim_expiries, member) then return {'schema'}
     end
   else return {'schema'} end
   table.insert(records, record)
@@ -693,28 +706,98 @@ end
 
 -- Project the same bounded deadline bridge and final short-reservation sweep used
 -- by admission.  Projection state is carried between transitions but never stored.
-local terminal_members = redis.call('ZRANGEBYSCORE', terminal_expiries, '(' .. now, '+inf', 'LIMIT', 0, max_terminals + 1)
-local control_members = redis.call('ZRANGEBYSCORE', control_expiries, '(' .. now, '+inf', 'LIMIT', 0, max_controls + 1)
-if #terminal_members > max_terminals or #control_members > max_controls then return {'schema'} end
-local terminal_count, control_count = #terminal_members, #control_members
-local client_terminals, node_controls = {}, {}
-for _, member in ipairs(terminal_members) do
-  local colon = string.find(member, ':', 1, true)
-  if not colon then return {'schema'} end
-  local c = string.sub(member, 1, colon - 1)
-  client_terminals[c] = (client_terminals[c] or 0) + 1
+local function digest(value)
+  return value and string.len(value) == 64 and not string.find(value, '[^0-9a-f]')
 end
-for _, member in ipairs(control_members) do
+local function split_terminal(member)
+  local sep = string.find(member, ':', 1, true)
+  local c = sep and string.sub(member, 1, sep - 1)
+  local q = sep and string.sub(member, sep + 1)
+  if not digest(c) or not digest(q) then return nil end
+  return c, q
+end
+local function terminal_valid(member, score)
+  local c, q = split_terminal(member)
+  if not c or not score then return false end
+  local v = redis.call('HMGET', prefix .. 'terminal:' .. c .. ':' .. q,
+    'client', 'request', 'node_id', 'owner_digest', 'consumer_digest', 'generation',
+    'accepted_at_epoch', 'replay_expires_at_epoch', 'expires_at_epoch', 'outcome', 'reason')
+  for _, value in ipairs(v) do if value == false then return false end end
+  local accepted, replay, expiry, generation = tonumber(v[7]), tonumber(v[8]), tonumber(v[9]), tonumber(v[6])
+  local inactive = (v[10] == 'expired' and v[11] == 'request_deadline_expired') or
+    (v[10] == 'cancelled' and (v[11] == 'requester_cancelled' or v[11] == 'server_unregistered'))
+  local actors_valid = (inactive and ((generation == 0 and v[4] == '' and v[5] == '') or
+    (generation and generation >= 1 and digest(v[4]) and digest(v[5])))) or
+    (v[10] == 'completed' and v[11] == 'response_completed' and generation and generation >= 1 and digest(v[4]) and digest(v[5]))
+  return v[1] == c and v[2] == q and string.len(v[3]) <= max_node_id_bytes and
+    actors_valid and accepted and replay and expiry and
+    accepted <= now and replay >= accepted and expiry >= replay and expiry == score and
+    (inactive or (v[10] == 'completed' and v[11] == 'response_completed'))
+end
+local function control_valid(member, score)
+  local a = string.find(member, ':', 1, true)
+  local b = a and string.find(member, ':', a + 1, true)
+  local n = a and string.sub(member, 1, a - 1)
+  local c = b and string.sub(member, a + 1, b - 1)
+  local q = b and string.sub(member, b + 1)
+  if not digest(n) or not digest(c) or not digest(q) or not score then return false end
+  local v = redis.call('HMGET', prefix .. 'control:' .. n .. ':' .. c .. ':' .. q,
+    'client', 'request', 'node_digest', 'node_id', 'owner_digest', 'consumer_digest',
+    'generation', 'status', 'reason', 'deadline', 'acknowledged', 'expires_at_epoch')
+  for _, value in ipairs(v) do if value == false then return false end end
+  local expiry, generation = tonumber(v[12]), tonumber(v[7])
+  local terminal_score = tonumber(redis.call('ZSCORE', terminal_expiries, c .. ':' .. q))
+  return v[1] == c and v[2] == q and v[3] == n and string.len(v[4]) <= max_node_id_bytes and
+    digest(v[5]) and digest(v[6]) and generation and generation >= 1 and tonumber(v[10]) and
+    (v[11] == '0' or v[11] == '1') and expiry == score and terminal_score and
+    terminal_valid(c .. ':' .. q, terminal_score) and
+    ((v[8] == 'expired' and v[9] == 'request_deadline_expired') or
+     (v[8] == 'cancelled' and (v[9] == 'requester_cancelled' or v[9] == 'server_unregistered')))
+end
+local terminal_rows = redis.call('ZRANGE', terminal_expiries, 0, max_terminals, 'WITHSCORES')
+local control_rows = redis.call('ZRANGE', control_expiries, 0, max_controls, 'WITHSCORES')
+if #terminal_rows / 2 > max_terminals or #control_rows / 2 > max_controls then return {'schema'} end
+local terminal_count, control_count = 0, 0
+local client_terminals, node_controls = {}, {}
+local paired_controls = {}
+for i=1,#terminal_rows,2 do
+  local member, score = terminal_rows[i], tonumber(terminal_rows[i+1])
+  if not terminal_valid(member, score) then return {'schema'} end
+  local c, q = split_terminal(member)
+  local node = redis.call('HGET', prefix .. 'request:' .. c .. ':' .. q, 'node_digest')
+  if not digest(node) then return {'schema'} end
+  local control_member = node .. ':' .. member
+  local control_score = tonumber(redis.call('ZSCORE', control_expiries, control_member))
+  local control_exists = redis.call('EXISTS', prefix .. 'control:' .. node .. ':' .. c .. ':' .. q)
+  if (control_exists ~= 0 or control_score) and
+     (control_exists ~= 1 or not control_score or not control_valid(control_member, control_score)) then return {'schema'} end
+  if score <= now then
+    if control_exists == 1 then paired_controls[control_member] = true end
+  else
+    terminal_count = terminal_count + 1
+    client_terminals[c] = (client_terminals[c] or 0) + 1
+  end
+end
+for i=1,#control_rows,2 do
+  local member, score = control_rows[i], tonumber(control_rows[i+1])
+  if not control_valid(member, score) then return {'schema'} end
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
   local n = string.sub(member, 1, colon - 1)
-  node_controls[n] = (node_controls[n] or 0) + 1
+  if score > now and not paired_controls[member] then
+    control_count = control_count + 1
+    node_controls[n] = (node_controls[n] or 0) + 1
+  end
 end
 local deferred, attempts = {}, 0
 while attempts < batch + 1 do
   local due = nil
+  local window = 0
   for _, record in ipairs(records) do
-    if record.retained and record.deadline <= now and not deferred[record.member] then due = record; break end
+    if record.retained and record.deadline <= now and window < batch + 1 then
+      window = window + 1
+      if not deferred[record.member] then due = record; break end
+    end
   end
   if not due then break end
   local needs_control = due.state == 'claimed' and due.claim_expiry >= due.deadline
@@ -732,20 +815,29 @@ while attempts < batch + 1 do
   end
   attempts = attempts + 1
 end
--- A further non-deferred deadline would exhaust the Python bridge retry bound.
-local bridge_blocked = false
-for _, record in ipairs(records) do
-  if record.retained and record.deadline <= now and not deferred[record.member] then bridge_blocked = true; break end
-end
+-- Deferred members remain in the bounded window on every retry.  Admission
+-- proceeds once that window contains no further transition it can attempt.
+local bridge_blocked = attempts >= batch + 1 and due ~= nil
 if not bridge_blocked then
   local cleaned = 0
-  local expired_tokens = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, batch + 1)
-  for _, token in ipairs(expired_tokens) do
+  -- Successful deadline cancellation removes its reservation index member;
+  -- rebuild the limited expiry window from the projected retained population.
+  local expired_records = {}
+  for _, record in ipairs(records) do
+    if record.retained and record.state == 'reserved' and record.expires <= now then
+      table.insert(expired_records, record)
+    end
+  end
+  table.sort(expired_records, function(a,b)
+    if a.expires ~= b.expires then return a.expires < b.expires end
+    return a.token < b.token
+  end)
+  for i=1,math.min(#expired_records, batch + 1) do
     if cleaned < batch then
-      for _, record in ipairs(records) do
-        if record.retained and record.state == 'reserved' and record.token == token and record.deadline > now then
-          record.retained = false; cleaned = cleaned + 1; break
-        end
+      local record = expired_records[i]
+      if record.deadline > now then
+        record.retained = false
+        cleaned = cleaned + 1
       end
     end
   end
@@ -824,7 +916,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "4e664329c632cc8e247833469a5d063c52d7516e15d2e66812d12640f4fd7345",  # pragma: allowlist secret
+    "f684c26a7d5271841fbc520d50a253703be9872784fd00df9088dcf48fb2d413",  # pragma: allowlist secret
     False,
 )
 

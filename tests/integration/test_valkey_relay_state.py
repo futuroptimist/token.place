@@ -14249,18 +14249,20 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
     writer = _registration_store(
         valkey_server,
         namespace,
-        max_request_lifecycles=1,
-        max_reservations=1,
+        max_request_lifecycles=2,
+        max_reservations=2,
         max_scheduler_fingerprints=1,
         node_transition_batch_size=1,
+        lease_ttl_seconds=300,
     )
     observer = _registration_store(
         valkey_server,
         namespace,
-        max_request_lifecycles=1,
-        max_reservations=1,
+        max_request_lifecycles=2,
+        max_reservations=2,
         max_scheduler_fingerprints=1,
         node_transition_batch_size=1,
+        lease_ttl_seconds=300,
     )
     node, identity = "availability-expiry-node", ("expired-client", "expired-request")
     cfg, client = writer._foundation.config, writer._foundation._client
@@ -14300,7 +14302,6 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
             assert (snapshot.reason, snapshot.schedulable_compute_nodes) == ("available", 1)
         assert _read_exact_keys(client, keys) == before
 
-        writer.renew(node, _digest("availability-expiry-owner"))
         fresh_deadline = writer._foundation.server_time()[0] + 30
         admitted = observer.select_and_reserve(
             *identity, "qwen3-8b-instruct", "8k-fast", fresh_deadline

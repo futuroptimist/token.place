@@ -33,6 +33,7 @@ from relay_state_store import (
     EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     EnqueueResult,
+    EligibilitySnapshot,
     NodeTombstoneRecord,
     NodeTransitionResult,
     ProgressRecord,
@@ -2870,6 +2871,76 @@ RATE_LIMIT_MULTI_SCRIPT = ReviewedScript(
     True,
 )
 
+
+INSPECT_ELIGIBILITY_SOURCE = """\
+local leases, deadlines = KEYS[1], KEYS[2]
+local prefix, model, requested_tier = ARGV[1], ARGV[2], ARGV[3]
+local requested_tokens, max_nodes, max_lifecycles = tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6])
+local max_node_reservations, max_depth = tonumber(ARGV[7]), tonumber(ARGV[8])
+local tier_8k, tier_64k = tonumber(ARGV[9]), tonumber(ARGV[10])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local members = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
+if #members > max_lifecycles then return {'schema'} end
+local reservations, queued = {}, {}
+for _, member in ipairs(members) do
+  local colon = string.find(member, ':', 1, true)
+  if not colon then return {'schema'} end
+  local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
+  if string.len(c) ~= 64 or string.len(q) ~= 64 or string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
+  local score = tonumber(redis.call('ZSCORE', deadlines, member))
+  local values = redis.call('HMGET', prefix..'request:'..c..':'..q, 'state', 'node_digest', 'deadline')
+  if not score or not values[1] or not values[2] or tonumber(values[3]) ~= score then return {'schema'} end
+  if score > now then
+    if values[1] == 'reserved' then reservations[values[2]] = (reservations[values[2]] or 0) + 1
+    elseif values[1] == 'queued' or values[1] == 'claimed' then queued[values[2]] = (queued[values[2]] or 0) + 1
+    else return {'schema'} end
+  end
+end
+local nodes = redis.call('ZRANGEBYSCORE', leases, '('..now, '+inf', 'LIMIT', 0, max_nodes + 1)
+if #nodes > max_nodes then return {'schema'} end
+local registered, healthy, matching, schedulable = #nodes, 0, 0, 0
+for _, digest in ipairs(nodes) do
+  if string.len(digest) ~= 64 or string.find(digest, '[^0-9a-f]') then return {'schema'} end
+  local lease = tonumber(redis.call('ZSCORE', leases, digest))
+  local values = redis.call('HMGET', prefix..'node:'..digest, 'lease_expires_at_epoch', 'supported_model_ids',
+    'active_context_tier', 'maximum_total_context_tokens', 'max_concurrency', 'scheduler_healthy',
+    'scheduler_draining', 'scheduler_claimed_work')
+  for _, value in ipairs(values) do if not value then return {'schema'} end end
+  if tonumber(values[1]) ~= lease then return {'schema'} end
+  if redis.call('ZSCORE', prefix..'node_work:'..digest, '!schema:1') ~= '0' then return {'schema'} end
+  local ok, models = pcall(cjson.decode, values[2])
+  if not ok or type(models) ~= 'table' then return {'schema'} end
+  local tier_tokens = values[3] == '8k-fast' and tier_8k or (values[3] == '64k-full' and tier_64k or nil)
+  local maximum, concurrency, claimed = tonumber(values[4]), tonumber(values[5]), tonumber(values[8])
+  if not tier_tokens or not maximum or not concurrency or not claimed or concurrency < 1 or claimed < 0 then return {'schema'} end
+  if values[6] ~= '0' and values[6] ~= '1' then return {'schema'} end
+  if values[7] ~= '0' and values[7] ~= '1' then return {'schema'} end
+  if values[6] == '1' and values[7] == '0' then
+    healthy = healthy + 1
+    local supports = false
+    for _, candidate in ipairs(models) do if candidate == model then supports = true end end
+    if supports and tier_tokens >= requested_tokens and maximum >= requested_tokens then
+      matching = matching + 1
+      local reserved, pending = reservations[digest] or 0, queued[digest] or 0
+      if reserved + pending + claimed < concurrency and reserved < max_node_reservations and reserved + pending < max_depth then
+        schedulable = schedulable + 1
+      end
+    end
+  end
+end
+local reason = schedulable > 0 and 'available' or (registered == 0 and 'no_registered_compute_nodes' or
+  (healthy == 0 and 'no_healthy_compute_nodes' or (matching == 0 and 'no_matching_compute_node' or 'no_available_capacity')))
+return {reason, tostring(registered), tostring(healthy), tostring(matching), tostring(schedulable)}
+"""
+
+INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
+    "inspect_eligibility_v1",
+    INSPECT_ELIGIBILITY_SOURCE,
+    "ff0880d43a3027f139900f3f012531be3e39ac84923a7966473b9d497f360516",  # pragma: allowlist secret
+    False,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -2889,6 +2960,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         OWNER_AUTHORITY_SCRIPT.name: OWNER_AUTHORITY_SCRIPT,
         RATE_LIMIT_SCRIPT.name: RATE_LIMIT_SCRIPT,
         RATE_LIMIT_MULTI_SCRIPT.name: RATE_LIMIT_MULTI_SCRIPT,
+        INSPECT_ELIGIBILITY_SCRIPT.name: INSPECT_ELIGIBILITY_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -2897,6 +2969,7 @@ SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
 _SHARED_LIMIT_SCRIPT_NAMES = frozenset(
     {OWNER_AUTHORITY_SCRIPT.name, RATE_LIMIT_SCRIPT.name, RATE_LIMIT_MULTI_SCRIPT.name}
 )
+_AVAILABILITY_SCRIPT_NAMES = frozenset({INSPECT_ELIGIBILITY_SCRIPT.name})
 
 
 class ValkeyFoundation:
@@ -3067,6 +3140,54 @@ class ValkeyFoundation:
             pipeline.watch(key)
             stored = self._call(pipeline.get, key)
             if stored is None or SchemaManifest.decode(stored) != legacy:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            pipeline.multi()
+            pipeline.set(key, expected.encode())
+            result = self._call(pipeline.execute)
+            if result != [True]:
+                raise ValkeyUnavailableError("state backend command failed")
+        except WatchError:
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        except ResponseError as exc:
+            if "READONLY" in str(exc).upper():
+                raise ValkeyReadOnlyError("state backend is not writable") from None
+            raise ValkeyUnavailableError("state backend command failed") from None
+        except RedisError:
+            raise ValkeyUnavailableError("state backend unavailable") from None
+        finally:
+            pipeline.reset()
+        manifest = self.read_manifest()
+        self.check_read_compatible(manifest)
+        self.check_write_compatible(manifest)
+        return manifest
+
+    def migrate_availability_manifest(self, *, namespace_stopped: bool) -> SchemaManifest:
+        """CAS the exact pre-availability manifest in an explicitly stopped namespace."""
+
+        if namespace_stopped is not True:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expected = self.expected_manifest
+        predecessor = SchemaManifest(
+            schema_major=expected.schema_major,
+            active_schema_revision=expected.active_schema_revision,
+            active_writer_revision=expected.active_writer_revision,
+            reader_min=expected.reader_min,
+            reader_max=expected.reader_max,
+            writer_min=expected.writer_min,
+            writer_max=expected.writer_max,
+            script_digests={
+                name: digest
+                for name, digest in expected.script_digests.items()
+                if name not in _AVAILABILITY_SCRIPT_NAMES
+            },
+            migration_epoch=expected.migration_epoch,
+        )
+        key = self.config.key("schema")
+        pipeline = self._client.pipeline()
+        try:
+            pipeline.watch(key)
+            stored = self._call(pipeline.get, key)
+            if stored is None or SchemaManifest.decode(stored) != predecessor:
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             pipeline.multi()
             pipeline.set(key, expected.encode())
@@ -3887,6 +4008,48 @@ class ValkeyRegistrationStore:
         if status == "schema":
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         return status == "ok"
+
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot:
+        model, tier, _ = self._model_tier_deadline(
+            requested_model_id, requested_context_tier, 1.0
+        )
+        cfg = self._foundation.config
+        result = self._foundation.execute(
+            INSPECT_ELIGIBILITY_SCRIPT.name,
+            (cfg.key("nodes:lease"), cfg.key("requests:deadline")),
+            (
+                cfg.key_prefix.encode(),
+                model.encode(),
+                tier.encode(),
+                str(CONTEXT_TIER_TOKEN_BOUNDS[tier]).encode(),
+                str(self.config.max_compute_nodes).encode(),
+                str(self.config.max_request_lifecycles).encode(),
+                str(self.config.max_reservations_per_node).encode(),
+                str(self.config.max_queue_depth_per_node).encode(),
+                str(CONTEXT_TIER_TOKEN_BOUNDS["8k-fast"]).encode(),
+                str(CONTEXT_TIER_TOKEN_BOUNDS["64k-full"]).encode(),
+            ),
+        )
+        status, values = self._ascii_status(result)
+        if status == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status not in {
+            "available",
+            "no_registered_compute_nodes",
+            "no_healthy_compute_nodes",
+            "no_matching_compute_node",
+            "no_available_capacity",
+        } or len(values) != 4:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            counts = tuple(int(self._decode_text(value)) for value in values)
+        except (TypeError, ValueError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        if any(value < 0 or value > self.config.max_compute_nodes for value in counts):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return EligibilitySnapshot(status, *counts)
 
     def select_and_reserve(
         self,

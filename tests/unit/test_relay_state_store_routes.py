@@ -11,12 +11,49 @@ from unittest.mock import Mock
 import pytest
 
 import relay
-from relay_state_store import RelayStateStoreError
+from relay_state_store import EligibilitySnapshot, RelayStateStoreError
 from valkey_relay_state import (
     ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
+
+
+def test_availability_route_returns_fixed_bounded_contract(monkeypatch):
+    store = Mock()
+    store.inspect_eligibility.return_value = EligibilitySnapshot(
+        "available", 3, 2, 1, 1
+    )
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+
+    response = relay.app.test_client().get("/api/v1/relay/availability")
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.get_json() == {
+        "status": "available",
+        "reason": "available",
+        "registered_compute_nodes": 3,
+        "healthy_compute_nodes": 2,
+        "matching_compute_nodes": 1,
+        "schedulable_compute_nodes": 1,
+    }
+    store.inspect_eligibility.assert_called_once_with(
+        "qwen3-8b-instruct", "8k-fast"
+    )
+
+
+def test_availability_route_bounds_backend_failure(monkeypatch):
+    store = Mock()
+    store.inspect_eligibility.side_effect = RelayStateStoreError("secret backend")
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+
+    response = relay.app.test_client().get("/api/v1/relay/availability")
+
+    assert response.status_code == 503
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.get_json()["reason"] == "state_backend_unavailable"
+    assert b"secret backend" not in response.data
 
 
 @pytest.mark.parametrize("handler_path", ["installed", "serve"])

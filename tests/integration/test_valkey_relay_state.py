@@ -14539,3 +14539,117 @@ def test_availability_node_work_validation_is_namespace_isolated(valkey_server):
         bad._foundation._client.delete(*bad_keys)
         bad.close()
         good.close()
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("missing_owner", "bad_consumer", "fractional_generation", "lease_after_deadline"),
+)
+def test_availability_rejects_deadline_claim_authority_without_mutation(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    observer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    node, owner = "availability-claim-authority", _digest("availability-claim-owner")
+    identity = (f"availability-claim-{corruption}", "request")
+    fresh = (f"availability-fresh-{corruption}", "request")
+    try:
+        writer.register(node, _capabilities(concurrency=2), owner)
+        seconds, micros = writer._foundation.server_time()
+        _enqueue_claim_fixture(writer, node, owner, *identity, seconds + micros / 1_000_000 + 60)
+        writer.claim_queued_request(node, owner, "availability-consumer")
+        cfg, client = writer._foundation.config, writer._foundation._client
+        c, q = writer._identity(*identity)
+        member, claim_key = f"{c}:{q}", cfg.key("claim", c, q)
+        due = writer._foundation.server_time()[0] - 1
+        client.hset(cfg.key("request", c, q), "deadline", due)
+        client.hset(claim_key, mapping={"deadline": due, "lease_expires": due})
+        client.zadd(cfg.key("requests:deadline"), {member: due})
+        client.zadd(cfg.key("claims:expiry"), {member: due})
+        if corruption == "missing_owner":
+            client.hdel(claim_key, "owner_digest")
+        elif corruption == "bad_consumer":
+            client.hset(claim_key, "consumer_digest", "not-a-digest")
+        elif corruption == "fractional_generation":
+            client.hset(claim_key, "generation", "1.5")
+            client.hset(cfg.key("request", c, q), "claim_generation", "1.5")
+        else:
+            client.hset(claim_key, "lease_expires", due + 10)
+            client.zadd(cfg.key("claims:expiry"), {member: due + 10})
+        before = _lifecycle_authority_snapshot(writer, node, identity)
+        for store in (writer, observer, writer):
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert _lifecycle_authority_snapshot(writer, node, identity) == before
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.select_and_reserve(
+                *fresh, "qwen3-8b-instruct", "8k-fast",
+                writer._foundation.server_time()[0] + 30,
+            )
+        assert _lifecycle_authority_snapshot(writer, node, identity) == before
+    finally:
+        _delete_claim_fixture_state(writer, (node,), (identity, fresh))
+        observer.close()
+        writer.close()
+
+@pytest.mark.parametrize(
+    "corruption", (None, "lifecycle_state", "retrieval_digest", "paired_owner", "paired_deadline")
+)
+def test_availability_validates_retained_terminal_control_authority(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    observer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    node, owner = "availability-retained-authority", _digest("availability-retained-owner")
+    identity = (f"availability-retained-{corruption or 'valid'}", "request")
+    fresh = (f"availability-retained-fresh-{corruption or 'valid'}", "request")
+    try:
+        writer.register(node, _capabilities(concurrency=2), owner)
+        now = writer._foundation.server_time()[0]
+        _enqueue_claim_fixture(writer, node, owner, *identity, now + 60)
+        writer.claim_queued_request(node, owner, "availability-retained-consumer")
+        keys = _retained_authority_keys(writer, node, identity)
+        claim_key = writer._foundation.config.key("claim", *writer._identity(*identity))
+        due = now - 1
+        writer._foundation._client.hset(keys["request"], "deadline", due)
+        writer._foundation._client.hset(claim_key, mapping={"deadline": due, "lease_expires": due})
+        writer._foundation._client.zadd(keys["deadline_index"], {keys["member"]: due})
+        writer._foundation._client.zadd(
+            writer._foundation.config.key("claims:expiry"), {keys["member"]: due}
+        )
+        writer.cancel_or_expire_request(
+            *identity, status="expired", reason="request_deadline_expired"
+        )
+        _force_retained_authority_due(writer, keys)
+        if corruption == "lifecycle_state":
+            writer._foundation._client.hset(keys["request"], "state", "cancelled")
+        elif corruption == "retrieval_digest":
+            writer._foundation._client.hset(
+                keys["terminal"], "retrieval_credential_digest", "not-a-digest"
+            )
+        elif corruption == "paired_owner":
+            writer._foundation._client.hset(keys["control"], "owner_digest", _digest("wrong"))
+        elif corruption == "paired_deadline":
+            writer._foundation._client.hset(keys["control"], "deadline", due - 1)
+        exact = tuple(keys[name] for name in (
+            "request", "terminal", "control", "terminal_index", "control_index",
+            "deadline_index",
+        ))
+        before = _read_exact_keys(writer._foundation._client, exact)
+        for store in (writer, observer, writer):
+            if corruption is None:
+                assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "available"
+            else:
+                with pytest.raises(ValkeySchemaIncompatibleError):
+                    store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert _read_exact_keys(writer._foundation._client, exact) == before
+        deadline = writer._foundation.server_time()[0] + 30
+        if corruption is None:
+            assert observer.select_and_reserve(
+                *fresh, "qwen3-8b-instruct", "8k-fast", deadline
+            ).selected_node_id == node
+    finally:
+        _delete_claim_fixture_state(writer, (node,), (identity, fresh))
+        observer.close()
+        writer.close()

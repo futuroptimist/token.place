@@ -641,12 +641,15 @@ local fingerprint, max_fingerprints, max_node_id_bytes =
   ARGV[11], tonumber(ARGV[12]), tonumber(ARGV[13])
 local batch, max_terminals, max_client_terminals, max_controls, max_node_controls =
   tonumber(ARGV[14]), tonumber(ARGV[15]), tonumber(ARGV[16]), tonumber(ARGV[17]), tonumber(ARGV[18])
+local max_identity, max_request_envelope, max_response_envelope = tonumber(ARGV[19]), tonumber(ARGV[20]), tonumber(ARGV[21])
 if not requested_tokens or not max_nodes or not max_res or not max_lifecycles or
    not max_node_res or not max_depth or not max_fingerprints or not max_node_id_bytes or
    not batch or not max_terminals or not max_client_terminals or not max_controls or not max_node_controls or
+   not max_identity or not max_request_envelope or not max_response_envelope or
    requested_tokens < 1 or max_nodes < 1 or max_res < 1 or max_lifecycles < 1 or
    max_node_res < 1 or max_depth < 1 or max_fingerprints < 1 or max_node_id_bytes < 1 or
    batch < 1 or max_terminals < 1 or max_client_terminals < 1 or max_controls < 1 or max_node_controls < 1 or
+   max_identity < 1 or max_request_envelope < 1 or max_response_envelope < 1 or
    string.len(model) < 1 or string.len(model) > 128 or
    string.len(fingerprint) ~= 64 or string.find(fingerprint, '[^0-9a-f]') then return {'schema'} end
 local t = redis.call('TIME')
@@ -655,6 +658,9 @@ local nodes = redis.call('ZRANGEBYSCORE', leases, '(' .. now, '+inf', 'LIMIT', 0
 if #nodes > max_nodes then return {'schema'} end
 local lifecycle = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
 if #lifecycle > max_lifecycles then return {'schema'} end
+local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
+local function integer(value) local n=finite(value); return n and n>=0 and n<=9007199254740990 and n%1==0 and tostring(n)==value and n end
+local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
 local records = {}
 for _, member in ipairs(lifecycle) do
   local colon = string.find(member, ':', 1, true)
@@ -691,12 +697,16 @@ for _, member in ipairs(lifecycle) do
     if values[1] == 'claimed' then
       local claim_expiry = redis.call('ZSCORE', claim_expiries, member)
       local claim = redis.call('HMGET', prefix .. 'claim:' .. c .. ':' .. q,
-        'client', 'request', 'node_digest', 'node_id', 'deadline', 'sequence', 'generation', 'lease_expires')
+        'client', 'request', 'node_digest', 'node_id', 'owner_digest', 'consumer_digest',
+        'deadline', 'sequence', 'generation', 'lease_expires')
       for _, value in ipairs(claim) do if value == false then return {'schema'} end end
-      if not claim_expiry or not tonumber(claim_expiry) or claim[1] ~= c or claim[2] ~= q or
-         claim[3] ~= values[4] or claim[4] ~= values[10] or tonumber(claim[5]) ~= lifecycle_deadline or
-         claim[6] ~= values[11] or claim[7] ~= values[12] or tonumber(claim[8]) ~= tonumber(claim_expiry) then return {'schema'} end
-      record.claim_expiry = tonumber(claim_expiry)
+      local sequence, generation, lease = integer(claim[8]), integer(claim[9]), finite(claim[10])
+      if not claim_expiry or not finite(claim_expiry) or claim[1] ~= c or claim[2] ~= q or
+         claim[3] ~= values[4] or claim[4] ~= values[10] or not digest(claim[5]) or not digest(claim[6]) or
+         finite(claim[7]) ~= lifecycle_deadline or not sequence or claim[8] ~= values[11] or
+         not generation or generation < 1 or claim[9] ~= values[12] or not lease or
+         lease > lifecycle_deadline or lease ~= finite(claim_expiry) then return {'schema'} end
+      record.claim_expiry = lease
     elseif values[12] or redis.call('EXISTS', prefix .. 'claim:' .. c .. ':' .. q) ~= 0 or
            redis.call('ZSCORE', claim_expiries, member) then return {'schema'}
     end
@@ -706,9 +716,6 @@ end
 
 -- Project the same bounded deadline bridge and final short-reservation sweep used
 -- by admission.  Projection state is carried between transitions but never stored.
-local function digest(value)
-  return value and string.len(value) == 64 and not string.find(value, '[^0-9a-f]')
-end
 local function split_terminal(member)
   local sep = string.find(member, ':', 1, true)
   local c = sep and string.sub(member, 1, sep - 1)
@@ -721,18 +728,64 @@ local function terminal_valid(member, score)
   if not c or not score then return false end
   local v = redis.call('HMGET', prefix .. 'terminal:' .. c .. ':' .. q,
     'client', 'request', 'node_id', 'owner_digest', 'consumer_digest', 'generation',
-    'accepted_at_epoch', 'replay_expires_at_epoch', 'expires_at_epoch', 'outcome', 'reason')
+    'accepted_at_epoch', 'replay_expires_at_epoch', 'expires_at_epoch', 'outcome', 'reason',
+    'retrieval_state', 'response_digest', 'retrieval_credential_digest', 'acknowledgement_digest',
+    'cancellation_token_digest')
+  local l = redis.call('HMGET', prefix .. 'request:' .. c .. ':' .. q,
+    'state', 'client', 'request', 'client_public_key', 'request_id', 'node_id', 'node_digest',
+    'deadline', 'sequence', 'claim_generation', 'queue_entry', 'token_digest', 'cancellation_digest', 'envelope')
   for _, value in ipairs(v) do if value == false then return false end end
-  local accepted, replay, expiry, generation = tonumber(v[7]), tonumber(v[8]), tonumber(v[9]), tonumber(v[6])
+  for i, value in ipairs(l) do
+    if value == false and (i == 1 or i == 2 or i == 3 or i == 6 or i == 7 or i == 8 or i == 10 or i == 12 or i == 13) then return false end
+  end
+  local accepted, replay, expiry, generation = finite(v[7]), finite(v[8]), finite(v[9]), integer(v[6])
+  local deadline, lifecycle_generation = finite(l[8]), integer(l[10])
+  if redis.call('EXISTS', prefix .. 'terminal:' .. c .. ':' .. q) ~= 1 or v[1] ~= c or v[2] ~= q or
+     v[3] == '' or string.len(v[3]) > max_node_id_bytes or not accepted or accepted > now or not replay or
+     replay < accepted or not expiry or expiry < replay or expiry ~= score or not deadline or
+     l[2] ~= c or l[3] ~= q or l[6] ~= v[3] or not digest(l[7]) or not digest(l[12]) or
+     lifecycle_generation ~= generation or l[12] ~= v[14] or l[13] ~= v[16] or
+     redis.call('ZSCORE', deadlines, member) or redis.call('EXISTS', prefix .. 'claim:' .. c .. ':' .. q) ~= 0 or
+     redis.call('ZSCORE', claim_expiries, member) or redis.call('EXISTS', prefix .. 'progress:' .. c .. ':' .. q) ~= 0 or
+     redis.call('EXISTS', prefix .. 'reservation:' .. l[12]) ~= 0 or redis.call('ZSCORE', expiries, l[12]) then return false end
+  local extended = l[4] or l[5] or l[9] or l[11] or l[14]
+  if generation > 0 and not extended then return false end
+  if extended then
+    local sequence = integer(l[9])
+    if not l[4] or string.len(l[4]) < 1 or string.len(l[4]) > max_identity or
+       not l[5] or string.len(l[5]) < 1 or string.len(l[5]) > max_identity or not sequence or sequence < 1 or
+       l[11] ~= l[9] .. '-0' or not l[14] or string.len(l[14]) < 1 or string.len(l[14]) > max_request_envelope or
+       #redis.call('XRANGE', prefix .. 'queue:' .. l[7], l[11], l[11], 'COUNT', 1) ~= 0 then return false end
+  end
   local inactive = (v[10] == 'expired' and v[11] == 'request_deadline_expired') or
     (v[10] == 'cancelled' and (v[11] == 'requester_cancelled' or v[11] == 'server_unregistered'))
-  local actors_valid = (inactive and ((generation == 0 and v[4] == '' and v[5] == '') or
-    (generation and generation >= 1 and digest(v[4]) and digest(v[5])))) or
-    (v[10] == 'completed' and v[11] == 'response_completed' and generation and generation >= 1 and digest(v[4]) and digest(v[5]))
-  return v[1] == c and v[2] == q and string.len(v[3]) <= max_node_id_bytes and
-    actors_valid and accepted and replay and expiry and
-    accepted <= now and replay >= accepted and expiry >= replay and expiry == score and
-    (inactive or (v[10] == 'completed' and v[11] == 'response_completed'))
+  if inactive then
+    local cancellation_ok = (v[10] == 'cancelled' and ((v[11] == 'requester_cancelled' and digest(v[16])) or
+      (v[11] == 'server_unregistered' and (v[16] == '' or digest(v[16]))))) or
+      (v[10] == 'expired' and (v[16] == '' or digest(v[16])))
+    return cancellation_ok and v[12] == 'completed_unavailable' and v[13] == '' and replay == accepted and
+      v[15] == '' and l[1] == v[10] and (v[10] ~= 'expired' or deadline <= accepted) and
+      ((generation == 0 and v[4] == '' and v[5] == '') or
+       (generation and generation >= 1 and digest(v[4]) and digest(v[5]))) and
+      redis.call('EXISTS', prefix .. 'response:' .. c .. ':' .. q) == 0 and
+      not redis.call('ZSCORE', prefix .. 'responses:expiry', member)
+  end
+  if v[10] ~= 'completed' or v[11] ~= 'response_completed' or
+     (v[12] ~= 'response_ready' and v[12] ~= 'acknowledged' and v[12] ~= 'retrieval_expired') or
+     not digest(v[4]) or not digest(v[5]) or not generation or generation < 1 or not digest(v[13]) or
+     not digest(v[14]) or not digest(v[15]) or not digest(v[16]) or l[1] ~= 'response_ready' then return false end
+  local response = prefix .. 'response:' .. c .. ':' .. q
+  local response_score = finite(redis.call('ZSCORE', prefix .. 'responses:expiry', member))
+  if v[12] == 'response_ready' then
+    local rv = redis.call('HMGET', response, 'client', 'request', 'client_public_key', 'request_id', 'node_id',
+      'consumer_digest', 'generation', 'envelope', 'accepted_at_epoch', 'response_digest', 'replay_expires_at_epoch', 'status')
+    for _, value in ipairs(rv) do if value == false then return false end end
+    return redis.call('EXISTS', response) == 1 and response_score == replay and rv[1] == c and rv[2] == q and
+      rv[3] == l[4] and rv[4] == l[5] and rv[5] == v[3] and rv[6] == v[5] and rv[7] == v[6] and
+      string.len(rv[8]) >= 1 and string.len(rv[8]) <= max_response_envelope and rv[9] == v[7] and
+      rv[10] == v[13] and rv[11] == v[8] and rv[12] == 'response_ready'
+  end
+  return redis.call('EXISTS', response) == 0 and not response_score
 end
 local function control_valid(member, score)
   local a = string.find(member, ':', 1, true)
@@ -745,14 +798,21 @@ local function control_valid(member, score)
     'client', 'request', 'node_digest', 'node_id', 'owner_digest', 'consumer_digest',
     'generation', 'status', 'reason', 'deadline', 'acknowledged', 'expires_at_epoch')
   for _, value in ipairs(v) do if value == false then return false end end
-  local expiry, generation = tonumber(v[12]), tonumber(v[7])
+  local expiry, generation = finite(v[12]), integer(v[7])
   local terminal_score = tonumber(redis.call('ZSCORE', terminal_expiries, c .. ':' .. q))
-  return v[1] == c and v[2] == q and v[3] == n and string.len(v[4]) <= max_node_id_bytes and
-    digest(v[5]) and digest(v[6]) and generation and generation >= 1 and tonumber(v[10]) and
+  if not (v[1] == c and v[2] == q and v[3] == n and string.len(v[4]) <= max_node_id_bytes and
+    digest(v[5]) and digest(v[6]) and generation and generation >= 1 and finite(v[10]) and
     (v[11] == '0' or v[11] == '1') and expiry == score and terminal_score and
     terminal_valid(c .. ':' .. q, terminal_score) and
     ((v[8] == 'expired' and v[9] == 'request_deadline_expired') or
-     (v[8] == 'cancelled' and (v[9] == 'requester_cancelled' or v[9] == 'server_unregistered')))
+     (v[8] == 'cancelled' and (v[9] == 'requester_cancelled' or v[9] == 'server_unregistered')))) then return false end
+  local tv = redis.call('HMGET', prefix .. 'terminal:' .. c .. ':' .. q,
+    'outcome', 'reason', 'node_id', 'owner_digest', 'consumer_digest', 'generation', 'accepted_at_epoch')
+  local lv = redis.call('HMGET', prefix .. 'request:' .. c .. ':' .. q, 'node_digest', 'deadline')
+  local accepted, deadline = finite(tv[7]), finite(lv[2])
+  return tv[1] == v[8] and tv[2] == v[9] and tv[3] == v[4] and tv[4] == v[5] and
+    tv[5] == v[6] and tv[6] == v[7] and lv[1] == n and lv[2] == v[10] and accepted and deadline and
+    (v[9] == 'server_unregistered' or (v[8] == 'expired' and deadline <= accepted) or accepted <= deadline)
 end
 local terminal_rows = redis.call('ZRANGE', terminal_expiries, 0, max_terminals, 'WITHSCORES')
 local control_rows = redis.call('ZRANGE', control_expiries, 0, max_controls, 'WITHSCORES')
@@ -924,7 +984,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "0ef409e2e6b25e8320f6e0376fd70c86a4366a734125d2ec4a955fb9a41ec4dd",  # pragma: allowlist secret
+    "73f6c2ee27930363796fb6c14b8cfb9cc0bf2b152aaaa636991db4d51c8d8c4a",  # pragma: allowlist secret
     False,
 )
 
@@ -4297,6 +4357,9 @@ class ValkeyRegistrationStore:
                     str(self.config.max_terminal_records_per_client).encode(),
                     str(self.config.max_control_tombstones).encode(),
                     str(self.config.max_control_tombstones_per_node).encode(),
+                    str(self.config.max_identity_bytes).encode(),
+                    str(self.config.max_envelope_bytes).encode(),
+                    str(self.config.max_response_envelope_bytes).encode(),
                 ),
             )
         )

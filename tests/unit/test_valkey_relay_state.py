@@ -439,7 +439,7 @@ def test_progress_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
-        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "657bbc9d9fd7bfa200480c552edcabf6ca17e816cb4fcf8c73a67724d2ebb8cb"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
         (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "ee7253365cd3517a8b48f714c12077d1677d425481c2304684366c07caa29d22"),  # pragma: allowlist secret
         (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "d4784e8bb3c2c1f0ef6d402dfb32ca3172d6678184f45b2d56b37aa54ee3167e"),  # pragma: allowlist secret
@@ -1353,6 +1353,86 @@ def test_manifest_is_immutable_and_round_trips_canonically():
         value.script_digests["new"] = "0" * 64
     with pytest.raises(dataclasses.FrozenInstanceError):
         value.migration_epoch = 1
+
+
+def _pre_availability_manifest(expected):
+    digests = dict(expected.script_digests)
+    digests.pop(valkey_relay_state.INSPECT_ELIGIBILITY_SCRIPT.name)
+    digests[valkey_relay_state.SELECT_AND_RESERVE_SCRIPT.name] = (
+        "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"
+    )  # pragma: allowlist secret
+    return dataclasses.replace(expected, script_digests=digests)
+
+
+def _availability_migration_foundation(stored):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    pipeline = foundation._client.pipeline.return_value
+    pipeline.get.return_value = stored.encode()
+    pipeline.execute.return_value = [True]
+    foundation._client.get.return_value = foundation.expected_manifest.encode()
+    foundation._call = lambda operation, *args: operation(*args)
+    return foundation, pipeline
+
+
+def test_availability_manifest_migration_requires_exact_stopped_legacy_manifest():
+    expected = manifest()
+    legacy = _pre_availability_manifest(expected)
+    foundation, pipeline = _availability_migration_foundation(legacy)
+
+    migrated = foundation.migrate_availability_manifest(namespace_stopped=True)
+
+    assert migrated == expected
+    pipeline.watch.assert_called_once_with(foundation.config.key("schema"))
+    pipeline.multi.assert_called_once_with()
+    pipeline.set.assert_called_once_with(
+        foundation.config.key("schema"), expected.encode()
+    )
+    pipeline.execute.assert_called_once_with()
+    pipeline.reset.assert_called_once_with()
+    foundation._client.delete.assert_not_called()
+
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.migrate_availability_manifest(namespace_stopped=False)
+
+
+@pytest.mark.parametrize("mismatch", ("metadata", "digest"))
+def test_availability_manifest_migration_rejects_mismatched_legacy(mismatch):
+    expected = manifest()
+    legacy = _pre_availability_manifest(expected)
+    if mismatch == "metadata":
+        legacy = dataclasses.replace(legacy, migration_epoch=1)
+    else:
+        digests = dict(legacy.script_digests)
+        digests[valkey_relay_state.SELECT_AND_RESERVE_SCRIPT.name] = "0" * 64
+        legacy = dataclasses.replace(legacy, script_digests=digests)
+    foundation, pipeline = _availability_migration_foundation(legacy)
+
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.migrate_availability_manifest(namespace_stopped=True)
+
+    pipeline.multi.assert_not_called()
+    pipeline.execute.assert_not_called()
+    pipeline.reset.assert_called_once_with()
+
+
+def test_availability_manifest_migration_rejects_cas_conflict():
+    expected = manifest()
+    foundation, pipeline = _availability_migration_foundation(
+        _pre_availability_manifest(expected)
+    )
+    pipeline.execute.side_effect = redis.WatchError
+
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.migrate_availability_manifest(namespace_stopped=True)
+
+    pipeline.set.assert_called_once_with(
+        foundation.config.key("schema"), expected.encode()
+    )
+    pipeline.reset.assert_called_once_with()
+    foundation._client.get.assert_not_called()
 
 
 def test_arbitrary_and_digest_mismatched_scripts_are_rejected():

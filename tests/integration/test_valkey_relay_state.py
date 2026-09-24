@@ -14303,8 +14303,18 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
             assert (snapshot.reason, snapshot.schedulable_compute_nodes) == ("available", 1)
         assert _read_exact_keys(client, keys) == before
 
-        fresh = writer._identity(*fresh_identity)
-        assert not client.exists(cfg.key("request", *fresh))
+        fresh_deadline = writer._foundation.server_time()[0] + 30
+        admitted = observer.select_and_reserve(
+            *fresh_identity,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            fresh_deadline,
+            "fresh-cancel",
+        )
+        assert admitted.selected_node_id == node
+        assert observer.cancel_or_expire_request(
+            *fresh_identity, "fresh-cancel"
+        ).state == "cancelled"
     finally:
         fresh = writer._identity(*fresh_identity)
         cleanup = list(keys) if "keys" in locals() else []
@@ -14316,7 +14326,7 @@ def test_availability_projects_short_reservation_cleanup_before_admission(valkey
 
 @pytest.mark.parametrize(
     ("due_count", "short_expired", "expected_reason"),
-    ((2, False, "available"), (3, False, "no_available_capacity")),
+    ((2, True, "available"), (3, True, "no_available_capacity")),
 )
 def test_availability_projects_deadline_retry_boundary_for_fresh_admission(
     valkey_server, due_count, short_expired, expected_reason

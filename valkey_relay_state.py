@@ -1025,7 +1025,7 @@ local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, b
 for _, token in ipairs(expired) do
   if cleaned < batch and token ~= addressed_token then
     local rkey = prefix .. 'reservation:' .. token
-    local c, q = redis.call('HMGET', rkey, 'client', 'request')
+    local c, q = unpack(redis.call('HMGET', rkey, 'client', 'request'))
     if not c or not q then return {'schema'} end
     if c ~= client or q ~= request or not addressed then
       local ok, err = reclaim(c, q)
@@ -1241,7 +1241,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947",  # pragma: allowlist secret
+    "657bbc9d9fd7bfa200480c552edcabf6ca17e816cb4fcf8c73a67724d2ebb8cb",  # pragma: allowlist secret
     True,
 )
 
@@ -3394,7 +3394,11 @@ class ValkeyFoundation:
         legacy = replace(
             expected,
             script_digests={
-                name: digest
+                name: (
+                    "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"
+                    if name == SELECT_AND_RESERVE_SCRIPT.name
+                    else digest
+                )
                 for name, digest in expected.script_digests.items()
                 if name != INSPECT_ELIGIBILITY_SCRIPT.name
             },

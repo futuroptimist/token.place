@@ -32,12 +32,25 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
         import signal
         import threading
         chained = []
-        signal.signal(signal.SIGTERM, lambda signum, frame: chained.append(signum))
-        signal.signal(signal.SIGINT, lambda signum, frame: chained.append(signum))
+        chained_event = threading.Event()
+        def _record_chain(signum, frame):
+            chained.append(signum)
+            if len(chained) >= 2:
+                chained_event.set()
+        signal.signal(signal.SIGTERM, _record_chain)
+        signal.signal(signal.SIGINT, _record_chain)
         import relay
 
         if not {pthread_sigmask!r}:
             relay.signal.pthread_sigmask = None
+
+        drain_complete = threading.Event()
+        _original_begin_draining = relay._begin_draining
+        def _begin_draining_traced():
+            result = _original_begin_draining()
+            drain_complete.set()
+            return result
+        relay._begin_draining = _begin_draining_traced
 
         client = relay.app.test_client()
         registration = client.post('/api/v1/relay/servers/register', json={{
@@ -92,6 +105,9 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
                 assert sent.wait(2)
                 sender.join()
 
+        if {handler_path!r} == 'installed':
+            assert chained_event.wait(2)
+        assert drain_complete.wait(2)
         assert relay.DRAINING.wait(2)
         denied = client.get('/api/v1/relay/servers/next', query_string={{
             'client_public_key': 'late-client', 'request_id': 'late',

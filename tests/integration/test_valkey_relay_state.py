@@ -14542,7 +14542,11 @@ def test_availability_node_work_validation_is_namespace_isolated(valkey_server):
 
 @pytest.mark.parametrize(
     "corruption",
-    ("missing_owner", "bad_consumer", "fractional_generation", "lease_after_deadline"),
+    (
+        "missing_owner", "bad_consumer", "fractional_generation", "lease_after_deadline",
+        "missing_progress_expiry", "progress_owner", "invalid_token", "fractional_sequence",
+        "scientific_deadline", "valid_progress",
+    ),
 )
 def test_availability_rejects_deadline_claim_authority_without_mutation(
     valkey_server, corruption
@@ -14557,15 +14561,26 @@ def test_availability_rejects_deadline_claim_authority_without_mutation(
         writer.register(node, _capabilities(concurrency=2), owner)
         seconds, micros = writer._foundation.server_time()
         _enqueue_claim_fixture(writer, node, owner, *identity, seconds + micros / 1_000_000 + 60)
-        writer.claim_queued_request(node, owner, "availability-consumer")
+        claim = writer.claim_queued_request(node, owner, "availability-consumer")
         cfg, client = writer._foundation.config, writer._foundation._client
         c, q = writer._identity(*identity)
         member, claim_key = f"{c}:{q}", cfg.key("claim", c, q)
+        if corruption in {"missing_progress_expiry", "progress_owner", "valid_progress"}:
+            writer.replace_encrypted_progress_if_claimed(
+                node, owner, "availability-consumer", *identity, claim.generation,
+                EncryptedProgressEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+            )
         due = writer._foundation.server_time()[0] - 1
         client.hset(cfg.key("request", c, q), "deadline", due)
         client.hset(claim_key, mapping={"deadline": due, "lease_expires": due})
         client.zadd(cfg.key("requests:deadline"), {member: due})
         client.zadd(cfg.key("claims:expiry"), {member: due})
+        if corruption in {"missing_progress_expiry", "progress_owner", "valid_progress"}:
+            progress_key = cfg.key("progress", c, q)
+            client.hset(progress_key, "deadline", due)
+            client.zadd(cfg.key("progress:expiry"), {member: due})
         if corruption == "missing_owner":
             client.hdel(claim_key, "owner_digest")
         elif corruption == "bad_consumer":
@@ -14573,27 +14588,63 @@ def test_availability_rejects_deadline_claim_authority_without_mutation(
         elif corruption == "fractional_generation":
             client.hset(claim_key, "generation", "1.5")
             client.hset(cfg.key("request", c, q), "claim_generation", "1.5")
-        else:
+        elif corruption == "lease_after_deadline":
             client.hset(claim_key, "lease_expires", due + 10)
             client.zadd(cfg.key("claims:expiry"), {member: due + 10})
+        elif corruption == "missing_progress_expiry":
+            client.zrem(cfg.key("progress:expiry"), member)
+        elif corruption == "progress_owner":
+            client.hset(progress_key, "owner_digest", _digest("wrong-progress-owner"))
+        elif corruption == "invalid_token":
+            client.hset(cfg.key("request", c, q), "token_digest", "not-a-digest")
+        elif corruption == "fractional_sequence":
+            client.hset(cfg.key("request", c, q), "sequence", "1.5")
+            client.hset(claim_key, "sequence", "1.5")
+        elif corruption == "scientific_deadline":
+            client.hset(cfg.key("request", c, q), "deadline", "9.9e2")
+            client.hset(claim_key, mapping={"deadline": "9.9e2", "lease_expires": "9.9e2"})
+            client.zadd(cfg.key("requests:deadline"), {member: 990})
+            client.zadd(cfg.key("claims:expiry"), {member: 990})
         before = _lifecycle_authority_snapshot(writer, node, identity)
+        exact = (
+            cfg.key("progress:expiry"), cfg.key("cursor"),
+            cfg.key("node_work", writer._node_digest(node)),
+        )
+        exact_before = _read_exact_keys(client, exact)
         for store in (writer, observer, writer):
-            with pytest.raises(ValkeySchemaIncompatibleError):
-                store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+            if corruption == "valid_progress":
+                assert store.inspect_eligibility(
+                    "qwen3-8b-instruct", "8k-fast"
+                ).reason == "available"
+            else:
+                with pytest.raises(ValkeySchemaIncompatibleError):
+                    store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
         assert _lifecycle_authority_snapshot(writer, node, identity) == before
-        with pytest.raises(ValkeySchemaIncompatibleError):
-            observer.select_and_reserve(
+        assert _read_exact_keys(client, exact) == exact_before
+        if corruption == "valid_progress":
+            assert observer.select_and_reserve(
                 *fresh, "qwen3-8b-instruct", "8k-fast",
                 writer._foundation.server_time()[0] + 30,
-            )
-        assert _lifecycle_authority_snapshot(writer, node, identity) == before
+            ).selected_node_id == node
+        else:
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                observer.select_and_reserve(
+                    *fresh, "qwen3-8b-instruct", "8k-fast",
+                    writer._foundation.server_time()[0] + 30,
+                )
+        if corruption != "valid_progress":
+            assert _lifecycle_authority_snapshot(writer, node, identity) == before
     finally:
         _delete_claim_fixture_state(writer, (node,), (identity, fresh))
         observer.close()
         writer.close()
 
 @pytest.mark.parametrize(
-    "corruption", (None, "lifecycle_state", "retrieval_digest", "paired_owner", "paired_deadline")
+    "corruption",
+    (
+        None, "lifecycle_state", "retrieval_digest", "paired_owner", "paired_deadline",
+        "scientific_accepted", "scientific_replay",
+    ),
 )
 def test_availability_validates_retained_terminal_control_authority(
     valkey_server, corruption
@@ -14632,6 +14683,10 @@ def test_availability_validates_retained_terminal_control_authority(
             writer._foundation._client.hset(keys["control"], "owner_digest", _digest("wrong"))
         elif corruption == "paired_deadline":
             writer._foundation._client.hset(keys["control"], "deadline", due - 1)
+        elif corruption == "scientific_accepted":
+            writer._foundation._client.hset(keys["terminal"], "accepted_at_epoch", "9.8e2")
+        elif corruption == "scientific_replay":
+            writer._foundation._client.hset(keys["terminal"], "replay_expires_at_epoch", "9.8e2")
         exact = tuple(keys[name] for name in (
             "request", "terminal", "control", "terminal_index", "control_index",
             "deadline_index",

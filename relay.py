@@ -2366,12 +2366,15 @@ def livez():
     return jsonify({"status": "alive"})
 
 
-def _publish_availability_metrics(reason: str, schedulable: int, *, store_up: bool) -> None:
+def _publish_availability_metrics(
+    reason: str, schedulable: int, *, store_up: bool | None
+) -> None:
     """Publish only fixed-cardinality, process-local availability observations."""
 
     RELAY_CHAT_AVAILABLE.set(1 if reason == "available" else 0)
     RELAY_SCHEDULABLE_COMPUTE_NODES.set(schedulable)
-    RELAY_STATE_STORE_UP.set(1 if store_up else 0)
+    if store_up is not None:
+        RELAY_STATE_STORE_UP.set(1 if store_up else 0)
     for state in AVAILABILITY_STATE_ENUM:
         RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(1 if state == reason else 0)
 
@@ -2382,7 +2385,8 @@ def api_v1_relay_availability():
     """Report canonical scheduler capacity without mutating shared state."""
 
     if DRAINING.is_set():
-        _publish_availability_metrics("no_available_capacity", 0, store_up=True)
+        # No backend operation occurred, so preserve its last observed health.
+        _publish_availability_metrics("no_available_capacity", 0, store_up=None)
         response = jsonify({
             "available": False, "reason": "no_available_capacity",
             "registered_compute_nodes": 0, "healthy_compute_nodes": 0,

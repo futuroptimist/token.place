@@ -922,11 +922,16 @@ def test_availability_route_reports_canonical_capacity_without_reservation():
         "schedulable_compute_nodes": 1,
     }
     assert before == (store.list_reservations(), store._fairness_cursors)
+    assert relay.RELAY_STATE_STORE_UP._value.get() == 1
 
 
-def test_availability_route_bounds_backend_failures(monkeypatch):
+@pytest.mark.parametrize(
+    "failure",
+    [RelayStateStoreError("secret backend URL"), ValkeySchemaIncompatibleError("secret schema")],
+)
+def test_availability_route_bounds_backend_failures(monkeypatch, failure):
     store = Mock()
-    store.inspect_eligibility.side_effect = RelayStateStoreError("secret backend URL")
+    store.inspect_eligibility.side_effect = failure
     monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
     response = relay.app.test_client().get("/api/v1/relay/availability")
     assert response.status_code == 503
@@ -936,24 +941,34 @@ def test_availability_route_bounds_backend_failures(monkeypatch):
         "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
     }
     assert b"secret" not in response.data
+    assert relay.RELAY_STATE_STORE_UP._value.get() == 0
 
 
-def test_availability_route_drain_short_circuits_state_backend(monkeypatch):
+@pytest.mark.parametrize("initial_store_up", [0, 1])
+def test_availability_route_drain_short_circuits_state_backend(
+    monkeypatch, initial_store_up
+):
     backend = Mock(side_effect=AssertionError("draining probe touched backend"))
     monkeypatch.setattr(relay, "_api_v1_health_store", backend)
+    relay.RELAY_STATE_STORE_UP.set(initial_store_up)
     relay.DRAINING.set()
     try:
-        response = relay.app.test_client().get("/api/v1/relay/availability")
+        responses = [
+            relay.app.test_client().get("/api/v1/relay/availability")
+            for _ in range(2)
+        ]
     finally:
         relay.DRAINING.clear()
 
-    assert response.status_code == 503
-    assert response.get_json() == {
-        "available": False, "reason": "no_available_capacity",
-        "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
-        "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
-    }
-    assert response.headers["Cache-Control"] == "no-store"
+    for response in responses:
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "available": False, "reason": "no_available_capacity",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        }
+        assert response.headers["Cache-Control"] == "no-store"
+    assert relay.RELAY_STATE_STORE_UP._value.get() == initial_store_up
     backend.assert_not_called()
 
 

@@ -31,13 +31,48 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
         import os
         import signal
         import threading
+        import time
+
+        # A signal's registered Python-level handler only actually runs when
+        # the interpreter returns to bytecode dispatch on the main thread.
+        # If the OS delivers the underlying signal to a different thread
+        # than the one blocked in threading.Event.wait(), that blocking
+        # C-level wait is not interrupted and can consume its entire
+        # timeout before the handler ever runs. A bounded poll that
+        # repeatedly yields back to Python bytecode does not have this
+        # blind spot, so every checkpoint below observes progress this way
+        # instead of via a single blocking wait().
+        def _wait_bounded(predicate, timeout=2.0, interval=0.005):
+            deadline = time.monotonic() + timeout
+            while True:
+                if predicate():
+                    return True
+                if time.monotonic() >= deadline:
+                    return predicate()
+                time.sleep(interval)
+
         chained = []
-        signal.signal(signal.SIGTERM, lambda signum, frame: chained.append(signum))
-        signal.signal(signal.SIGINT, lambda signum, frame: chained.append(signum))
+        chained_seen = set()
+        chained_event = threading.Event()
+        def _record_chain(signum, frame):
+            chained.append(signum)
+            chained_seen.add(signum)
+            if {{signal.SIGTERM, signal.SIGINT}} <= chained_seen:
+                chained_event.set()
+        signal.signal(signal.SIGTERM, _record_chain)
+        signal.signal(signal.SIGINT, _record_chain)
         import relay
 
         if not {pthread_sigmask!r}:
             relay.signal.pthread_sigmask = None
+
+        drain_complete = threading.Event()
+        _original_begin_draining = relay._begin_draining
+        def _begin_draining_traced():
+            result = _original_begin_draining()
+            drain_complete.set()
+            return result
+        relay._begin_draining = _begin_draining_traced
 
         client = relay.app.test_client()
         registration = client.post('/api/v1/relay/servers/register', json={{
@@ -92,6 +127,9 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
                 assert sent.wait(2)
                 sender.join()
 
+        if {handler_path!r} == 'installed':
+            assert _wait_bounded(chained_event.is_set)
+        assert _wait_bounded(drain_complete.is_set)
         assert relay.DRAINING.wait(2)
         denied = client.get('/api/v1/relay/servers/next', query_string={{
             'client_public_key': 'late-client', 'request_id': 'late',
@@ -111,6 +149,124 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
     completed = subprocess.run(
         [sys.executable, "-c", program],
         cwd=os.fspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_signal_checkpoint_bounded_poll_observes_cross_thread_delivery():
+    """Bounded polling reliably observes a signal handled on another thread.
+
+    Python only runs a registered signal handler on the real main thread's
+    own bytecode-dispatch loop -- no other thread's activity can trigger it.
+    A single blocking threading.Event.wait() call is not guaranteed to
+    observe delivery promptly: if the OS delivers the underlying signal to a
+    *different* thread than the one blocked in wait(), whether the handler
+    manages to run before that wait's timeout elapses depends on exactly
+    what the main thread happens to be doing in between -- which cannot be
+    controlled or forced one way or the other from outside (an earlier
+    version of this test tried to force the old pattern to fail on every
+    run; the reviewer proved that assumption wrong with a scheduling
+    variation where delivery legitimately raced ahead and the old pattern
+    succeeded instead -- a real, valid outcome, not a bug to paper over).
+    So this test does not attempt to characterize the old pattern's
+    behavior at all; it verifies the bounded-poll replacement directly,
+    under conditions whose *ordering* is deterministic by construction
+    (not by timing), plus the genuinely-missing-progress case.
+    """
+
+    program = textwrap.dedent(
+        """
+        import signal
+        import threading
+        import time
+
+        SIG = signal.SIGUSR1
+        progress = threading.Event()
+
+        def _on_signal(signum, frame):
+            progress.set()
+
+        signal.signal(SIG, _on_signal)
+
+        def _wait_bounded(predicate, timeout, interval=0.005):
+            deadline = time.monotonic() + timeout
+            while True:
+                if predicate():
+                    return True
+                if time.monotonic() >= deadline:
+                    return predicate()
+                time.sleep(interval)
+
+        def _prepare_delivery():
+            # Block SIG on a worker thread and queue it there via
+            # pthread_kill: POSIX semantics mean a signal sent to a thread
+            # that has it blocked is queued pending-for-that-thread only,
+            # not delivered anywhere, until that thread itself unblocks it.
+            # This lets the caller control exactly when delivery becomes
+            # *possible*, independent of when it's actually observed.
+            worker_ready = threading.Event()
+            release = threading.Event()
+            state = {}
+
+            def worker():
+                signal.pthread_sigmask(signal.SIG_BLOCK, {SIG})
+                state['tid'] = threading.get_ident()
+                worker_ready.set()
+                release.wait()
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {SIG})
+
+            thread = threading.Thread(target=worker, daemon=False)
+            thread.start()
+            worker_ready.wait()
+            signal.pthread_kill(state['tid'], SIG)
+            return thread, release
+
+        # Case 1: progress already observed before entry -- the trivial
+        # but necessary baseline.
+        progress.set()
+        assert _wait_bounded(progress.is_set, timeout=0.2) is True
+        progress.clear()
+
+        # Case 2: cross-thread delivery released *during* observation. The
+        # worker is only released from inside the predicate itself, on its
+        # first invocation -- i.e. only once _wait_bounded's polling loop
+        # has actually begun calling it. This establishes "delivery happens
+        # while polling is already underway" through real code ordering
+        # (the release call cannot execute before the predicate is called,
+        # and the predicate is only called from inside the loop), not
+        # through a sleep or any assumption about scheduling speed.
+        worker_thread, release = _prepare_delivery()
+        released = {"done": False}
+
+        def _predicate():
+            if not released["done"]:
+                released["done"] = True
+                release.set()
+            return progress.is_set()
+
+        result = _wait_bounded(_predicate, timeout=2.0)
+        worker_thread.join(timeout=2)
+        assert result is True, (
+            "bounded polling should observe cross-thread signal delivery "
+            "released during observation, within its bound"
+        )
+        assert progress.is_set()
+
+        # Missing progress must still correctly fail within its bound -- the
+        # checkpoint must not become a trivial always-True check.
+        miss_start = time.monotonic()
+        miss_result = _wait_bounded(lambda: False, timeout=0.2)
+        miss_elapsed = time.monotonic() - miss_start
+        assert miss_result is False
+        assert miss_elapsed >= 0.19
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
         capture_output=True,
         text=True,
         timeout=10,

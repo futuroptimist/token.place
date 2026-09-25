@@ -158,31 +158,24 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
 
 
 def test_signal_checkpoint_bounded_poll_observes_cross_thread_delivery():
-    """A single blocking Event.wait() can miss a cross-thread signal handler.
+    """Bounded polling reliably observes a signal handled on another thread.
 
     Python only runs a registered signal handler on the real main thread's
     own bytecode-dispatch loop -- no other thread's activity can trigger it.
-    If the OS delivers the underlying signal to a *different* thread than
-    the one blocked in threading.Event.wait(), that blocking C-level wait is
-    not reliably interrupted and can consume its entire timeout budget
-    before the handler ever runs, even though the handler fires almost
-    immediately once wait() returns.
-
-    Demonstrating this deterministically requires care: naively releasing
-    the delivering thread and then starting the old checkpoint's wait() is
-    itself a race (the handler can run first, during whatever code executes
-    on the main thread in between -- e.g. some blocking calls like
-    time.sleep() are signal-responsive and can let it run early, which is a
-    legitimate scheduling outcome, not a bug). To make the demonstration
-    reliable regardless of scheduling, delivery is only triggered *after*
-    the observer thread has confirmed it is about to block in wait() --
-    removing the ordering race rather than assuming any particular timing.
-
-    This shows the bounded-poll checkpoint does not share this blind spot
-    (it reliably observes delivery within its bound, though not necessarily
-    fast -- no latency requirement is imposed beyond the bound itself),
-    while a genuinely missing signal still correctly fails within its
-    bound.
+    A single blocking threading.Event.wait() call is not guaranteed to
+    observe delivery promptly: if the OS delivers the underlying signal to a
+    *different* thread than the one blocked in wait(), whether the handler
+    manages to run before that wait's timeout elapses depends on exactly
+    what the main thread happens to be doing in between -- which cannot be
+    controlled or forced one way or the other from outside (an earlier
+    version of this test tried to force the old pattern to fail on every
+    run; the reviewer proved that assumption wrong with a scheduling
+    variation where delivery legitimately raced ahead and the old pattern
+    succeeded instead -- a real, valid outcome, not a bug to paper over).
+    So this test does not attempt to characterize the old pattern's
+    behavior at all; it verifies the bounded-poll replacement directly,
+    under conditions whose *ordering* is deterministic by construction
+    (not by timing), plus the genuinely-missing-progress case.
     """
 
     program = textwrap.dedent(
@@ -214,7 +207,7 @@ def test_signal_checkpoint_bounded_poll_observes_cross_thread_delivery():
             # that has it blocked is queued pending-for-that-thread only,
             # not delivered anywhere, until that thread itself unblocks it.
             # This lets the caller control exactly when delivery becomes
-            # possible, independent of when it's actually observed.
+            # *possible*, independent of when it's actually observed.
             worker_ready = threading.Event()
             release = threading.Event()
             state = {}
@@ -232,58 +225,39 @@ def test_signal_checkpoint_bounded_poll_observes_cross_thread_delivery():
             signal.pthread_kill(state['tid'], SIG)
             return thread, release
 
-        # OLD checkpoint pattern: a single blocking Event.wait() call. Run
-        # it on a separate observer thread, and confirm (via an Event) that
-        # the observer is about to block in wait() *before* releasing the
-        # worker -- so the signal cannot possibly become deliverable before
-        # the checkpoint under test has already started blocking.
+        # Case 1: progress already observed before entry -- the trivial
+        # but necessary baseline.
+        progress.set()
+        assert _wait_bounded(progress.is_set, timeout=0.2) is True
+        progress.clear()
+
+        # Case 2: cross-thread delivery released *during* observation. The
+        # worker is only released from inside the predicate itself, on its
+        # first invocation -- i.e. only once _wait_bounded's polling loop
+        # has actually begun calling it. This establishes "delivery happens
+        # while polling is already underway" through real code ordering
+        # (the release call cannot execute before the predicate is called,
+        # and the predicate is only called from inside the loop), not
+        # through a sleep or any assumption about scheduling speed.
         worker_thread, release = _prepare_delivery()
-        observer_started = threading.Event()
-        observer_result = {}
+        released = {"done": False}
 
-        def observer():
-            observer_started.set()
-            start = time.monotonic()
-            observer_result['old_result'] = progress.wait(0.3)
-            observer_result['old_elapsed'] = time.monotonic() - start
+        def _predicate():
+            if not released["done"]:
+                released["done"] = True
+                release.set()
+            return progress.is_set()
 
-        observer_thread = threading.Thread(target=observer, daemon=False)
-        observer_thread.start()
-        observer_started.wait()
-        release.set()  # only now does delivery become possible
-        observer_thread.join(timeout=2)
+        result = _wait_bounded(_predicate, timeout=2.0)
         worker_thread.join(timeout=2)
-
-        assert observer_result['old_result'] is False, (
-            "expected the old single-wait checkpoint to miss delivery that "
-            "only became possible after it had already started blocking"
+        assert result is True, (
+            "bounded polling should observe cross-thread signal delivery "
+            "released during observation, within its bound"
         )
-        assert observer_result['old_elapsed'] >= 0.29, (
-            "expected the old checkpoint to consume its full timeout budget"
-        )
-        # The handler did fire -- just too late for the wait() call above
-        # to observe it before its timeout elapsed.
         assert progress.is_set()
 
-        # NEW checkpoint pattern: repeat with the same cross-thread
-        # delivery, this time observed via bounded polling. Each short
-        # sleep() inside _wait_bounded returns control to bytecode
-        # dispatch, giving the main thread many chances to run the pending
-        # handler within its bound -- so, unlike the old pattern, this does
-        # not depend on a specific ordering to be reliable. Only the bound
-        # itself is asserted; no additional latency requirement is imposed.
-        progress.clear()
-        worker_thread, release = _prepare_delivery()
-        release.set()
-        new_result = _wait_bounded(progress.is_set, timeout=2.0)
-        worker_thread.join(timeout=2)
-        assert new_result is True, (
-            "bounded polling should observe cross-thread signal delivery "
-            "within its bound"
-        )
-
         # Missing progress must still correctly fail within its bound -- the
-        # replacement checkpoint must not become a trivial always-True check.
+        # checkpoint must not become a trivial always-True check.
         miss_start = time.monotonic()
         miss_result = _wait_bounded(lambda: False, timeout=0.2)
         miss_elapsed = time.monotonic() - miss_start

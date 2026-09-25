@@ -14708,3 +14708,137 @@ def test_availability_validates_retained_terminal_control_authority(
         _delete_claim_fixture_state(writer, (node,), (identity, fresh))
         observer.close()
         writer.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "corruption"),
+    (
+        ("reserved", "reservation_node"),
+        ("reserved", "reservation_cancellation"),
+        ("reserved", "missing_lifecycle_node"),
+        ("reserved", "conflicting_claim"),
+        ("queued", "retained_reservation"),
+        ("claimed", "unindexed_control"),
+    ),
+)
+def test_availability_rejects_active_authority_conflicts_without_mutation(
+    valkey_server, state, corruption
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    observer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    node, owner = "availability-active-authority", _digest("availability-active-owner")
+    identity = (f"availability-active-{corruption}", "request")
+    fresh = (f"availability-active-fresh-{corruption}", "request")
+    try:
+        writer.register(node, _capabilities(concurrency=2), owner)
+        now = writer._foundation.server_time()[0]
+        selection = writer.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", now + 60, "cancel"
+        )
+        if state != "reserved":
+            writer.enqueue_encrypted_request(
+                *identity, selection.reservation_token, node,
+                "qwen3-8b-instruct", "8k-fast", now + 60,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+                "cancel",
+            )
+        if state == "claimed":
+            writer.claim_queued_request(node, owner, "availability-active-consumer")
+
+        cfg, client = writer._foundation.config, writer._foundation._client
+        c, q = writer._identity(*identity)
+        member = f"{c}:{q}"
+        request_key = cfg.key("request", c, q)
+        request = client.hgetall(request_key)
+        token = request[b"token_digest"].decode()
+        node_digest = writer._node_digest(node)
+        reservation_key = cfg.key("reservation", token)
+        claim_key = cfg.key("claim", c, q)
+        control_key = cfg.key("control", node_digest, c, q)
+        due = writer._foundation.server_time()[0] - 1
+        client.hset(request_key, "deadline", due)
+        client.zadd(cfg.key("requests:deadline"), {member: due})
+        if state == "reserved":
+            client.hset(reservation_key, mapping={"deadline": due, "reservation_expires": due})
+            client.hset(request_key, "reservation_expires", due)
+            client.zadd(cfg.key("reservations:expiry"), {token: due})
+        elif state == "claimed":
+            client.hset(claim_key, mapping={"deadline": due, "lease_expires": due})
+            client.zadd(cfg.key("claims:expiry"), {member: due})
+
+        if corruption == "reservation_node":
+            client.hset(reservation_key, "node_id", "different-node")
+        elif corruption == "reservation_cancellation":
+            client.hset(reservation_key, "cancellation_digest", _digest("different-cancel"))
+        elif corruption == "missing_lifecycle_node":
+            client.hdel(request_key, "node_id")
+        elif corruption == "conflicting_claim":
+            client.hset(claim_key, "conflict", "1")
+        elif corruption == "retained_reservation":
+            client.hset(reservation_key, "conflict", "1")
+        elif corruption == "unindexed_control":
+            client.hset(control_key, "conflict", "1")
+
+        exact = (
+            request_key, reservation_key, claim_key, control_key,
+            cfg.key("requests:deadline"), cfg.key("reservations:expiry"),
+            cfg.key("claims:expiry"), cfg.key("control:expiry"),
+            cfg.key("node_work", node_digest), cfg.key("cursor"),
+        )
+        before = _read_exact_keys(client, exact)
+        for store in (writer, observer, writer):
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert _read_exact_keys(client, exact) == before
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.select_and_reserve(
+                *fresh, "qwen3-8b-instruct", "8k-fast",
+                writer._foundation.server_time()[0] + 30,
+            )
+        assert _read_exact_keys(client, exact) == before
+    finally:
+        _delete_claim_fixture_state(writer, (node,), (identity, fresh))
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("state", ("reserved", "queued", "claimed"))
+def test_availability_accepts_valid_active_authority_before_fresh_admission(
+    valkey_server, state
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    observer = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    node, owner = "availability-valid-active", _digest("availability-valid-owner")
+    identity, fresh = ((f"availability-valid-{state}", "request"),
+                       (f"availability-valid-fresh-{state}", "request"))
+    try:
+        writer.register(node, _capabilities(concurrency=2), owner)
+        now = writer._foundation.server_time()[0]
+        selection = writer.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", now + 60, "cancel"
+        )
+        if state != "reserved":
+            writer.enqueue_encrypted_request(
+                *identity, selection.reservation_token, node,
+                "qwen3-8b-instruct", "8k-fast", now + 60,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+                "cancel",
+            )
+        if state == "claimed":
+            writer.claim_queued_request(node, owner, "availability-valid-consumer")
+        assert observer.inspect_eligibility(
+            "qwen3-8b-instruct", "8k-fast"
+        ).reason == "available"
+        assert observer.select_and_reserve(
+            *fresh, "qwen3-8b-instruct", "8k-fast", now + 60
+        ).selected_node_id == node
+    finally:
+        _delete_claim_fixture_state(writer, (node,), (identity, fresh))
+        observer.close()
+        writer.close()

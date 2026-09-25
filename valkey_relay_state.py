@@ -729,12 +729,19 @@ for _, member in ipairs(lifecycle) do
   local lifecycle_deadline, indexed_deadline = bounded_number(values[5], false), redis.call('ZSCORE', deadlines, member)
   if not values[1] or values[2] ~= c or values[3] ~= q or not values[4] or
      string.len(values[4]) ~= 64 or string.find(values[4], '[^0-9a-f]') or
+     not values[10] or values[10] == '' or string.len(values[10]) > max_node_id_bytes or
      not lifecycle_deadline or not indexed_deadline or finite(indexed_deadline) ~= lifecycle_deadline or
      redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], '!schema:1') ~= '0' or
      redis.call('ZSCORE', prefix .. 'node_work:' .. values[4], member) ~= '1' or
      not values[7] or not digest(values[7]) or
-     (values[13] and values[13] ~= '' and not digest(values[13])) or
+     values[13] == false or (values[13] ~= '' and not digest(values[13])) or
      not values[8] or string.len(values[8]) ~= 64 or string.find(values[8], '[^0-9a-f]') then return {'schema'} end
+  local terminal_key, response_key = prefix .. 'terminal:' .. c .. ':' .. q, prefix .. 'response:' .. c .. ':' .. q
+  local control_member = values[4] .. ':' .. member
+  if redis.call('EXISTS', terminal_key) ~= 0 or redis.call('ZSCORE', terminal_expiries, member) or
+     redis.call('EXISTS', response_key) ~= 0 or redis.call('ZSCORE', prefix .. 'responses:expiry', member) or
+     redis.call('EXISTS', prefix .. 'control:' .. values[4] .. ':' .. c .. ':' .. q) ~= 0 or
+     redis.call('ZSCORE', control_expiries, control_member) then return {'schema'} end
   local record = {member=member, client=c, request=q, state=values[1], node=values[4],
     deadline=lifecycle_deadline, expires=tonumber(values[6]), token=values[7], fingerprint=values[8], retained=true}
   if values[1] == 'reserved' then
@@ -743,16 +750,21 @@ for _, member in ipairs(lifecycle) do
     local indexed = redis.call('ZSCORE', expiries, values[7])
     if not indexed or tonumber(indexed) ~= tonumber(values[6]) then return {'schema'} end
     local r = redis.call('HMGET', prefix .. 'reservation:' .. values[7], 'client', 'request',
-      'node_digest', 'deadline', 'reservation_expires', 'token_digest')
+      'node_digest', 'node_id', 'deadline', 'reservation_expires', 'token_digest', 'cancellation_digest')
     for _, value in ipairs(r) do if not value then return {'schema'} end end
-    if r[1] ~= c or r[2] ~= q or r[3] ~= values[4] or bounded_number(r[4], false) ~= lifecycle_deadline or
-       bounded_number(r[5], false) ~= bounded_number(values[6], false) or r[6] ~= values[7] then return {'schema'} end
+    if r[1] ~= c or r[2] ~= q or r[3] ~= values[4] or r[4] ~= values[10] or
+       bounded_number(r[5], false) ~= lifecycle_deadline or
+       bounded_number(r[6], false) ~= bounded_number(values[6], false) or r[7] ~= values[7] or
+       r[8] ~= values[13] or redis.call('EXISTS', prefix .. 'claim:' .. c .. ':' .. q) ~= 0 or
+       redis.call('ZSCORE', claim_expiries, member) then return {'schema'} end
   elseif values[1] == 'queued' or values[1] == 'claimed' then
     local request_sequence = integer(values[11])
     if not values[9] or not values[10] or not request_sequence or request_sequence < 1 or values[13] == false or
        not values[14] or string.len(values[14]) < 1 or string.len(values[14]) > max_identity or
        not values[15] or string.len(values[15]) < 1 or string.len(values[15]) > max_identity or
-       not values[16] or string.len(values[16]) < 1 or string.len(values[16]) > max_request_envelope then return {'schema'} end
+       not values[16] or string.len(values[16]) < 1 or string.len(values[16]) > max_request_envelope or
+       redis.call('EXISTS', prefix .. 'reservation:' .. values[7]) ~= 0 or
+       redis.call('ZSCORE', expiries, values[7]) then return {'schema'} end
     local entries = redis.call('XRANGE', prefix .. 'queue:' .. values[4], values[9], values[9], 'COUNT', 1)
     if #entries ~= 1 or entries[1][1] ~= values[9] or #entries[1][2] ~= 4 or
        entries[1][2][1] ~= 'client' or entries[1][2][2] ~= c or
@@ -1062,7 +1074,7 @@ INSPECT_ELIGIBILITY_SOURCE = INSPECT_ELIGIBILITY_SOURCE.replace("__CANONICAL_PRO
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "5217e719def9c2d1caac8f53ebe079087b540c43fd9ea69d47aa42c932ee1aa8",  # pragma: allowlist secret
+    "f372aed5af3408a3633a8f328df515c0908b361c41a6d23baf4885d835405cc5",  # pragma: allowlist secret
     False,
 )
 

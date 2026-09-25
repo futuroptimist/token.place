@@ -322,7 +322,7 @@ def test_canonical_metrics_track_queue_in_flight_completion_and_eviction(relay_c
 
 
 def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monkeypatch) -> None:
-    """Public lease-expiry tombstones drive bounded, once-only eviction metrics."""
+    """Only retained transition identities drive once-only eviction metrics."""
 
     store = relay_module._api_v1_store()
     now = [time.time()]
@@ -333,49 +333,60 @@ def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monk
         'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
     )
 
-    explicit_credential = _register_node(
-        relay_client, server_key="explicit-node"
-    ).get_json()["control_credential"]
-    explicit = relay_client.post(
-        "/api/v1/relay/servers/unregister",
-        json={
-            "server_public_key": "explicit-node",
-            "control_credential": explicit_credential,
-        },
-    )
-    assert explicit.status_code == 200
-    assert _metric_value(
-        _metric_body(relay_client),
-        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
-    ) == baseline
-
     node_id = "telemetry-node-secret"
     first_credential = _register_node(relay_client, server_key=node_id).get_json()[
         "control_credential"
     ]
-    first_lease = store.get(node_id).lease_expires_at_epoch
+    first_record = store._records[node_id]
+    first_lease = first_record.lease_expires_at_epoch
     now[0] = first_lease + 1
-    first_body = _metric_body(relay_client)
-    assert _metric_value(first_body, "tokenplace_compute_nodes_registered") == 0
-    assert _metric_value(first_body, "tokenplace_compute_nodes_healthy") == 0
+    before_state = (
+        dict(store._records), dict(store._node_tombstones),
+        dict(store._pending_node_transitions),
+    )
+
+    for _ in range(2):
+        registrations, _, _, tombstones = store.runtime_metrics_snapshot()
+        assert registrations == ()
+        assert tombstones == ()
+        health_registrations, _, _, health_tombstones = store.health_snapshot()
+        assert health_registrations == ()
+        assert health_tombstones == ()
+        assert _metric_value(
+            _metric_body(relay_client),
+            'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+        ) == baseline
+    assert (
+        store._records, store._node_tombstones, store._pending_node_transitions
+    ) == before_state
+
+    # A real lifecycle transition, rather than observation, creates authority.
+    assert [record.node_id for record in store.expire()] == [node_id]
+    first_tombstone = store.node_tombstones()[0]
+    for _ in range(2):
+        assert _metric_value(
+            _metric_body(relay_client),
+            'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+        ) == baseline + 1
+
+    # Registration through another relay must not clear a retained observation.
+    second_credential = "second-control-credential"
+    store.register(
+        node_id,
+        first_record.capabilities,
+        relay_module._credential_digest(second_credential),
+    )
     assert _metric_value(
-        first_body,
+        _metric_body(relay_client),
         'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
     ) == baseline + 1
 
-    assert relay_client.get("/healthz").status_code == 200
-    assert relay_client.get("/relay/diagnostics").status_code == 200
-    repeated_body = _metric_body(relay_client)
-    assert _metric_value(
-        repeated_body,
-        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
-    ) == baseline + 1
-
-    second_registration = _register_node(relay_client, server_key=node_id).get_json()
-    second_credential = second_registration["control_credential"]
-    assert second_credential != first_credential
-    second_lease = store.get(node_id).lease_expires_at_epoch
+    # A later transition for the same node may be produced outside this relay route.
+    second_lease = store._records[node_id].lease_expires_at_epoch
     now[0] = second_lease + 1
+    assert [record.node_id for record in store.expire()] == [node_id]
+    second_tombstone = store.node_tombstones()[0]
+    assert second_tombstone.transition_epoch != first_tombstone.transition_epoch
     second_body = _metric_body(relay_client)
     assert _metric_value(
         second_body,
@@ -383,7 +394,9 @@ def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monk
     ) == baseline + 2
 
     ledger = relay_module._api_v1_seen_stale_lease_evictions
-    assert len(ledger) == 1
+    assert ledger == {
+        (second_tombstone.node_identity_digest, second_tombstone.transition_epoch)
+    }
     assert node_id not in repr(ledger)
     assert first_credential not in repr(ledger)
     assert second_credential not in repr(ledger)
@@ -397,15 +410,30 @@ def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monk
         line,
     ) for line in eviction_samples)
     assert node_id not in second_body
-    assert first_credential not in second_body
-    assert second_credential not in second_body
 
-    tombstone_expiry = max(
-        record.expires_at_epoch for record in store.node_tombstones()
-    )
-    now[0] = tombstone_expiry + 1
+    now[0] = second_tombstone.expires_at_epoch + 1
     assert relay_client.get("/healthz").status_code == 200
     assert not relay_module._api_v1_seen_stale_lease_evictions
+
+
+def test_metrics_snapshot_does_not_invoke_overridden_legacy_accessors(
+    relay_client, monkeypatch
+) -> None:
+    """Memory scrapes collect only through the read-only snapshot boundary."""
+
+    _register_node(relay_client, server_key="snapshot-only-node")
+    store = relay_module._api_v1_store()
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("legacy accessor invoked")
+
+    for method_name in ("list", "queued_requests", "active_claims"):
+        monkeypatch.setattr(store, method_name, fail)
+
+    response = relay_client.get("/metrics")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert _metric_value(body, "tokenplace_compute_nodes_registered") == 1
 
 
 def test_metrics_endpoint_optional_bearer_auth(relay_client, monkeypatch) -> None:
@@ -839,21 +867,18 @@ def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, m
     assert secret not in response.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("method_name", ["list", "queued_requests", "active_claims"])
 def test_metrics_bounds_authoritative_store_snapshot_failures(
-    relay_client, monkeypatch, method_name
+    relay_client, monkeypatch
 ) -> None:
     """Store snapshot failures must not produce legacy-only metrics or leak details."""
 
     relay_module._reset_api_v1_relay_state_store()
-    if method_name != "list":
-        _register_node(relay_client, server_key=f"metrics-{method_name}")
     secret = "sensitive-metrics-store-failure"
 
     def fail(*_args, **_kwargs):
         raise relay_module.RelayStateStoreError(secret)
 
-    monkeypatch.setattr(relay_module._api_v1_store(), method_name, fail)
+    monkeypatch.setattr(relay_module._api_v1_store(), "runtime_metrics_snapshot", fail)
 
     response = relay_client.get("/metrics")
 

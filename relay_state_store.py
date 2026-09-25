@@ -1197,21 +1197,11 @@ class InMemoryRelayStateStore:
                 if record.lease_expires_at_epoch > now
                 and record.request_deadline_epoch > now
             )
-            tombstones = [
+            tombstones = tuple(
                 replace(record) for record in self._node_tombstones.values()
                 if record.expires_at_epoch > now
-            ]
-            tombstones.extend(
-                NodeTombstoneRecord(
-                    self._node_digest(record.node_id),
-                    record.control_credential_digest,
-                    "registration_lease_expired", "completed", now, True,
-                    now + self.config.node_tombstone_ttl_seconds,
-                )
-                for record in self._records.values()
-                if record.lease_expires_at_epoch <= now
             )
-            return registrations, queued, claims, tuple(tombstones)
+            return registrations, queued, claims, tombstones
 
     def health_snapshot(self) -> tuple[
         tuple[ComputeNodeRegistration, ...],
@@ -1246,22 +1236,12 @@ class InMemoryRelayStateStore:
                     and claim.request_deadline_epoch > now
                     for claim in self._claims.values()
                 )
-            tombstones = [
+            tombstones = tuple(
                 replace(record)
                 for record in self._node_tombstones.values()
                 if record.expires_at_epoch > now
-            ]
-            tombstones.extend(
-                NodeTombstoneRecord(
-                    self._node_digest(record.node_id),
-                    record.control_credential_digest,
-                    "registration_lease_expired", "completed", now, True,
-                    now + self.config.node_tombstone_ttl_seconds,
-                )
-                for record in self._records.values()
-                if record.lease_expires_at_epoch <= now
             )
-            return registrations, queue_depths, in_flight_counts, tuple(tombstones)
+            return registrations, queue_depths, in_flight_counts, tombstones
 
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         with self._lock:

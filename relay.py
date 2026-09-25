@@ -916,11 +916,6 @@ def _update_runtime_gauges() -> None:
     oldest_in_flight_age = 0.0
     store, close_store = _api_v1_health_store()
     try:
-        # Compatibility fault injection remains observable without making
-        # normal scrapes call the mutating legacy accessors.
-        for method_name in ("list", "queued_requests", "active_claims"):
-            if method_name in getattr(store, "__dict__", {}):
-                getattr(store, method_name)()
         registrations, queued_records, claim_records, tombstones = (
             store.runtime_metrics_snapshot()
         )
@@ -1439,20 +1434,8 @@ def _reconcile_api_v1_stale_lease_evictions(
             for record in tombstones
             if record.cause == "registration_lease_expired"
         }
-        retained_digests = {identity for identity, _ in retained}
-        _api_v1_seen_stale_lease_evictions.intersection_update(
-            item for item in _api_v1_seen_stale_lease_evictions
-            if item[0] in retained_digests
-        )
-        seen_digests = {
-            identity for identity, _ in _api_v1_seen_stale_lease_evictions
-        }
-        unseen_by_digest = {
-            identity: (identity, transition)
-            for identity, transition in retained
-            if identity not in seen_digests
-        }
-        unseen = set(unseen_by_digest.values())
+        _api_v1_seen_stale_lease_evictions.intersection_update(retained)
+        unseen = retained - _api_v1_seen_stale_lease_evictions
         if unseen:
             COMPUTE_NODE_EVICTIONS_TOTAL.labels("stale_lease").inc(len(unseen))
             _api_v1_seen_stale_lease_evictions.update(unseen)
@@ -3573,14 +3556,6 @@ def api_v1_relay_servers_register():
             raw_credential = secrets.token_urlsafe(32)
             created_credential = True
             store.register(public_key, typed, _credential_digest(raw_credential))
-            node_digest = hashlib.sha256(
-                b"node\0" + public_key.encode("utf-8")
-            ).hexdigest()
-            with _api_v1_stale_lease_eviction_lock:
-                _api_v1_seen_stale_lease_evictions.difference_update(
-                    item for item in tuple(_api_v1_seen_stale_lease_evictions)
-                    if item[0] == node_digest
-                )
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     except RelayStateStoreError:

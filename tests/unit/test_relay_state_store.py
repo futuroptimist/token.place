@@ -21,6 +21,7 @@ from relay_state_store import ClaimResult
 from relay_state_store import EncryptedRequestEnvelope
 from relay_state_store import EncryptedProgressEnvelope
 from relay_state_store import EncryptedResponseEnvelope
+from relay_state_store import EligibilitySnapshot
 from relay_state_store import InMemoryRelayStateStore
 from relay_state_store import RelayStateCapacityExceeded
 from relay_state_store import RelayStateCredentialMismatch
@@ -86,6 +87,19 @@ def capabilities() -> ComputeNodeCapabilities:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        ("unexpected", 0, 0, 0, 0),
+        ("available", -1, 0, 0, 0),
+        ("available", True, 0, 0, 0),
+    ],
+)
+def test_eligibility_snapshot_rejects_unbounded_contract_values(snapshot):
+    with pytest.raises(RelayStateStoreError, match="availability (reason|counts)"):
+        EligibilitySnapshot(*snapshot)
 
 
 def digest_with_domain(value: str, domain: bytes) -> str:
@@ -5382,6 +5396,42 @@ def test_inspect_eligibility_counts_retained_expired_lifecycles(
     assert snapshot.reason == "available"
     assert snapshot.schedulable_compute_nodes == 1
     assert len(store._reservations) == 1
+
+
+def test_runtime_and_health_snapshots_are_authoritative_and_non_mutating(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(store_factory, capabilities, clock=clock)
+    claimed_work(store)
+    def authority():
+        return deepcopy(
+            (
+                store._records,
+                store._reservations,
+                store._queued,
+                store._claims,
+                store._node_tombstones,
+            )
+        )
+
+    before = authority()
+
+    registrations, queued, claims, tombstones = store.runtime_metrics_snapshot()
+    health = store.health_snapshot()
+
+    assert [record.node_id for record in registrations] == ["node-a"]
+    assert queued == ()
+    assert len(claims) == 1
+    assert tombstones == ()
+    assert health[1:] == ({"node-a": 0}, {"node-a": 1}, ())
+    assert authority() == before
+
+    clock.value = claims[0].request_deadline_epoch
+    before = authority()
+    assert store.runtime_metrics_snapshot() == ((), (), (), ())
+    assert store.health_snapshot() == ((), {}, {}, ())
+    assert authority() == before
 
 
 @pytest.mark.parametrize(

@@ -2975,11 +2975,8 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
             .pointer("/artifact/artifact_sha256")
             .and_then(Value::as_str)
             .is_some_and(|value| {
-                if success {
-                    value == "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
-                } else {
-                    value == "unknown"
-                }
+                value == "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+                    || (!success && value == "unknown")
             })
         && matches!(
             event.pointer("/backend/declared").and_then(Value::as_str),
@@ -9302,7 +9299,7 @@ mod tests {
             "success": true,
             "failure_code": "none",
             "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64, "artifact_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"},
-            "identity": {"app_version": "0.1.20", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
+            "identity": {"app_version": "0.1.21", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
             "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
             "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
             "phases": {
@@ -9355,6 +9352,14 @@ mod tests {
         failed["failure_code"] = Value::String("cleanup_failed".into());
         failed["artifact"]["artifact_sha256"] = Value::String("unknown".into());
         assert!(validate_gpu_completion_preflight_event(failed.clone()).is_ok());
+        failed["artifact"]["artifact_sha256"] = Value::String(
+            "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785".into(),
+        );
+        failed["failure_code"] = Value::String("model_identity_mismatch".into());
+        assert!(validate_gpu_completion_preflight_event(failed.clone()).is_ok());
+        failed["artifact"]["artifact_sha256"] = Value::String("0".repeat(64));
+        assert!(validate_gpu_completion_preflight_event(failed.clone()).is_err());
+        failed["artifact"]["artifact_sha256"] = Value::String("unknown".into());
         failed["secret"] = Value::String("must not pass".into());
         assert!(validate_gpu_completion_preflight_event(failed).is_err());
     }

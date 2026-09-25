@@ -2707,6 +2707,8 @@ def main(argv: list[str] | None = None) -> int:
             env.pop(key, None)
     else:
         env["USE_MOCK_LLM"] = "1"
+        env["TOKEN_PLACE_ENV"] = "testing"
+        env["TOKENPLACE_DESKTOP_TEST_FIXTURE"] = "desktop_operator_ui_e2e"
     # This harness is a confirmed DevSourceTree launch, so provide the explicit
     # interpreter override required by the fail-closed launcher policy without
     # restoring PATH probing for packaged/runtime launches.

@@ -258,38 +258,11 @@ jobs:
       - name: Build Tauri bundles
         shell: bash
         run: |
+          set -euo pipefail
           if [ "${{ runner.os }}" = "macOS" ]; then
-            CONFIGURED_APPLE_SIGNING_IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
-            APPLE_CERTIFICATE_P12_BASE64="${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}"
-            APPLE_CERTIFICATE_PASSWORD="${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
-            APPLE_KEYCHAIN_PASSWORD="${{ secrets.APPLE_KEYCHAIN_PASSWORD }}"
-            # Prevent tauri-bundler from auto-reading an empty APPLE_SIGNING_IDENTITY
-            # from the job environment, which triggers a failing `codesign -s ""` path.
-            unset APPLE_SIGNING_IDENTITY
-            if [ -n "${CONFIGURED_APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
-              KEYCHAIN_PATH="$RUNNER_TEMP/codesign.keychain-db"
-              KEYCHAIN_PASSWORD="${APPLE_KEYCHAIN_PASSWORD:-temp_keychain_password}"
-              CERT_PATH="$RUNNER_TEMP/apple-signing-cert.p12"
-              echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
-              security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-              security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-              security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-              security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-              security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
-              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
-              export APPLE_SIGNING_IDENTITY="$CONFIGURED_APPLE_SIGNING_IDENTITY"
-              export APPLE_CERTIFICATE_IMPORTED=1
-            else
-              echo "::warning::Developer ID certificate and identity are not fully configured; using ad-hoc signing for preview/dev-only macOS artifacts."
-              export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'
-              export APPLE_SIGNING_IDENTITY='-'
-            fi
-          fi
-          if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ matrix.tauri_target }}" ]; then
-            # Tauri's built-in DMG bundler is flaky for cross-target macOS builds in CI
-            # (bundle_dmg.sh intermittently exits non-zero). Build the .app reliably, then
-            # generate the DMG in the staging step via hdiutil.
+            # The release script signs every nested code object explicitly after
+            # bundling. Do not let Tauri select an ad-hoc or partial identity.
+            unset APPLE_SIGNING_IDENTITY TAURI_BUNDLE_MACOS_SIGNING_IDENTITY
             npm run tauri build -- --target ${{ matrix.tauri_target }} --bundles app
           elif [ -n "${{ matrix.tauri_target }}" ]; then
             npm run tauri build -- --target ${{ matrix.tauri_target }}
@@ -304,10 +277,15 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
           if [ "${{ runner.os }}" = "macOS" ]; then
+            # Tauri-only release source: reject legacy desktop/electron-builder and
+            # tokenplace Desktop Setup artifacts from this channel.
             bundle_root="src-tauri/target/${{ matrix.tauri_target }}/release/bundle"
             app_dir="${bundle_root}/macos"
             app_files=("${app_dir}"/*.app)
@@ -315,7 +293,6 @@ jobs:
               echo "No .app bundle found in ${app_dir}" >&2
               exit 1
             fi
-
             app_path="${app_files[0]}"
             app_name="$(basename "${app_path}" .app)"
             if [[ "${app_name}" == *"tokenplace Desktop"* ]]; then
@@ -323,90 +300,18 @@ jobs:
               exit 1
             fi
             if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${INPUT_TAG_NAME:-}" ]; then
-              case "${INPUT_TAG_NAME}" in
-                desktop-v*) ;;
-                *)
-                  echo "workflow_dispatch input 'tag_name' must match desktop-v*" >&2
-                  exit 1
-                  ;;
-              esac
+              [[ "${INPUT_TAG_NAME}" == desktop-v* ]] || { echo "workflow_dispatch input 'tag_name' must match desktop-v*" >&2; exit 1; }
               ref_slug="${INPUT_TAG_NAME}"
             else
               ref_slug="${GITHUB_REF_NAME:-manual}"
             fi
             ref_slug="${ref_slug//\//-}"
             version="${ref_slug#desktop-v}"
-            dmg_name="token.place-desktop-${version}-apple-silicon.dmg"
-            dmg_path="release-artifacts/${dmg_name}"
+            dmg_path="release-artifacts/token.place-desktop-${version}-apple-silicon.dmg"
             dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"
-            preview_notice_name="README BEFORE OPENING.txt"
-            preview_notice="release-artifacts/README-macos-apple-silicon-preview.txt"
-
-            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
-              printf '%s\n' \
-                "token.place desktop macOS Apple Silicon preview build" \
-                "" \
-                "This preview build is signed with the configured Apple signing identity, but it is not notarized." \
-                "Unpaid/no-credential preview builds use ad-hoc signing; either way, this workflow does not perform Developer ID notarization." \
-                "The first normal double-click may show:" \
-                "\"Apple could not verify \\\"token.place desktop\\\" is free of malware.\"" \
-                "This is expected for unpaid/non-notarized GitHub preview releases." \
-                "" \
-                "If you trust this source and the release checksums:" \
-                "1) Drag/copy token.place desktop.app to Applications." \
-                "2) Try opening it once from Applications." \
-                "3) If macOS blocks it, click Done." \
-                "4) Open System Settings -> Privacy & Security." \
-                "5) Click Open Anyway / Allow / Open for token.place desktop." \
-                "6) Or Control-click (right-click) the app and choose Open when available." \
-                "" \
-                "Only install if you trust this GitHub release and verify checksums." \
-                "" \
-                "Normal no-warning public macOS distribution requires paid Developer ID signing + notarization." > "${preview_notice}"
-            else
-              printf '%s\n' \
-                "token.place desktop macOS Apple Silicon preview build" \
-                "" \
-                "This preview build is ad-hoc signed and not notarized." \
-                "The first normal double-click may show:" \
-                "\"Apple could not verify \\\"token.place desktop\\\" is free of malware.\"" \
-                "" \
-                "This is expected for unpaid/non-notarized GitHub preview releases." \
-                "" \
-                "If you trust this source and the release checksums:" \
-                "1) Drag/copy token.place desktop.app to Applications." \
-                "2) Try opening it once from Applications." \
-                "3) If macOS blocks it, click Done." \
-                "4) Open System Settings -> Privacy & Security." \
-                "5) Click Open Anyway / Allow / Open for token.place desktop." \
-                "6) Or Control-click (right-click) the app and choose Open when available." \
-                "" \
-                "Only install if you trust this GitHub release and verify checksums." \
-                "" \
-                "Normal no-warning public macOS distribution requires paid Developer ID signing + notarization." > "${preview_notice}"
-            fi
-            codesign --verify --deep --strict --verbose=4 "${app_path}"
-
-            signing_flag=""
-            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
-              signing_flag="--expect-signing"
-            fi
-            python ../scripts/validate_desktop_tauri_release_artifacts.py               --app-only               --require-embedded-python-runtime               --app-path "${app_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
-            codesign --verify --deep --strict --verbose=4 "${app_path}"
-
-            rm -rf "${dmg_stage_dir}"
-            mkdir -p "${dmg_stage_dir}"
-            cp -R "${app_path}" "${dmg_stage_dir}/"
-            staged_app_path="${dmg_stage_dir}/$(basename "${app_path}")"
-            codesign --verify --deep --strict --verbose=4 "${staged_app_path}"
-            cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"
-            ln -s /Applications "${dmg_stage_dir}/Applications"
-            rm -f "${dmg_path}"
-            hdiutil create -volname "token.place desktop" -srcfolder "${dmg_stage_dir}" -ov -format UDZO "${dmg_path}"
-            if [[ "${dmg_path}" == *"tokenplace Desktop"* ]] || [[ "${dmg_path}" == *"tokenplace Desktop Setup"* ]] || [[ "${dmg_path}" == *"desktop/electron-builder"* ]]; then
-              echo "stale Electron branding detected in staged DMG path: ${dmg_path}" >&2
-              exit 1
-            fi
+            notarization_log_dir="$RUNNER_TEMP/token-place-notarization-logs"
+            bash scripts/sign_and_notarize_macos_release.sh \
+              "${app_path}" "${dmg_path}" "${dmg_stage_dir}" "${notarization_log_dir}"
           elif [ "${{ runner.os }}" = "Windows" ]; then
             nsis_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/nsis"
             msi_dir="src-tauri/target/${{ matrix.tauri_target }}/release/bundle/msi"
@@ -435,48 +340,35 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install 'pytest>=8.1'
 
-      - name: Validate macOS staged artifact guardrails
+      - name: Validate macOS signed and notarized artifacts
         if: runner.os == 'macOS'
         shell: bash
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_NOTARYTOOL_KEYCHAIN_PROFILE: ${{ secrets.APPLE_NOTARYTOOL_KEYCHAIN_PROFILE }}
         run: |
           set -euo pipefail
           app_path="$(find src-tauri/target/${{ matrix.tauri_target }}/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
-          if [ -z "${app_path}" ]; then
-            echo "Expected macOS .app in bundle output." >&2
+          dmg_paths=(release-artifacts/*.dmg)
+          if [ -z "${app_path}" ] || [ ! -e "${dmg_paths[0]}" ] || [ "${#dmg_paths[@]}" -ne 1 ]; then
+            echo "Expected one macOS app and exactly one staged macOS .dmg." >&2
             exit 1
           fi
-          dmg_count="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d '[:space:]')"
-          if [ "${dmg_count}" -ne 1 ]; then
-            echo "Expected exactly one staged macOS .dmg in release-artifacts; found ${dmg_count}." >&2
-            exit 1
-          fi
-          dmg_path="$(find release-artifacts -maxdepth 1 -type f -name '*.dmg' | sort | head -n 1)"
-          if [ -z "${dmg_path}" ]; then
-            echo "Expected staged macOS .dmg in release-artifacts." >&2
-            exit 1
-          fi
-          if [ ! -f release-artifacts/README-macos-apple-silicon-preview.txt ]; then
-            echo "Expected release-artifacts/README-macos-apple-silicon-preview.txt for macOS preview guidance." >&2
-            exit 1
-          fi
-
-          signing_flag=""
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
-            signing_flag="--expect-signing"
-            if [ -n "${APPLE_NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]; then
-              echo "::warning::APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed in this workflow yet; skipping strict Gatekeeper notarization enforcement."
-            fi
-          fi
-
-          python ../scripts/validate_desktop_tauri_release_artifacts.py               --require-embedded-python-runtime               --app-path "${app_path}"               --dmg-path "${dmg_path}"               --tauri-config src-tauri/tauri.conf.json               --expected-icon src-tauri/icons/icon.icns               ${signing_flag}
-
+          python ../scripts/validate_desktop_tauri_release_artifacts.py \
+            --require-embedded-python-runtime \
+            --require-gatekeeper-ready \
+            --app-path "${app_path}" \
+            --dmg-path "${dmg_paths[0]}" \
+            --tauri-config src-tauri/tauri.conf.json \
+            --expected-icon src-tauri/icons/icon.icns
           cd ..
           python -m pytest --confcutdir=tests/integration tests/integration/test_macos_release_probe.py -q
+
+      - name: Upload Apple notarization logs
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: apple-notarization-logs
+          path: ${{ runner.temp }}/token-place-notarization-logs
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Validate Windows MSI and NSIS artifact contents
         if: runner.os == 'Windows'

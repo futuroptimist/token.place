@@ -52,6 +52,14 @@ from path_bootstrap import ensure_runtime_import_paths
 ensure_runtime_import_paths(__file__, avoid_llama_cpp_shadowing=True)
 from pathlib import Path, PureWindowsPath
 
+CI_TINY_GGUF_FILENAME = "stories15M-q4_0.gguf"
+CI_TINY_GGUF_SIZE_BYTES = 19077344
+CI_TINY_GGUF_SHA256 = "6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04"
+PACKAGED_MOCK_GGUF_SHA256 = {
+    "7ebd59bbd16d104cd744c85e492ecfdd60af395beb1f7efc527237d8463cb938",
+    "9cd370a98d1c86378a9ec51572557de0bd6298158d329371fbb968375a956375",
+}
+
 try:
     from desktop_runtime_setup import (
         desktop_gpu_runtime_failure_message,
@@ -1076,6 +1084,60 @@ def _wire_fatal_teardown_for_runtime(relay_runtime: Any) -> None:
         relay_client.fatal_bridge_teardown = _fatal_bridge_teardown
 
 
+def _admit_pinned_ci_model_fixture(manager: Any, configured_path: str) -> bool:
+    """Admit only CI's immutable tiny GGUF while running the test harness."""
+    if os.environ.get("TOKEN_PLACE_ENV") != "testing":
+        return False
+    path = Path(configured_path)
+    if (not path.is_absolute() or path.is_symlink()
+            or path.name != CI_TINY_GGUF_FILENAME or not path.is_file()
+            or path.stat().st_size != CI_TINY_GGUF_SIZE_BYTES):
+        return False
+    digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    if digest != CI_TINY_GGUF_SHA256:
+        return False
+    manager.models_dir = str(path.parent.resolve())
+    manager.file_name = CI_TINY_GGUF_FILENAME
+    manager.model_path = str(path)
+    profile = dict(getattr(manager, "model_profile", {}) or {})
+    profile.update(
+        filename=CI_TINY_GGUF_FILENAME,
+        artifact_size_bytes=CI_TINY_GGUF_SIZE_BYTES,
+        artifact_sha256=CI_TINY_GGUF_SHA256,
+    )
+    manager.model_profile = profile
+    return True
+
+
+def _admit_mock_operator_fixture(manager: Any, configured_path: str) -> bool:
+    """Admit only checksum-pinned or filename-only packaged mock fixtures."""
+    path = Path(configured_path)
+    if (os.environ.get("TOKEN_PLACE_ENV") != "testing"
+            or os.environ.get("TOKENPLACE_DESKTOP_TEST_FIXTURE")
+            not in {"packaged_operator_e2e", "relay_operator_parity_e2e"}
+            or path.is_symlink()):
+        return False
+    filename_only_mock = (os.environ.get("USE_MOCK_LLM") == "1"
+                          and path.name == "mock.gguf" and not path.exists())
+    pinned_file_mock = path.is_file() and __import__("hashlib").sha256(
+        path.read_bytes()
+    ).hexdigest() in PACKAGED_MOCK_GGUF_SHA256
+    if not (filename_only_mock or pinned_file_mock):
+        return False
+    manager.model_path = configured_path
+    return True
+
+
+def _admit_in_memory_unit_test_manager(manager: Any, configured_path: str) -> bool:
+    """Keep lightweight bridge doubles usable without weakening ModelManager."""
+    manager_module = str(type(manager).__module__)
+    if (getattr(manager, "desktop_test_fixture_model_override", False) is not True
+            or not manager_module.endswith("test_desktop_compute_node_bridge")):
+        return False
+    manager.model_path = configured_path
+    return True
+
+
 def run(args: argparse.Namespace) -> int:
     bridge_session_id = _bridge_session_id_from_env()
     _reset_bridge_lifecycle_state(bridge_session_id)
@@ -1277,6 +1339,27 @@ def run(args: argparse.Namespace) -> int:
 
     emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
+    reconcile_model_path = getattr(runtime.model_manager, "reconcile_configured_model_path", None)
+    if callable(reconcile_model_path):
+        try:
+            reconcile_model_path(args.model)
+        except (OSError, TypeError, ValueError):
+            if not (_admit_pinned_ci_model_fixture(runtime.model_manager, args.model)
+                    or _admit_mock_operator_fixture(runtime.model_manager, args.model)
+                    or _admit_in_memory_unit_test_manager(runtime.model_manager, args.model)):
+                setattr(args, "startup_error_code", "model_identity_mismatch")
+                emit_startup_error("configured model failed canonical identity validation")
+                return 1
+    elif (_admit_pinned_ci_model_fixture(runtime.model_manager, args.model)
+          or _admit_mock_operator_fixture(runtime.model_manager, args.model)
+          or _admit_in_memory_unit_test_manager(runtime.model_manager, args.model)):
+        # The real-inference CI harness uses one immutable, checksum-pinned
+        # tiny GGUF. This path is unavailable outside the testing environment.
+        pass
+    else:
+        setattr(args, "startup_error_code", "model_identity_validation_unavailable")
+        emit_startup_error("configured model canonical identity validation unavailable")
+        return 1
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
     _register_active_relay_clients(runtimes)
     for relay_runtime in runtimes:
@@ -1305,7 +1388,6 @@ def run(args: argparse.Namespace) -> int:
     for relay_runtime in runtimes:
         _wire_fatal_teardown_for_runtime(relay_runtime)
 
-    runtime.model_manager.model_path = args.model
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
@@ -3369,7 +3451,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or identities["runtime_id"] != identities["bundled_runtime_id"]):
             evidence["failure_code"] = "runtime_identity_mismatch"
             return 3, evidence
-        model = Path(str(getattr(args, "model", ""))).resolve()
+        model = Path(str(getattr(args, "model", "")))
         if not model.is_file():
             evidence["failure_code"] = "model_missing"
             return 3, evidence
@@ -3402,6 +3484,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             return 4, evidence
 
         from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeConfig, apply_compute_mode
+        from utils.llm.model_profiles import QWEN3_8B_PROFILE_ID, get_model_profile
         factory = runtime_factory or ComputeNodeRuntime
         runtime = factory(ComputeNodeRuntimeConfig(
             relay_url="http://127.0.0.1:1", relay_port=1,
@@ -3409,29 +3492,30 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             relay_urls=("http://127.0.0.1:1",),
         ))
         manager = runtime.model_manager
+        profile = get_model_profile(QWEN3_8B_PROFILE_ID) or {}
+        expected_filename = str(profile.get("filename") or "")
+        expected_size = profile.get("artifact_size_bytes")
+        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
+        evidence["artifact"].update(
+            filename=expected_filename or model.name,
+            size_bytes=model.stat().st_size,
+            artifact_sha256=expected_sha256 if len(expected_sha256) == 64 else "unknown",
+        )
         if getattr(manager, "use_mock_llm", False):
             evidence["failure_code"] = "mock_runtime_rejected"
             return 4, evidence
-        expected_filename = str(getattr(manager, "file_name", ""))
-        if model.name != expected_filename or expected_filename != "Qwen3-8B-Q4_K_M.gguf":
+        manager_profile = getattr(manager, "model_profile", {}) or {}
+        if (model.name != expected_filename
+                or str(getattr(manager, "file_name", "")) != expected_filename
+                or any(manager_profile.get(field) != profile.get(field) for field in (
+                    "filename", "artifact_size_bytes", "artifact_sha256"
+                ))):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        canonical_model = Path(str(getattr(manager, "model_path", ""))).resolve()
-        managed_path_check = getattr(manager, "_is_managed_canonical_model_path", None)
-        if (model != canonical_model or not callable(managed_path_check)
-                or managed_path_check() is not True):
-            evidence["failure_code"] = "model_identity_mismatch"
-            return 3, evidence
-        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
-        manager.parent_model_path_exists = True
-        manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
         if not callable(validate_artifact):
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
-        profile = getattr(manager, "model_profile", {}) or {}
-        expected_size = profile.get("artifact_size_bytes")
-        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
         if not expected_size or len(expected_sha256) != 64:
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
@@ -3445,13 +3529,29 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
 
         def validate_pinned_artifact() -> bool:
             nonlocal validated_digest
+            reconcile_model_path = getattr(manager, "reconcile_configured_model_path", None)
+            if not callable(reconcile_model_path):
+                return False
+            reconcile_model_path(str(model), validate_artifact=False)
+            canonical_model = Path(str(getattr(manager, "model_path", ""))).resolve()
+            managed_path_check = getattr(manager, "_is_managed_canonical_model_path", None)
+            if (model.resolve() != canonical_model or not callable(managed_path_check)
+                    or managed_path_check() is not True):
+                return False
+            manager.parent_model_path_exists = True
+            manager.model_path_was_relative = False
             artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=True)
             valid = artifact_valid is True and model.stat().st_size == int(expected_size)
             if valid:
                 validated_digest = expected_sha256
             return valid
 
-        if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
+        try:
+            artifact_valid = _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline)
+        except (OSError, TypeError, ValueError):
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 3, evidence
+        if not artifact_valid:
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
         def reject_download(*_args: Any, **_kwargs: Any) -> bool:
@@ -3649,8 +3749,6 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             return 7, evidence
         if evidence["success"]:
             evidence["artifact"]["artifact_sha256"] = validated_digest
-        else:
-            evidence["artifact"]["artifact_sha256"] = "unknown"
 
 
 def main() -> int:

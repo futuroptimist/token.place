@@ -194,6 +194,8 @@ def _packaged_env(
     env["PYTHONNOUSERSITE"] = "1"
     env["TOKEN_PLACE_PYTHON_IMPORT_ROOT"] = str(resources_root)
     env["PYTHONPATH"] = os.pathsep.join([str(resources_root / "python"), str(resources_root)])
+    env["TOKEN_PLACE_ENV"] = "testing"
+    env["TOKENPLACE_DESKTOP_TEST_FIXTURE"] = "packaged_operator_e2e"
     if extra_env:
         env.update(extra_env)
     return env

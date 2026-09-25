@@ -225,32 +225,35 @@ Desktop binaries released as GitHub Release assets are published only by the can
    - Desktop Tauri release staging is Tauri-only (`desktop-tauri/src-tauri/target/.../bundle`);
      legacy Electron artifacts from `desktop/` must never be published on this
      release channel.
-   - If Apple signing credentials are not configured in CI, the workflow emits
-     an explicit preview warning and uses ad-hoc signing for dev/preview builds.
-     Those builds are not equivalent to fully Developer ID signed + notarized
-     Gatekeeper-ready releases.
-   - If signing credentials are configured, CI validates with `codesign`.
-     Strict Gatekeeper notarization checks are skipped unless notarization is added.
+   - The macOS job fails closed unless all protected signing and notarization
+     credentials below are configured. It never publishes an ad-hoc-signed macOS DMG.
+   - CI signs Mach-O leaves and nested bundles inside-out with hardened runtime and
+     secure timestamps, then signs the app with the minimal release entitlements in
+     `src-tauri/Entitlements.plist`. Signing never uses `codesign --deep` (deep mode is
+     reserved for verification).
+   - CI notarizes and staples the app before constructing the DMG, then signs,
+     notarizes, and staples the final DMG. Gatekeeper, stapler, signature, hardened
+     runtime, and forbidden `get-task-allow` checks must all pass before checksums are
+     generated or artifacts can reach the publish job.
 
-### Unpaid macOS preview releases
+### Protected GitHub Actions secrets for macOS releases
 
-- token.place can publish Apple Silicon preview DMGs without a paid
-  Apple Developer Program account.
-- These preview builds use ad-hoc signing and are not notarized, so Gatekeeper
-  warnings after browser/GitHub download are expected.
-- The mounted DMG now includes an inline opening guide (`README BEFORE OPENING.txt`)
-  plus a sidecar release asset (`README-macos-apple-silicon-preview.txt`) that
-  explain the same manual-open flow.
-- Users must manually open/whitelist trusted previews:
-  - Drag/copy `token.place desktop.app` to **Applications** and try opening once.
-  - If macOS blocks with the expected “Apple could not verify…” dialog, click
-    **Done**, then use **System Settings → Privacy & Security** to
-    **Open Anyway / Allow / Open**.
-  - Control-click (or right-click) and choose **Open** remains a fallback path.
-- This flow does not remove Gatekeeper warnings for unpaid preview releases; it
-  explains the expected manual allow/open steps.
-- No-warning public distribution generally requires paid
-  Developer ID signing plus notarization.
+Configure these repository or protected-environment secrets before qualifying a
+release. Do not store their decoded values in the repository or release assets:
+
+- `APPLE_SIGNING_IDENTITY`: full `Developer ID Application: ...` identity label.
+- `APPLE_CERTIFICATE_P12_BASE64`: base64 of the Developer ID Application `.p12`.
+- `APPLE_CERTIFICATE_PASSWORD`: password protecting that `.p12`.
+- `APPLE_NOTARY_KEY_P8_BASE64`: base64 of the App Store Connect Team API `.p8`.
+- `APPLE_NOTARY_KEY_ID`: App Store Connect API key ID.
+- `APPLE_NOTARY_ISSUER_ID`: App Store Connect issuer ID.
+
+The workflow decodes private material only into a permission-restricted temporary
+directory, imports the certificate into an ephemeral keychain, and removes both with
+an exit trap. `notarytool` uses API-key authentication. Submission IDs and Apple JSON
+logs are retained for seven days in the private `apple-notarization-logs` workflow
+artifact; private keys and credentials are never included. Local builds remain
+unsigned/ad-hoc preview artifacts and are not publishable release substitutes.
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.

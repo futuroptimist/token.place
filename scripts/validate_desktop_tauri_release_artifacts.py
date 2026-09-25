@@ -447,6 +447,51 @@ def _codesign_verify(app_path: Path) -> None:
         _run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(app_path)])
 
 
+def _validate_gatekeeper_ready(app_path: Path, dmg_path: Path | None = None) -> None:
+    if platform.system() != "Darwin":
+        _fail("--require-gatekeeper-ready requires macOS")
+
+    code_objects = [app_path]
+    for candidate in app_path.rglob("*"):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        file_result = subprocess.run(["file", "-b", str(candidate)], check=False, capture_output=True, text=True)
+        if file_result.returncode == 0 and "Mach-O" in file_result.stdout:
+            code_objects.append(candidate)
+
+    for code_object in code_objects:
+        details = _run(["codesign", "--display", "--verbose=4", str(code_object)])
+        if "Authority=Developer ID Application:" not in details:
+            _fail(f"code object is not signed by Developer ID Application: {code_object}")
+        if not re.search(r"flags=.*\bruntime\b", details):
+            _fail(f"hardened runtime is missing from code object: {code_object}")
+        if not re.search(r"^(?:Timestamp|Signed Time)=.+$", details, flags=re.MULTILINE):
+            _fail(f"secure timestamp is missing from code object: {code_object}")
+
+    entitlements_result = subprocess.run(
+        ["codesign", "--display", "--entitlements", ":-", str(app_path)],
+        check=False,
+        capture_output=True,
+    )
+    if entitlements_result.returncode != 0:
+        _fail(f"unable to inspect release entitlements for {app_path}")
+    entitlement_bytes = entitlements_result.stdout
+    if entitlement_bytes.strip():
+        try:
+            entitlements = plistlib.loads(entitlement_bytes)
+        except plistlib.InvalidFileException:
+            _fail(f"invalid release entitlements on {app_path}")
+        if entitlements.get("com.apple.security.get-task-allow") not in (None, False):
+            _fail("production app signature contains forbidden get-task-allow entitlement")
+
+    _run(["xcrun", "stapler", "validate", str(app_path)])
+    _run(["spctl", "--assess", "--verbose=4", "--type", "execute", str(app_path)])
+    if dmg_path is not None:
+        _run(["codesign", "--verify", "--strict", "--verbose=4", str(dmg_path)])
+        _run(["xcrun", "stapler", "validate", str(dmg_path)])
+        _run(["spctl", "--assess", "--verbose=4", "--type", "open", "--context", "context:primary-signature", str(dmg_path)])
+
+
 def _copy_app_for_runtime_validation(app_path: Path) -> tempfile.TemporaryDirectory[str]:
     temp_dir = tempfile.TemporaryDirectory(prefix="token-place-app-probe-")
     copy_path = Path(temp_dir.name) / app_path.name
@@ -789,10 +834,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--expect-signing", action="store_true")
     p.add_argument("--require-embedded-python-runtime", action="store_true")
     p.add_argument("--expect-notarization", action="store_true")
+    p.add_argument("--require-gatekeeper-ready", action="store_true")
     return p.parse_args()
 
 
-def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embedded_python_runtime: bool = False) -> None:
+def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embedded_python_runtime: bool = False, require_gatekeeper_ready: bool = False) -> None:
     if platform.system() != "Darwin":
         print("::warning::Skipping DMG mounted-content checks outside macOS.")
         return
@@ -804,25 +850,26 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embe
             apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")
             if len(apps) != 1:
                 _fail(f"DMG must contain exactly one .app at root; found {len(apps)}")
-            readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
-            if readme_path is None:
-                _fail(f"DMG must include one preview README at root: {DMG_PREVIEW_README_NAMES}")
-            readme_text = readme_path.read_text(encoding="utf-8")
-            missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
-            if missing:
-                _fail(f"DMG preview README missing required phrases: {missing}")
-            if expect_signing:
-                if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
-                    _fail(
-                        "DMG preview README must describe configured Apple signing identity when --expect-signing is set"
-                    )
-            elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
-                _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
+            if not require_gatekeeper_ready:
+                readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
+                if readme_path is None:
+                    _fail(f"DMG must include one preview README at root: {DMG_PREVIEW_README_NAMES}")
+                readme_text = readme_path.read_text(encoding="utf-8")
+                missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
+                if missing:
+                    _fail(f"DMG preview README missing required phrases: {missing}")
+                if expect_signing and DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
+                    _fail("DMG preview README must describe configured Apple signing identity when --expect-signing is set")
+                if not expect_signing and DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
+                    _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
             mounted_app = apps[0]
             _validate_no_python_bytecode(mounted_app)
             if require_embedded_python_runtime:
                 _validate_embedded_python_runtime_non_mutating(mounted_app)
             _codesign_verify(mounted_app)
+            if require_gatekeeper_ready:
+                _run(["xcrun", "stapler", "validate", str(mounted_app)])
+                _run(["spctl", "--assess", "--verbose=4", "--type", "execute", str(mounted_app)])
         finally:
             _cleanup_dmg_attach_state(dmg_path, Path(mount_dir))
     finally:
@@ -831,6 +878,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embe
 
 def main() -> None:
     args = _parse_args()
+    require_gatekeeper_ready = getattr(args, "require_gatekeeper_ready", False)
     app_path = Path(args.app_path)
     dmg_path = Path(args.dmg_path) if args.dmg_path else None
     tauri_config = Path(args.tauri_config)
@@ -853,7 +901,7 @@ def main() -> None:
                 _fail(f"dmg artifact missing or invalid: {dmg_path}")
             if not dmg_path.name.startswith("token.place-desktop-") or not dmg_path.name.endswith("-apple-silicon.dmg"):
                 _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
-            _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
+            _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime, require_gatekeeper_ready=require_gatekeeper_ready)
 
     if not app_path.is_dir() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
@@ -918,7 +966,9 @@ def main() -> None:
 
     _codesign_verify(app_path)
 
-    if args.expect_notarization:
+    if require_gatekeeper_ready:
+        _validate_gatekeeper_ready(app_path, dmg_path)
+    elif args.expect_notarization:
         _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
     elif args.expect_signing:
         print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")

@@ -1826,6 +1826,7 @@ def test_landing_chat_system_message_is_inside_real_encryption(
         wait_for_landing_send_enabled(page).click()
         page.locator(".assistant-message").last.wait_for(state="visible")
 
+    assert len(state["relay_requests"]) == 3
     decrypted_envelopes = []
     for relay_payload in state["relay_requests"]:
         plaintext = decrypt(

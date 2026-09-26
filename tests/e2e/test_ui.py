@@ -1822,9 +1822,21 @@ def test_landing_chat_system_message_is_inside_real_encryption(
     )
 
     for prompt in ("encrypted first turn", "encrypted second turn"):
+        assistant_count = page.locator(".assistant-message").count()
         page.locator("textarea").first.fill(prompt)
         wait_for_landing_send_enabled(page).click()
-        page.locator(".assistant-message").last.wait_for(state="visible")
+        page.wait_for_function(
+            """
+            ({ expectedText, previousCount }) => {
+                const messages = document.querySelectorAll('.assistant-message');
+                return messages.length > previousCount && messages[messages.length - 1].textContent.includes(expectedText);
+            }
+            """,
+            arg={
+                "expectedText": "Encrypted boundary response.",
+                "previousCount": assistant_count,
+            },
+        )
 
     assert len(state["relay_requests"]) == 3
     decrypted_envelopes = []

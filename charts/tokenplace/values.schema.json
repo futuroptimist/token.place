@@ -64,15 +64,36 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean", "default": false },
-        "path": { "type": "string", "const": "/metrics", "default": "/metrics" },
-        "mode": { "type": "string", "enum": ["normal", "degraded"], "default": "normal" },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "path": {
+          "type": "string",
+          "const": "/metrics",
+          "default": "/metrics"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "degraded"
+          ],
+          "default": "normal"
+        },
         "auth": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "existingSecret": { "type": "string", "default": "" },
-            "secretKey": { "type": "string", "default": "token", "minLength": 1 }
+            "existingSecret": {
+              "type": "string",
+              "default": ""
+            },
+            "secretKey": {
+              "type": "string",
+              "default": "token",
+              "minLength": 1
+            }
           }
         }
       }
@@ -81,23 +102,444 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean", "default": false },
-        "interval": { "type": "string", "default": "30s" },
-        "scrapeTimeout": { "type": "string", "default": "10s" },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval": {
+          "type": "string",
+          "default": "30s"
+        },
+        "scrapeTimeout": {
+          "type": "string",
+          "default": "10s"
+        },
         "additionalLabels": {
           "type": "object",
-          "default": { "release": "kube-prometheus-stack" },
-          "additionalProperties": { "type": "string" }
+          "default": {
+            "release": "kube-prometheus-stack"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "relabelings": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "app": { "type": "string", "default": "tokenplace" },
-            "environment": { "type": "string", "default": "" },
-            "release": { "type": "string", "default": "" },
-            "cluster": { "type": "string", "default": "" }
+            "app": {
+              "type": "string",
+              "default": "tokenplace"
+            },
+            "environment": {
+              "type": "string",
+              "default": ""
+            },
+            "release": {
+              "type": "string",
+              "default": ""
+            },
+            "cluster": {
+              "type": "string",
+              "default": ""
+            }
           }
+        }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workers"
+      ],
+      "properties": {
+        "workers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        }
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "Recreate",
+            "RollingUpdate"
+          ]
+        },
+        "rollingUpdate": {
+          "type": "object"
+        }
+      }
+    },
+    "stateBackend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "valkey"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory",
+            "valkey"
+          ]
+        },
+        "valkey": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "discovery",
+            "direct",
+            "sentinel",
+            "environment",
+            "cluster",
+            "schema",
+            "acknowledgementKey",
+            "auth",
+            "tls",
+            "timeouts",
+            "retryAttempts"
+          ],
+          "properties": {
+            "discovery": {
+              "type": "string",
+              "enum": [
+                "direct",
+                "sentinel"
+              ]
+            },
+            "direct": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "host",
+                "port"
+              ],
+              "properties": {
+                "host": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                }
+              }
+            },
+            "sentinel": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "endpoints",
+                "service"
+              ],
+              "properties": {
+                "endpoints": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": [
+                      {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 253
+                      },
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535
+                      }
+                    ]
+                  }
+                },
+                "service": {
+                  "type": "string",
+                  "maxLength": 253
+                }
+              }
+            },
+            "environment": {
+              "type": "string",
+              "maxLength": 63
+            },
+            "cluster": {
+              "type": "string",
+              "maxLength": 63
+            },
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "major",
+                "readerRevision",
+                "writerRevision",
+                "supportedReadMin",
+                "supportedReadMax",
+                "supportedWriterMin",
+                "supportedWriterMax",
+                "activeRevision",
+                "activeWriterRevision",
+                "migrationEpoch"
+              ],
+              "properties": {
+                "major": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "readerRevision": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "writerRevision": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "supportedReadMin": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "supportedReadMax": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "supportedWriterMin": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "supportedWriterMax": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "activeRevision": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "activeWriterRevision": {
+                  "type": "integer",
+                  "const": 1
+                },
+                "migrationEpoch": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "acknowledgementKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "existingSecret",
+                "key"
+              ],
+              "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "key": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                }
+              }
+            },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "existingSecret",
+                "usernameKey",
+                "passwordKey",
+                "sentinelUsernameKey",
+                "sentinelPasswordKey"
+              ],
+              "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "usernameKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                },
+                "passwordKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                },
+                "sentinelUsernameKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                },
+                "sentinelPasswordKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                }
+              }
+            },
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "enabled",
+                "existingSecret",
+                "caKey",
+                "clientCertKey",
+                "clientKeyKey"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "existingSecret": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "caKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                },
+                "clientCertKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                },
+                "clientKeyKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                }
+              }
+            },
+            "timeouts": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "connectSeconds",
+                "socketSeconds",
+                "commandSeconds",
+                "retrySeconds"
+              ],
+              "properties": {
+                "connectSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 60
+                },
+                "socketSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 60
+                },
+                "commandSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 60
+                },
+                "retrySeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 60
+                }
+              }
+            },
+            "retryAttempts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            }
+          }
+        }
+      }
+    },
+    "sharedRateLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "existingSecret",
+        "storageUriKey"
+      ],
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "maxLength": 253
+        },
+        "storageUriKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "maxUnavailable"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "maxUnavailable": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "topologySpreadConstraints": {
+      "type": "array",
+      "maxItems": 8
+    },
+    "podAntiAffinity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "type",
+        "topologyKey"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "preferred",
+            "required"
+          ]
+        },
+        "topologyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
         }
       }
     }

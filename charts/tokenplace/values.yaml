@@ -1,7 +1,65 @@
 replicaCount: 1
 
+relay:
+  workers: 1
+
+# Memory is intentionally the safe, single-process development default. Valkey
+# consumes an externally managed direct primary or Sentinel topology; this chart
+# never creates Valkey resources.
+stateBackend:
+  type: memory
+  valkey:
+    discovery: direct
+    direct:
+      host: ""
+      port: 6379
+    sentinel:
+      endpoints: []
+      service: ""
+    environment: ""
+    cluster: ""
+    schema:
+      major: 1
+      readerRevision: 1
+      writerRevision: 1
+      supportedReadMin: 1
+      supportedReadMax: 1
+      supportedWriterMin: 1
+      supportedWriterMax: 1
+      activeRevision: 1
+      activeWriterRevision: 1
+      migrationEpoch: 0
+    acknowledgementKey:
+      existingSecret: ""
+      key: acknowledgement-key-base64
+    auth:
+      existingSecret: ""
+      usernameKey: username
+      passwordKey: password
+      sentinelUsernameKey: sentinel-username
+      sentinelPasswordKey: sentinel-password
+    tls:
+      enabled: false
+      existingSecret: ""
+      caKey: ca.crt
+      clientCertKey: tls.crt
+      clientKeyKey: tls.key
+    timeouts:
+      connectSeconds: 1
+      socketSeconds: 2
+      commandSeconds: 2
+      retrySeconds: 1
+    retryAttempts: 1
+
+sharedRateLimit:
+  existingSecret: ""
+  storageUriKey: storage-uri
+
 strategy:
   type: Recreate
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
@@ -119,3 +177,14 @@ probes:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+topologySpreadConstraints: []
+
+podAntiAffinity:
+  enabled: false
+  type: preferred
+  topologyKey: kubernetes.io/hostname
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1

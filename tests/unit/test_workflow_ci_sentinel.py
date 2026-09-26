@@ -17,12 +17,26 @@ PR_REQUIRED_WORKFLOWS = {
     "run-all-tests-pr.yml",
 }
 RUN_ALL_TESTS_PR_WORKFLOW = WORKFLOW_DIR / "run-all-tests-pr.yml"
+CODECOV_CONFIG = Path("codecov.yml")
 
 
 def _load_workflow(path: Path) -> dict:
     data = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     assert isinstance(data, dict), f"{path} should parse as a YAML mapping"
     return data
+
+
+def test_codecov_publishes_project_and_patch_commit_statuses() -> None:
+    config = yaml.safe_load(CODECOV_CONFIG.read_text(encoding="utf-8"))
+
+    assert config["github_checks"] is False
+    statuses = config["coverage"]["status"]
+    project = statuses["project"]["default"]
+    assert project["target"] in (90, "90%")
+    assert project["threshold"] in (0, "0%")
+    assert project["base"] == "auto"
+    assert project["informational"] is False
+    assert statuses["patch"]["default"]["target"] in (90, "90%")
 
 
 def _workflow_on_block(data: dict, workflow_name: str) -> dict:

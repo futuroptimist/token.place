@@ -52,6 +52,40 @@ class RelayStateInvalidReservation(RelayStateStoreError):
     """A reservation token is invalid, expired, consumed, or wrongly bound."""
 
 
+AVAILABILITY_REASONS = frozenset(
+    {
+        "available",
+        "no_registered_compute_nodes",
+        "no_healthy_compute_nodes",
+        "no_matching_compute_node",
+        "no_available_capacity",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class EligibilitySnapshot:
+    """Bounded, identity-free view of scheduler eligibility."""
+
+    reason: str
+    registered_compute_nodes: int
+    healthy_compute_nodes: int
+    matching_compute_nodes: int
+    schedulable_compute_nodes: int
+
+    def __post_init__(self) -> None:
+        if self.reason not in AVAILABILITY_REASONS:
+            raise RelayStateStoreError("availability reason is invalid")
+        counts = (
+            self.registered_compute_nodes,
+            self.healthy_compute_nodes,
+            self.matching_compute_nodes,
+            self.schedulable_compute_nodes,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise RelayStateStoreError("availability counts are invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class RelayStateStoreConfig:
     """Explicit key-space, expiry, and size policy shared by all backends."""
@@ -866,6 +900,9 @@ class RelayStateStore(Protocol):
     def set_scheduler_state(
         self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
     ) -> bool: ...
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot: ...
     def select_and_reserve(
         self,
         client_public_key: str,
@@ -1136,6 +1173,36 @@ class InMemoryRelayStateStore:
                 replace(self._records[node_id]) for node_id in sorted(self._records)
             )
 
+    def runtime_metrics_snapshot(self) -> tuple[
+        tuple[ComputeNodeRegistration, ...], tuple[QueuedRequest, ...],
+        tuple[ClaimRecord, ...], tuple[NodeTombstoneRecord, ...],
+    ]:
+        """Return one non-mutating snapshot for runtime gauges."""
+        with self._lock:
+            now = self._now()
+            registrations = tuple(
+                replace(record) for record in self._records.values()
+                if record.lease_expires_at_epoch > now
+            )
+            queued = tuple(
+                replace(record) for identity, record in self._queued.items()
+                if record.request_deadline_epoch > now
+                and not (
+                    (claim := self._claims.get(identity)) is not None
+                    and claim.lease_expires_at_epoch > now
+                )
+            )
+            claims = tuple(
+                replace(record) for record in self._claims.values()
+                if record.lease_expires_at_epoch > now
+                and record.request_deadline_epoch > now
+            )
+            tombstones = tuple(
+                replace(record) for record in self._node_tombstones.values()
+                if record.expires_at_epoch > now
+            )
+            return registrations, queued, claims, tombstones
+
     def health_snapshot(self) -> tuple[
         tuple[ComputeNodeRegistration, ...],
         dict[str, int],
@@ -1223,6 +1290,298 @@ class InMemoryRelayStateStore:
             self._require_digest(record, control_credential_digest)
             self._scheduler_states[node_id] = state
             return True
+
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot:
+        """Inspect live capacity without reaping records or advancing fairness."""
+
+        model_id = self._model_id(requested_model_id)
+        tier = self._context_tier(requested_context_tier)
+        requested_tokens = CONTEXT_TIER_TOKEN_BOUNDS[tier]
+        with self._lock:
+            now = self._now()
+            records = tuple(
+                record
+                for record in self._records.values()
+                if record.lease_expires_at_epoch > now
+            )
+            healthy = tuple(
+                record
+                for record in records
+                if (state := self._scheduler_states.get(record.node_id)) is not None
+                and state.healthy
+                and not state.draining
+            )
+            matching = tuple(
+                record
+                for record in healthy
+                if model_id in record.capabilities.supported_model_ids
+                and CONTEXT_TIER_TOKEN_BOUNDS[
+                    record.capabilities.active_context_tier
+                ]
+                >= requested_tokens
+                and record.capabilities.maximum_total_context_tokens
+                >= requested_tokens
+            )
+            # Predict the scheduler's bounded cleanup without mutating authority.
+            # Deadline-due work remains capacity-consuming only when terminal or
+            # control-tombstone capacity would defer its authoritative transition.
+            retained_terminals = [
+                item for item in self._terminals.values()
+                if item.expires_at_epoch > now
+            ]
+            retained_tombstones = [
+                item for item in self._control_tombstones.values()
+                if item.expires_at_epoch > now
+            ]
+            retained_reservations = []
+            retained_queued = []
+            node_transition_work = set(self._reservations) | set(self._queued)
+            due = list(self._reservations.items()) + list(self._queued.items())
+            for identity, item in due:
+                if item.request_deadline_epoch <= now:
+                    client_terminal_count = sum(
+                        terminal.client_identity_digest == identity[0]
+                        for terminal in retained_terminals
+                    )
+                    claim = self._claims.get(identity)
+                    needs_tombstone = claim is not None and (
+                        claim.lease_expires_at_epoch >= item.request_deadline_epoch
+                    )
+                    node_tombstone_count = sum(
+                        tombstone.selected_node_id == item.selected_node_id
+                        for tombstone in retained_tombstones
+                    )
+                    can_terminalize = (
+                        len(retained_terminals) < self.config.max_terminal_records
+                        and client_terminal_count
+                        < self.config.max_terminal_records_per_client
+                        and (
+                            not needs_tombstone
+                            or (
+                                len(retained_tombstones)
+                                < self.config.max_control_tombstones
+                                and node_tombstone_count
+                                < self.config.max_control_tombstones_per_node
+                            )
+                        )
+                    )
+                    if can_terminalize:
+                        retained_terminals.append(
+                            TerminalOutcomeRecord(
+                                identity[0], identity[1], item.selected_node_id,
+                                "", "", 0, "", now, now,
+                                now + self.config.terminal_retention_seconds,
+                            )
+                        )
+                        if needs_tombstone:
+                            retained_tombstones.append(
+                                ControlTombstoneRecord(
+                                    identity[0], identity[1], item.selected_node_id,
+                                    "", "", 0, "expired",
+                                    "request_deadline_expired", now, False,
+                                    now + self.config.control_tombstone_ttl_seconds,
+                                )
+                            )
+                        node_transition_work.discard(identity)
+                        continue
+                if isinstance(item, ReservationRecord):
+                    if item.reservation_expires_at_epoch <= now and item.request_deadline_epoch > now:
+                        continue
+                    retained_reservations.append(item)
+                else:
+                    retained_queued.append(item)
+            # Admission expires every stale registration in node-id order.
+            # Carry the projected pending occupancy across that entire sweep:
+            # a transition that exhausts its bounded work batch keeps its slot,
+            # while a completed transition releases the slot for the next node.
+            retained_node_tombstones = {
+                node_digest
+                for node_digest, tombstone in self._node_tombstones.items()
+                if tombstone.expires_at_epoch > now
+            }
+            pending_authorities = {
+                transition.node_identity_digest:
+                transition.control_credential_digest
+                for transition in self._pending_node_transitions.values()
+            }
+            retained_owner_fences = {
+                (node_digest, owner_digest)
+                for node_digest, authorities
+                in self._former_node_authorities.items()
+                for owner_digest, authority in authorities.items()
+                if authority.expires_at_epoch > now
+                or pending_authorities.get(node_digest) == owner_digest
+            }
+            projected_pending = len(self._pending_node_transitions)
+            projected_fairness_cursors = dict(self._fairness_cursors)
+            transition_capacity = True
+            for record in sorted(
+                (
+                    item
+                    for item in self._records.values()
+                    if item.lease_expires_at_epoch <= now
+                ),
+                key=lambda item: item.node_id,
+            ):
+                node_digest = self._node_digest(record.node_id)
+                owner = (node_digest, record.control_credential_digest)
+                if (
+                    projected_pending >= self.config.max_pending_node_transitions
+                    or (
+                        owner not in retained_owner_fences
+                        and len(retained_owner_fences)
+                        >= self.config.max_removed_owner_fences
+                    )
+                    or (
+                        node_digest not in retained_node_tombstones
+                        and len(retained_node_tombstones)
+                        >= self.config.max_node_tombstones
+                    )
+                ):
+                    transition_capacity = False
+                    break
+                projected_pending += 1
+                retained_owner_fences.add(owner)
+                retained_node_tombstones.add(node_digest)
+                projected_fairness_cursors = {
+                    fingerprint: cursor
+                    for fingerprint, cursor in projected_fairness_cursors.items()
+                    if cursor[0] != record.node_id
+                }
+                work = [
+                    identity
+                    for identity in self._node_work_identities.get(
+                        record.node_id, {}
+                    )
+                    if identity in node_transition_work
+                ]
+                for identity in work[: self.config.node_transition_batch_size]:
+                    item = self._reservations.get(identity) or self._queued.get(
+                        identity
+                    )
+                    if item is None:
+                        node_transition_work.discard(identity)
+                        continue
+                    client_terminal_count = sum(
+                        terminal.client_identity_digest == identity[0]
+                        for terminal in retained_terminals
+                    )
+                    claim = self._claims.get(identity)
+                    node_tombstone_count = sum(
+                        tombstone.selected_node_id == item.selected_node_id
+                        for tombstone in retained_tombstones
+                    )
+                    if (
+                        len(retained_terminals) >= self.config.max_terminal_records
+                        or client_terminal_count
+                        >= self.config.max_terminal_records_per_client
+                        or (
+                            claim is not None
+                            and (
+                                len(retained_tombstones)
+                                >= self.config.max_control_tombstones
+                                or node_tombstone_count
+                                >= self.config.max_control_tombstones_per_node
+                            )
+                        )
+                    ):
+                        break
+                    retained_terminals.append(
+                        TerminalOutcomeRecord(
+                            identity[0], identity[1], item.selected_node_id,
+                            "", "", 0, "", now, now,
+                            now + self.config.terminal_retention_seconds,
+                        )
+                    )
+                    if claim is not None:
+                        retained_tombstones.append(
+                            ControlTombstoneRecord(
+                                identity[0], identity[1], item.selected_node_id,
+                                "", "", 0, "cancelled",
+                                "server_unregistered", now, False,
+                                now + self.config.control_tombstone_ttl_seconds,
+                            )
+                        )
+                    node_transition_work.discard(identity)
+                if not any(identity in node_transition_work for identity in work):
+                    projected_pending -= 1
+            retained_reservations = [
+                item
+                for item in retained_reservations
+                if (item.client_identity_digest, item.request_identity_digest)
+                in node_transition_work
+            ]
+            retained_queued = [
+                item
+                for item in retained_queued
+                if (item.client_identity_digest, item.request_identity_digest)
+                in node_transition_work
+            ]
+            global_capacity = (
+                len(retained_reservations) < self.config.max_reservations
+                and len(retained_reservations) + len(retained_queued)
+                < self.config.max_request_lifecycles
+            )
+            fingerprint = self._scheduler_fingerprint(model_id, tier)
+            active_fingerprints = {
+                item.scheduler_fingerprint for item in retained_reservations
+            }
+            active_fingerprints.update(
+                self._scheduler_fingerprint(
+                    item.requested_model_id, item.requested_context_tier
+                )
+                for item in retained_queued
+            )
+            fingerprint_capacity = (
+                fingerprint in projected_fairness_cursors
+                or len(projected_fairness_cursors)
+                < self.config.max_scheduler_fingerprints
+                or any(
+                    existing not in active_fingerprints
+                    for existing in projected_fairness_cursors
+                )
+            )
+            global_capacity = (
+                global_capacity and fingerprint_capacity and transition_capacity
+            )
+            reservation_counts: dict[str, int] = {}
+            queued_counts: dict[str, int] = {}
+            for item in retained_reservations:
+                node_id = item.selected_node_id
+                reservation_counts[node_id] = reservation_counts.get(node_id, 0) + 1
+            for item in retained_queued:
+                node_id = item.selected_node_id
+                queued_counts[node_id] = queued_counts.get(node_id, 0) + 1
+            schedulable = 0
+            if global_capacity:
+                for record in matching:
+                    node_id = record.node_id
+                    reservations = reservation_counts.get(node_id, 0)
+                    queued = queued_counts.get(node_id, 0)
+                    state = self._scheduler_states[node_id]
+                    load = reservations + queued + state.claimed_work
+                    if (
+                        load < record.capabilities.max_concurrency
+                        and reservations < self.config.max_reservations_per_node
+                        and reservations + queued
+                        < self.config.max_queue_depth_per_node
+                    ):
+                        schedulable += 1
+            counts = (len(records), len(healthy), len(matching), schedulable)
+            reason = (
+                "available"
+                if schedulable
+                else "no_registered_compute_nodes"
+                if not records
+                else "no_healthy_compute_nodes"
+                if not healthy
+                else "no_matching_compute_node"
+                if not matching
+                else "no_available_capacity"
+            )
+            return EligibilitySnapshot(reason, *counts)
 
     def select_and_reserve(
         self,

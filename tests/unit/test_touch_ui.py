@@ -176,8 +176,17 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     )
     assert "createApiV1Messages" in chat_js
     assert "this.chatHistory" in chat_js
-    assert f"const LANDING_CHAT_SYSTEM_MESSAGE = '{system_message}';" in chat_js
-    assert system_message in architecture.replace("\n> ", " ").replace("\n", " ")
+    chat_match = re.search(
+        r"const LANDING_CHAT_SYSTEM_MESSAGE = '([^'\\]*(?:\\.[^'\\]*)*)';",
+        chat_js,
+    )
+    doc_match = re.search(
+        r"The exact message is this single-line value:\s*```text\n([^\n]+)\n```",
+        architecture,
+    )
+    assert chat_match is not None
+    assert doc_match is not None
+    assert chat_match.group(1) == doc_match.group(1) == system_message
     builder_start = chat_js.index("        createApiV1Messages(messageContent) {")
     builder = chat_js[builder_start:chat_js.index("generateClientKeys()", builder_start)]
     assert "{ role: 'system', content: LANDING_CHAT_SYSTEM_MESSAGE }" in builder

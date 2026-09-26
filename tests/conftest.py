@@ -181,6 +181,8 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_cancel_http_failure_is_one_coherent_error",
     "tests/e2e/test_ui.py::test_landing_chat_cancel_network_failure_is_visible",
     "tests/e2e/test_ui.py::test_landing_chat_sticky_server_two_turns_and_key_label",
+    "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming_system_message_fallback_estimation_and_auto_retry",
+    "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming_real_browser_encryption_preserves_system_message_on_failover",
     "tests/e2e/test_ui.py::test_landing_chat_sticky_server_auto_failover_preserves_history",
     "tests/e2e/test_ui.py::test_landing_chat_failover_no_servers_keeps_history",
     "tests/e2e/test_ui.py::test_landing_chat_failover_rejects_repeated_same_server_after_stale_count_refresh",

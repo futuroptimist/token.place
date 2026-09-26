@@ -169,6 +169,17 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     assert "this.chatHistory" in chat_js
     assert "const apiV1Messages = this.createApiV1Messages(messageContent);" in chat_js
     assert "messages: apiV1Messages" in chat_js
+    system_message = (
+        "You are the assistant in the token.place landing-page chat. token.place connects people who "
+        "need generative-AI inference with people who contribute compute; a selected compute node serves "
+        "each request. The relay routes end-to-end encrypted request and response envelopes and cannot read "
+        "the conversation, while the selected compute node decrypts the request to run inference and encrypts "
+        "its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that you "
+        "searched or browsed the web."
+    )
+    assert f"const LANDING_PAGE_SYSTEM_MESSAGE = '{system_message}';" in chat_js
+    assert "{ role: 'system', content: LANDING_PAGE_SYSTEM_MESSAGE }" in chat_js
+    assert "...conversationMessages" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js
     assert "response.choices[0].message" in chat_js
 

@@ -29,10 +29,14 @@ def _load_workflow(path: Path) -> dict:
 def test_codecov_publishes_project_and_patch_commit_statuses() -> None:
     config = yaml.safe_load(CODECOV_CONFIG.read_text(encoding="utf-8"))
 
-    assert config["codecov"]["github_checks"] is False
+    assert config["github_checks"] is False
     statuses = config["coverage"]["status"]
-    assert statuses["project"]["default"]["target"] == 90
-    assert statuses["patch"]["default"]["target"] == 90
+    project = statuses["project"]["default"]
+    assert project["target"] in (90, "90%")
+    assert project["threshold"] in (0, "0%")
+    assert project["base"] == "auto"
+    assert project["informational"] is False
+    assert statuses["patch"]["default"]["target"] in (90, "90%")
 
 
 def _workflow_on_block(data: dict, workflow_name: str) -> dict:

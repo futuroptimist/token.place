@@ -165,8 +165,24 @@ def test_landing_chat_js_maps_structured_api_v1_errors_to_user_messages():
 
 def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    architecture = Path("docs/architecture/api_v1_e2ee_relay.md").read_text(encoding="utf-8")
+    system_message = (
+        "You are the assistant in the token.place landing-page chat. token.place connects people "
+        "who need generative-AI inference with people who contribute compute; a selected compute "
+        "node serves each request. The relay routes end-to-end encrypted request and response "
+        "envelopes and cannot read the conversation, while the selected compute node decrypts the "
+        "request to run inference and encrypts its response for the requesting browser. If you are "
+        "uncertain, say so. Do not claim or imply that you searched or browsed the web."
+    )
     assert "createApiV1Messages" in chat_js
     assert "this.chatHistory" in chat_js
+    assert f"const LANDING_CHAT_SYSTEM_MESSAGE = '{system_message}';" in chat_js
+    assert system_message in architecture.replace("\n> ", " ").replace("\n", " ")
+    builder_start = chat_js.index("        createApiV1Messages(messageContent) {")
+    builder = chat_js[builder_start:chat_js.index("generateClientKeys()", builder_start)]
+    assert "{ role: 'system', content: LANDING_CHAT_SYSTEM_MESSAGE }" in builder
+    assert "...conversationMessages" in builder
+    assert "entry.role === 'user' || entry.role === 'assistant'" in builder
     assert "const apiV1Messages = this.createApiV1Messages(messageContent);" in chat_js
     assert "messages: apiV1Messages" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js

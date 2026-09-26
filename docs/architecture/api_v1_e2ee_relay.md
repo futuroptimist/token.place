@@ -83,10 +83,10 @@ plaintext model payload content, including:
 
 Any path that would expose plaintext to relay-owned surfaces must fail closed.
 
-## Landing-page system message (proposed)
+## Landing-page system message
 
-The landing-page chat should give the model a small, factual description of token.place so it can
-answer product questions without inventing capabilities. The proposed message is:
+The landing-page chat gives the model a small, factual description of token.place so it can answer
+product questions without inventing capabilities. The message is:
 
 > You are the assistant in the token.place landing-page chat. token.place connects people who need
 > generative-AI inference with people who contribute compute; a selected compute node serves each
@@ -100,10 +100,10 @@ and safe routing metadata, but the selected compute node necessarily receives pl
 context for inference. It does not claim that the model has current information or that the compute
 node cannot access or retain plaintext.
 
-### Future request construction
+### Request construction
 
-A future implementation belongs in the relay-served landing-page client (`static/chat.js`). For every
-outgoing API v1 conversation, it should construct a fresh request-message array by prepending one
+The relay-served landing-page client (`static/chat.js`) constructs, for every outgoing API v1
+conversation, a fresh request-message array by prepending one
 copy of the system message to the user/assistant conversation returned by the current request
 builder. That complete array, including the system message, must be used both for automatic
 context-tier estimation and for `api_v1_request.messages` before the whole request envelope is
@@ -116,15 +116,15 @@ Keeping the request-only instruction separate prevents rendering it as conversat
 ensuring that each later turn reconstructs it ahead of the retained user/assistant conversation.
 
 This is per-request context delivered only to the compute node selected for that encrypted request;
-it is not persistent model configuration and is not propagated to every registered node. Therefore
-the future deployment change is to the relay's landing-page static asset, not relay routing, compute
-node registration, model packaging, or node configuration. The compute-node API v1 validator already
+it is not persistent model configuration and is not propagated to every registered node. Therefore,
+the behavior belongs to the relay's landing-page static asset, not relay routing, compute node
+registration, model packaging, or node configuration. The compute-node API v1 validator already
 accepts `system`, `user`, and `assistant` roles, and the inference path passes the validated message
 list through runtime preparation, context admission, and non-streaming chat completion.
 
-### Acceptance criteria for the future implementation
+### Implemented invariants
 
-- Every landing-page API v1 request contains exactly one copy of the proposed system message, first
+- Every landing-page API v1 request contains exactly one copy of the system message, first
   in the encrypted conversation message list.
 - The message remains present exactly once on subsequent turns, automatic context-tier retries, and
   compute-node failover retries, without entering the visible chat history.

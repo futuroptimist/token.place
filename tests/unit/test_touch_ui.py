@@ -173,6 +173,27 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     assert "response.choices[0].message" in chat_js
 
 
+def test_landing_chat_js_adds_request_only_system_message_once():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    system_message = (
+        "You are the assistant in the token.place landing-page chat. token.place connects people "
+        "who need generative-AI inference with people who contribute compute; a selected compute "
+        "node serves each request. The relay routes end-to-end encrypted request and response "
+        "envelopes and cannot read the conversation, while the selected compute node decrypts the "
+        "request to run inference and encrypts its response for the requesting browser. If you are "
+        "uncertain, say so. Do not claim or imply that you searched or browsed the web."
+    )
+
+    assert chat_js.count(system_message) == 1
+    builder_start = chat_js.index("createApiV1Messages(messageContent)")
+    builder = chat_js[builder_start:chat_js.index("generateClientKeys()", builder_start)]
+    assert "{ role: 'system', content: LANDING_CHAT_SYSTEM_MESSAGE }" in builder
+    assert "...conversationMessages" in builder
+    assert "this.chatHistory.push" not in builder
+    assert "const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);" in chat_js
+    assert "const initialTierResolution = this.resolveContextTierForRequest(apiV1Messages" in chat_js
+
+
 def test_landing_chat_js_rejects_raw_array_chat_responses():
     # Landing chat invariants currently use static string guards here rather
     # than an executable static/chat.js harness. Keep these assertions focused

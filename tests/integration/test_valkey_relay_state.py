@@ -11716,7 +11716,9 @@ def test_node_removed_record_round_trips_terminal_retrieval_and_control(
 def test_node_removed_record_rejects_malformed_terminal_authority(
     valkey_server, field, value
 ):
-    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
     node, owner = f"malformed-removed-{field}", _digest(f"owner-{field}-{value}")
     identity = (f"malformed-client-{field}", f"malformed-request-{field}-{value[:4]}")
     try:
@@ -11732,13 +11734,15 @@ def test_node_removed_record_rejects_malformed_terminal_authority(
         result = store.unregister_node_and_transition_work(node, owner)
         assert result.state == "complete"
         client, request = store._identity(*identity)
-        store._foundation._client.hset(
-            store._foundation.config.key("terminal", client, request), field, value
-        )
-        with pytest.raises(
-            ValkeySchemaIncompatibleError, match="state schema incompatible"
-        ):
-            store.terminal_records()
+        terminal_key = store._foundation.config.key("terminal", client, request)
+        store._foundation._client.hset(terminal_key, field, value)
+        malformed_terminal = store._foundation._client.dump(terminal_key)
+        for _ in range(2):
+            with pytest.raises(
+                ValkeySchemaIncompatibleError, match="state schema incompatible"
+            ):
+                observer.terminal_records()
+            assert store._foundation._client.dump(terminal_key) == malformed_terminal
         assert selection.reservation_token
     finally:
         _delete_claim_fixture_state(store, (node,), (identity,))
@@ -11751,6 +11755,7 @@ def test_node_removed_record_rejects_malformed_terminal_authority(
             cfg.key("node_tombstones:expiry"),
             cfg.key("former_owners:expiry"),
         )
+        observer.close()
         store.close()
 
 

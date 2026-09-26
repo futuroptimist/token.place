@@ -83,6 +83,58 @@ plaintext model payload content, including:
 
 Any path that would expose plaintext to relay-owned surfaces must fail closed.
 
+## Landing-page system message (proposed)
+
+The landing-page chat should give the model a small, factual description of token.place so it can
+answer product questions without inventing capabilities. The proposed message is:
+
+> You are the assistant in the token.place landing-page chat. token.place connects people who need
+> generative-AI inference with people who contribute compute; a selected compute node serves each
+> request. The relay routes end-to-end encrypted request and response envelopes and cannot read the
+> conversation, while the selected compute node decrypts the request to run inference and encrypts
+> its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that
+> you searched or browsed the web.
+
+This wording deliberately limits the privacy claim to the relay boundary: the relay sees ciphertext
+and safe routing metadata, but the selected compute node necessarily receives plaintext request
+context for inference. It does not claim that the model has current information or that the compute
+node cannot access or retain plaintext.
+
+### Future request construction
+
+A future implementation belongs in the relay-served landing-page client (`static/chat.js`). For every
+outgoing API v1 conversation, it should construct a fresh request-message array by prepending one
+copy of the system message to the user/assistant conversation returned by the current request
+builder. That complete array, including the system message, must be used both for automatic
+context-tier estimation and for `api_v1_request.messages` before the whole request envelope is
+encrypted to the selected compute node. The same complete array must be reused by context-tier
+retries and compute-node failover retries.
+
+The system message must not be stored in or reconstructed from display `chatHistory`. That state is
+currently filtered into only `user` and `assistant` messages when API v1 request context is built.
+Keeping the request-only instruction separate prevents rendering it as conversation history while
+ensuring that each later turn reconstructs it ahead of the retained user/assistant conversation.
+
+This is per-request context delivered only to the compute node selected for that encrypted request;
+it is not persistent model configuration and is not propagated to every registered node. Therefore
+the future deployment change is to the relay's landing-page static asset, not relay routing, compute
+node registration, model packaging, or node configuration. The compute-node API v1 validator already
+accepts `system`, `user`, and `assistant` roles, and the inference path passes the validated message
+list through runtime preparation, context admission, and non-streaming chat completion.
+
+### Acceptance criteria for the future implementation
+
+- Every landing-page API v1 request contains exactly one copy of the proposed system message, first
+  in the encrypted conversation message list.
+- The message remains present exactly once on subsequent turns, automatic context-tier retries, and
+  compute-node failover retries, without entering the visible chat history.
+- Context-tier estimation includes the message, and the message is inside the E2EE request envelope;
+  relay-owned payloads, state, logs, and diagnostics remain ciphertext-only plus safe routing
+  metadata.
+- A focused end-to-end landing-page check sends an initial prompt, a subsequent turn, and a retry,
+  verifies the selected compute node receives exactly one system message each time, and confirms the
+  relay never receives plaintext conversation content.
+
 ## Migration context (why this exists)
 
 There is a known alignment gap between `relay.py`, desktop-tauri flows, and the relay landing-page

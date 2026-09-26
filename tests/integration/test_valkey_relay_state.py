@@ -12779,8 +12779,15 @@ def test_node_transition_prevalidation_continuation_rejects_without_mutation(
                 *identity, "qwen3-8b-instruct", "8k-fast",
                 seconds + micros / 1_000_000 + 60, None,
             )
-        cfg = store._foundation.config
-        client, request = store._identity(*identities[1])
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        # Work is selected by sorted-set order, not reservation insertion order.
+        # Corrupt the member beyond the first bounded batch so that the initial
+        # transition succeeds and only continuation prevalidation sees it.
+        continuation_member = store._foundation._client.zrange(
+            cfg.key("node_work", digest), 2, 2
+        )
+        assert len(continuation_member) == 1
+        client, request = continuation_member[0].decode("ascii").split(":")
         store._foundation._client.hset(
             cfg.key("request", client, request), "deadline", "invalid"
         )
@@ -13383,13 +13390,22 @@ def test_node_owner_retention_retry_precedes_replacement_pending_transition(
 ):
     namespace = uuid.uuid4().hex
     store = _registration_store(
-        valkey_server, namespace, node_transition_batch_size=1
+        valkey_server,
+        namespace,
+        node_transition_batch_size=1,
+        reservation_ttl_seconds=300,
     )
     retry_store = _registration_store(
-        valkey_server, namespace, node_transition_batch_size=1
+        valkey_server,
+        namespace,
+        node_transition_batch_size=1,
+        reservation_ttl_seconds=300,
     )
     continuation_store = _registration_store(
-        valkey_server, namespace, node_transition_batch_size=1
+        valkey_server,
+        namespace,
+        node_transition_batch_size=1,
+        reservation_ttl_seconds=300,
     )
     node = "retained-owner-pending-replacement"
     owner_a, owner_b = map(_digest, ("retained-owner-a", "retained-owner-b"))
@@ -13421,9 +13437,11 @@ def test_node_owner_retention_retry_precedes_replacement_pending_transition(
         assert original.state == "complete"
 
         store.register(node, _capabilities(), owner_b)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 300
         for identity in identities:
             store.select_and_reserve(
-                *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+                *identity, "qwen3-8b-instruct", "8k-fast", deadline
             )
         pending = remove(owner_b, replacement_cause)
         assert pending.state == "transitioning"

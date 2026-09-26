@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 import relay
-from relay_state_store import RelayStateStoreError
+from relay_state_store import EligibilitySnapshot, RelayStateStoreError
 from valkey_relay_state import (
     ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
@@ -1046,3 +1046,117 @@ def test_operational_endpoints_bound_store_snapshot_failures(
         }
     }
     assert secret.encode() not in response.data
+
+
+def test_availability_route_reports_canonical_capacity_without_reservation():
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    empty = client.get("/api/v1/relay/availability")
+    assert empty.status_code == 503
+    assert empty.get_json()["reason"] == "no_registered_compute_nodes"
+    assert empty.headers["Cache-Control"] == "no-store"
+
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "availability-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    })
+    assert registration.status_code == 200
+    store = relay._api_v1_store()
+    before = (store.list_reservations(), dict(store._fairness_cursors))
+    response = client.get("/api/v1/relay/availability")
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "available": True,
+        "reason": "available",
+        "registered_compute_nodes": 1,
+        "healthy_compute_nodes": 1,
+        "matching_compute_nodes": 1,
+        "schedulable_compute_nodes": 1,
+    }
+    assert before == (store.list_reservations(), store._fairness_cursors)
+    assert relay.RELAY_STATE_STORE_UP._value.get() == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RelayStateStoreError("secret backend URL"), ValkeySchemaIncompatibleError("secret schema")],
+)
+def test_availability_route_bounds_backend_failures(monkeypatch, failure):
+    store = Mock()
+    store.inspect_eligibility.side_effect = failure
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+    response = relay.app.test_client().get("/api/v1/relay/availability")
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "available": False, "reason": "state_backend_unavailable",
+        "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+        "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+    }
+    assert b"secret" not in response.data
+    assert relay.RELAY_STATE_STORE_UP._value.get() == 0
+
+
+@pytest.mark.parametrize("initial_store_up", [0, 1])
+def test_availability_route_drain_short_circuits_state_backend(
+    monkeypatch, initial_store_up
+):
+    backend = Mock(side_effect=AssertionError("draining probe touched backend"))
+    monkeypatch.setattr(relay, "_api_v1_health_store", backend)
+    relay.RELAY_STATE_STORE_UP.set(initial_store_up)
+    relay.DRAINING.set()
+    try:
+        responses = [
+            relay.app.test_client().get("/api/v1/relay/availability")
+            for _ in range(2)
+        ]
+    finally:
+        relay.DRAINING.clear()
+
+    for response in responses:
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "available": False, "reason": "no_available_capacity",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        }
+        assert response.headers["Cache-Control"] == "no-store"
+    assert relay.RELAY_STATE_STORE_UP._value.get() == initial_store_up
+    backend.assert_not_called()
+
+
+def test_availability_metrics_are_fixed_bounded_and_probe_is_quota_safe(monkeypatch):
+    """Availability owns fixed metric labels and bypasses public API quotas."""
+
+    store = Mock()
+    store.inspect_eligibility.return_value = EligibilitySnapshot(
+        "no_registered_compute_nodes", 0, 0, 0, 0
+    )
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+    client = relay.app.test_client()
+    for _ in range(65):
+        response = client.get("/api/v1/relay/availability")
+        assert response.status_code == 503
+        assert response.get_json()["reason"] == "no_registered_compute_nodes"
+
+    from prometheus_client import generate_latest
+
+    body = generate_latest(relay.RELAY_METRICS_REGISTRY).decode()
+    for name in (
+        "tokenplace_relay_chat_available",
+        "tokenplace_relay_schedulable_compute_nodes",
+        "tokenplace_relay_chat_availability_state",
+        "tokenplace_relay_state_store_up",
+        "tokenplace_relay_state_store_operation_duration_seconds",
+        "tokenplace_relay_state_store_errors_total",
+    ):
+        assert name in body
+    observed = {
+        line.split('state="', 1)[1].split('"', 1)[0]
+        for line in body.splitlines()
+        if line.startswith("tokenplace_relay_chat_availability_state{")
+    }
+    assert observed == set(relay.AVAILABILITY_STATE_ENUM)

@@ -17,6 +17,7 @@ const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const API_V1_MAX_OUTPUT_TOKENS = 8192;
+const LANDING_CHAT_SYSTEM_MESSAGE = 'You are the assistant in the token.place landing-page chat. token.place connects people who need generative-AI inference with people who contribute compute; a selected compute node serves each request. The relay routes end-to-end encrypted request and response envelopes and cannot read the conversation, while the selected compute node decrypts the request to run inference and encrypts its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that you searched or browsed the web.';
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -617,7 +618,7 @@ new Vue({
         },
 
         createApiV1Messages(messageContent) {
-            const messages = Array.isArray(this.chatHistory)
+            const conversationMessages = Array.isArray(this.chatHistory)
                 ? this.chatHistory
                     .filter((entry) => entry && (entry.role === 'user' || entry.role === 'assistant'))
                     .map((entry) => ({
@@ -627,14 +628,19 @@ new Vue({
                     .filter((entry) => typeof entry.content === 'string' && entry.content.trim())
                 : [];
 
-            const latest = messages.length > 0 ? messages[messages.length - 1] : null;
+            const latest = conversationMessages.length > 0
+                ? conversationMessages[conversationMessages.length - 1]
+                : null;
             if (!latest || latest.role !== 'user' || latest.content !== messageContent) {
-                messages.push({
+                conversationMessages.push({
                     role: 'user',
                     content: messageContent
                 });
             }
-            return messages;
+            return [
+                { role: 'system', content: LANDING_CHAT_SYSTEM_MESSAGE },
+                ...conversationMessages
+            ];
         },
 
         generateClientKeys() {

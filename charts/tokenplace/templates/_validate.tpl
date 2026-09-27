@@ -8,6 +8,13 @@
 {{- if and $ha (ne $backend "valkey") -}}
 {{- fail "multiple replicas or workers require stateBackend.type=valkey" -}}
 {{- end -}}
+{{- range $source := list .Values.env .Values.extraEnv -}}
+{{- range $key, $entry := $source -}}
+{{- $name := $key -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = get $entry "name" -}}{{- end -}}
+{{- if eq (printf "%v" $name) "RELAY_WORKERS" -}}
+{{- fail "environment override RELAY_WORKERS is chart-managed" -}}
+{{- end -}}
+{{- end -}}{{- end -}}
 {{- if eq $backend "valkey" -}}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.podDisruptionBudget.enabled) -}}{{ fail "multiple replicas require podDisruptionBudget.enabled=true" }}{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.podAntiAffinity.enabled) (not .Values.topologySpreadConstraints) -}}{{ fail "multiple replicas require podAntiAffinity or topologySpreadConstraints" }}{{- end -}}
@@ -29,7 +36,7 @@
 {{- range $source := list .Values.env .Values.extraEnv -}}
 {{- range $key, $entry := $source -}}
 {{- $name := $key -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = get $entry "name" -}}{{- end -}}
-{{- if or (eq (printf "%v" $name) "TOKENPLACE_RELAY_STATE_BACKEND") (hasPrefix "TOKENPLACE_RELAY_VALKEY_" (printf "%v" $name)) (eq (printf "%v" $name) "RELAY_WORKERS") (eq (printf "%v" $name) "TOKENPLACE_RATE_LIMIT_STORAGE_URI") (eq (printf "%v" $name) "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES") -}}
+{{- if or (eq (printf "%v" $name) "TOKENPLACE_RELAY_STATE_BACKEND") (hasPrefix "TOKENPLACE_RELAY_VALKEY_" (printf "%v" $name)) (eq (printf "%v" $name) "TOKENPLACE_RATE_LIMIT_STORAGE_URI") (eq (printf "%v" $name) "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES") -}}
 {{- fail (printf "environment override %s is chart-managed when Valkey is selected" $name) -}}
 {{- end -}}
 {{- end -}}{{- end -}}

@@ -39,6 +39,19 @@ def test_memory_defaults_remain_single_process_and_do_not_render_valkey() -> Non
     assert not any(doc.get("kind", "").lower().startswith(("redis", "valkey")) for doc in docs)
 
 
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("--set", "env.RELAY_WORKERS=2"),
+        ("--set", "extraEnv[0].name=RELAY_WORKERS", "--set-string", "extraEnv[0].value=2"),
+    ),
+)
+def test_memory_rejects_relay_worker_environment_overrides(args: tuple[str, ...]) -> None:
+    result = _helm_template(*args, check=False)
+    assert result.returncode != 0
+    assert "environment override RELAY_WORKERS is chart-managed" in result.stderr
+
+
 def test_direct_valkey_renders_runtime_contract_and_secret_refs() -> None:
     docs = _valkey_render(
         "--set", "replicaCount=3",

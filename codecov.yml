@@ -1,7 +1,8 @@
 codecov:
   require_ci_to_pass: yes
-github_checks:
-  annotations: true
+# Publish both configured gates as commit statuses. Codecov's Checks-based
+# publication emitted only the patch result for otherwise complete reports.
+github_checks: false
 coverage:
   status:
     project:

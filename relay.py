@@ -501,7 +501,7 @@ def create_app() -> Flask:
 
     from api import init_app  # Imported lazily to honor mock-mode configuration
 
-    init_app(
+    limiter = init_app(
         flask_app,
         metrics_registry=RELAY_METRICS_REGISTRY,
         metrics_export_defaults=False,
@@ -516,6 +516,7 @@ def create_app() -> Flask:
             "public_base_url": public_base_url,
         },
     )
+    flask_app.extensions["tokenplace_public_limiter"] = limiter
     return flask_app
 
 
@@ -544,6 +545,16 @@ OUTCOME_ENUM = (
     "dependency_failure",
     "failed",
 )
+AVAILABILITY_STATE_ENUM = (
+    "available",
+    "no_registered_compute_nodes",
+    "no_healthy_compute_nodes",
+    "no_matching_compute_node",
+    "no_available_capacity",
+    "state_backend_unavailable",
+)
+STATE_STORE_OPERATION_ENUM = ("availability", "readiness")
+STATE_STORE_ERROR_REASON_ENUM = ("unavailable", "schema_incompatible")
 EVICTION_REASON_ENUM = ("stale_lease", "unregistered", "capacity_loss")
 HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 BUILD_METADATA = get_release_metadata(None)
@@ -674,6 +685,30 @@ METRICS_DEGRADED = _collector(
     lambda: Gauge("tokenplace_metrics_degraded", "Whether the explicit emergency degraded metrics mode is active.", registry=RELAY_METRICS_REGISTRY),
     degraded=True,
 )
+RELAY_CHAT_AVAILABLE = _collector(
+    "tokenplace_relay_chat_available",
+    lambda: Gauge("tokenplace_relay_chat_available", "Whether canonical relay chat work is currently schedulable.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_SCHEDULABLE_COMPUTE_NODES = _collector(
+    "tokenplace_relay_schedulable_compute_nodes",
+    lambda: Gauge("tokenplace_relay_schedulable_compute_nodes", "Bounded count of compute nodes schedulable for canonical relay chat work.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_CHAT_AVAILABILITY_STATE = _collector(
+    "tokenplace_relay_chat_availability_state",
+    lambda: Gauge("tokenplace_relay_chat_availability_state", "Last canonical relay chat availability result by fixed state.", ["state"], registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_UP = _collector(
+    "tokenplace_relay_state_store_up",
+    lambda: Gauge("tokenplace_relay_state_store_up", "Whether the most recent observed state-store operation succeeded.", registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_OPERATION_DURATION_SECONDS = _collector(
+    "tokenplace_relay_state_store_operation_duration_seconds",
+    lambda: Histogram("tokenplace_relay_state_store_operation_duration_seconds", "State-store operation latency by fixed operation.", ["operation"], buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5), registry=RELAY_METRICS_REGISTRY),
+)
+RELAY_STATE_STORE_ERRORS_TOTAL = _collector(
+    "tokenplace_relay_state_store_errors_total",
+    lambda: Counter("tokenplace_relay_state_store_errors_total", "State-store failures by fixed operation and reason.", ["operation", "reason"], registry=RELAY_METRICS_REGISTRY),
+)
 
 
 def _initialise_metric_labels() -> None:
@@ -692,6 +727,15 @@ def _initialise_metric_labels() -> None:
             RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
         RELAY_QUEUE_DEPTH.labels("relay").set(0)
         RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
+        RELAY_CHAT_AVAILABLE.set(0)
+        RELAY_SCHEDULABLE_COMPUTE_NODES.set(0)
+        RELAY_STATE_STORE_UP.set(0)
+        for state in AVAILABILITY_STATE_ENUM:
+            RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(0)
+        for operation in STATE_STORE_OPERATION_ENUM:
+            RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels(operation)
+            for reason in STATE_STORE_ERROR_REASON_ENUM:
+                RELAY_STATE_STORE_ERRORS_TOTAL.labels(operation, reason)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
         _build_revision_label(BUILD_METADATA),
@@ -742,6 +786,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
         "api_v1_relay_servers_control": "/api/v1/relay/servers/control",
         "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
+        "api_v1_relay_availability": "/api/v1/relay/availability",
         "healthz": "/healthz",
         "livez": "/livez",
         "metrics": "/metrics",
@@ -869,20 +914,29 @@ def _update_runtime_gauges() -> None:
     oldest_lease_age = 0.0
     in_flight = 0
     oldest_in_flight_age = 0.0
-    store = _api_v1_store()
-    registrations = store.list()
-    _reconcile_api_v1_stale_lease_evictions(store)
-    registered = len(registrations)
-    healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
-    for record in registrations:
-        remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
-        oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
-        for claim in store.active_claims(record.node_id):
-            in_flight += 1
-            oldest_in_flight_age = max(oldest_in_flight_age, max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0))
-        for queued in store.queued_requests(record.node_id):
-            queue_depth += 1
+    store, close_store = _api_v1_health_store()
+    try:
+        registrations, queued_records, claim_records, tombstones = (
+            store.runtime_metrics_snapshot()
+        )
+        _reconcile_api_v1_stale_lease_evictions(store, tombstones)
+        registered = len(registrations)
+        healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
+        for record in registrations:
+            remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
+            oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
+        queue_depth += len(queued_records)
+        in_flight += len(claim_records)
+        for queued in queued_records:
             oldest_queued_age = max(oldest_queued_age, max(now_wall - queued.enqueued_at_epoch, 0.0))
+        for claim in claim_records:
+            oldest_in_flight_age = max(
+                oldest_in_flight_age,
+                max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0),
+            )
+    finally:
+        if close_store:
+            store.close()
     server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
     with server_round_robin_lock:
         for payload in known_servers.values():
@@ -1018,7 +1072,7 @@ streaming_sessions = {}
 streaming_sessions_by_client = {}
 stream_lock = threading.Lock()
 
-IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics"}
+IGNORED_LOG_ENDPOINTS = {"livez", "healthz", "metrics", "api_v1_relay_availability"}
 SERVER_STALE_SECONDS_ENV = "TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS"
 DEFAULT_SERVER_STALE_SECONDS = 30
 API_V1_POLL_WAIT_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS"
@@ -2237,16 +2291,27 @@ def healthz():
     try:
         store, close_store = _api_v1_health_store()
         if isinstance(store, ValkeyRegistrationStore):
-            store.readiness()
+            started = time.monotonic()
+            try:
+                store.readiness()
+            finally:
+                RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels("readiness").observe(
+                    max(time.monotonic() - started, 0.0)
+                )
         eligible_known_servers = _health_eligible_known_server_items()
         registered_servers = _live_server_diagnostics(
             store=store,
             health_probe=True,
             known_server_items=eligible_known_servers,
         )
+        RELAY_STATE_STORE_UP.set(1)
     except ValkeySchemaIncompatibleError:
+        RELAY_STATE_STORE_UP.set(0)
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "schema_incompatible").inc()
         return _schema_failure_response()
     except RelayStateStoreError:
+        RELAY_STATE_STORE_UP.set(0)
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "unavailable").inc()
         return _store_failure_response()
     finally:
         if close_store and store is not None:
@@ -2299,6 +2364,95 @@ def healthz():
 @app.route("/livez", methods=["GET"])
 def livez():
     return jsonify({"status": "alive"})
+
+
+def _publish_availability_metrics(
+    reason: str, schedulable: int, *, store_up: bool | None
+) -> None:
+    """Publish only fixed-cardinality, process-local availability observations."""
+
+    RELAY_CHAT_AVAILABLE.set(1 if reason == "available" else 0)
+    RELAY_SCHEDULABLE_COMPUTE_NODES.set(schedulable)
+    if store_up is not None:
+        RELAY_STATE_STORE_UP.set(1 if store_up else 0)
+    for state in AVAILABILITY_STATE_ENUM:
+        RELAY_CHAT_AVAILABILITY_STATE.labels(state).set(1 if state == reason else 0)
+
+
+@app.extensions["tokenplace_public_limiter"].exempt
+@app.route("/api/v1/relay/availability", methods=["GET"])
+def api_v1_relay_availability():
+    """Report canonical scheduler capacity without mutating shared state."""
+
+    if DRAINING.is_set():
+        # No backend operation occurred, so preserve its last observed health.
+        _publish_availability_metrics("no_available_capacity", 0, store_up=None)
+        response = jsonify({
+            "available": False, "reason": "no_available_capacity",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        })
+        response.status_code = 503
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    store = None
+    close_store = False
+    started = time.monotonic()
+    try:
+        store, close_store = _api_v1_health_store()
+        snapshot = store.inspect_eligibility(
+            MODEL_ALIASES.get(DEFAULT_MODEL_IDS[0], DEFAULT_MODEL_IDS[0]),
+            DEFAULT_CONTEXT_TIER,
+        )
+        draining = DRAINING.is_set()
+        reason = "no_available_capacity" if draining else snapshot.reason
+        counts = (
+            snapshot.registered_compute_nodes,
+            snapshot.healthy_compute_nodes,
+            snapshot.matching_compute_nodes,
+            0 if draining else snapshot.schedulable_compute_nodes,
+        )
+        _publish_availability_metrics(reason, counts[3], store_up=True)
+        payload = {
+            "available": reason == "available",
+            "reason": reason,
+            "registered_compute_nodes": counts[0],
+            "healthy_compute_nodes": counts[1],
+            "matching_compute_nodes": counts[2],
+            "schedulable_compute_nodes": counts[3],
+        }
+        response = jsonify(payload)
+        response.status_code = 200 if reason == "available" else 503
+    except ValkeySchemaIncompatibleError:
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("availability", "schema_incompatible").inc()
+        _publish_availability_metrics("state_backend_unavailable", 0, store_up=False)
+        response = jsonify({
+            "available": False, "reason": "state_backend_unavailable",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        })
+        response.status_code = 503
+    except RelayStateStoreError:
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("availability", "unavailable").inc()
+        _publish_availability_metrics("state_backend_unavailable", 0, store_up=False)
+        response = jsonify({
+            "available": False, "reason": "state_backend_unavailable",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        })
+        response.status_code = 503
+    finally:
+        RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels("availability").observe(
+            max(time.monotonic() - started, 0.0)
+        )
+        if close_store and store is not None:
+            try:
+                store.close()
+            except Exception:
+                LOGGER.warning("relay.state_backend_cleanup_failed")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 def _register_stream_session(server_public_key, client_public_key):
     """Create or replace the streaming session for a client/server pair."""
 

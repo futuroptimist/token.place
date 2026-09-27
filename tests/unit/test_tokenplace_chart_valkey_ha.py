@@ -43,6 +43,7 @@ def test_memory_defaults_remain_single_process_and_do_not_render_valkey() -> Non
     "args",
     (
         ("--set", "env.RELAY_WORKERS=2"),
+        ("--set", "env.RELAY_WORKERS.name=SAFE", "--set", "env.RELAY_WORKERS.value=2"),
         ("--set", "extraEnv[0].name=RELAY_WORKERS", "--set-string", "extraEnv[0].value=2"),
     ),
 )
@@ -59,6 +60,7 @@ def test_direct_valkey_renders_runtime_contract_and_secret_refs() -> None:
         "--set", "stateBackend.valkey.auth.existingSecret=relay-valkey-auth",
         "--set", "podDisruptionBudget.enabled=true",
         "--set", "podAntiAffinity.enabled=true",
+        "--set", "podAntiAffinity.type=required",
         "--set", "topologySpreadConstraints[0].maxSkew=1",
         "--set", "topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname",
         "--set", "topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule",
@@ -117,6 +119,7 @@ def test_custom_affinity_preserves_generated_pod_anti_affinity() -> None:
         "--set", "stateBackend.valkey.direct.host=valkey",
         "--set", "podDisruptionBudget.enabled=true",
         "--set", "podAntiAffinity.enabled=true",
+        "--set", "podAntiAffinity.type=required",
         "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os",
         "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In",
         "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=linux",
@@ -124,6 +127,30 @@ def test_custom_affinity_preserves_generated_pod_anti_affinity() -> None:
     affinity = _kind(docs, "Deployment")[0]["spec"]["template"]["spec"]["affinity"]
     assert affinity["nodeAffinity"]
     assert affinity["podAntiAffinity"]
+
+
+@pytest.mark.parametrize(
+    "placement",
+    (
+        ("--set", "podAntiAffinity.enabled=true"),
+        (
+            "--set", "topologySpreadConstraints[0].maxSkew=1",
+            "--set", "topologySpreadConstraints[0].topologyKey=kubernetes.io/hostname",
+            "--set", "topologySpreadConstraints[0].whenUnsatisfiable=ScheduleAnyway",
+        ),
+    ),
+)
+def test_multiple_replicas_reject_soft_placement(placement: tuple[str, ...]) -> None:
+    result = _helm_template(
+        *VALKEY_BASE,
+        "--set", "stateBackend.valkey.direct.host=valkey",
+        "--set", "replicaCount=2",
+        "--set", "podDisruptionBudget.enabled=true",
+        *placement,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "required podAntiAffinity on kubernetes.io/hostname" in result.stderr
 
 
 def test_mutual_tls_renders_client_certificate_paths() -> None:

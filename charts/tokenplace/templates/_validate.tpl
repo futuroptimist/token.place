@@ -10,14 +10,14 @@
 {{- end -}}
 {{- range $source := list .Values.env .Values.extraEnv -}}
 {{- range $key, $entry := $source -}}
-{{- $name := $key -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = get $entry "name" -}}{{- end -}}
-{{- if eq (printf "%v" $name) "RELAY_WORKERS" -}}
+{{- $name := "" -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = printf "%v" (get $entry "name") -}}{{- end -}}
+{{- if or (eq (printf "%v" $key) "RELAY_WORKERS") (eq $name "RELAY_WORKERS") -}}
 {{- fail "environment override RELAY_WORKERS is chart-managed" -}}
 {{- end -}}
 {{- end -}}{{- end -}}
 {{- if eq $backend "valkey" -}}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.podDisruptionBudget.enabled) -}}{{ fail "multiple replicas require podDisruptionBudget.enabled=true" }}{{- end -}}
-{{- if and (gt (int .Values.replicaCount) 1) (not .Values.podAntiAffinity.enabled) (not .Values.topologySpreadConstraints) -}}{{ fail "multiple replicas require podAntiAffinity or topologySpreadConstraints" }}{{- end -}}
+{{- if and (gt (int .Values.replicaCount) 1) (not (and .Values.podAntiAffinity.enabled (eq .Values.podAntiAffinity.type "required") (eq .Values.podAntiAffinity.topologyKey "kubernetes.io/hostname"))) -}}{{ fail "multiple replicas require required podAntiAffinity on kubernetes.io/hostname" }}{{- end -}}
 {{- if ne .Values.strategy.type "RollingUpdate" -}}{{ fail "stateBackend.type=valkey requires strategy.type=RollingUpdate" }}{{- end -}}
 {{- if not .Values.preStop.enabled -}}{{ fail "stateBackend.type=valkey requires preStop.enabled=true" }}{{- end -}}
 {{- if lt (int .Values.terminationGracePeriodSeconds) (int .Values.preStop.sleepSeconds) -}}{{ fail "terminationGracePeriodSeconds must be at least preStop.sleepSeconds" }}{{- end -}}

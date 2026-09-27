@@ -147,11 +147,14 @@ spec:
           {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" (dict "name" "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" "valueFrom" (dict "secretKeyRef" (dict "name" $v.acknowledgementKey.existingSecret "key" $v.acknowledgementKey.key))) }}
           {{- $_ := set $mergedEnv "TOKENPLACE_RATE_LIMIT_STORAGE_URI" (dict "name" "TOKENPLACE_RATE_LIMIT_STORAGE_URI" "valueFrom" (dict "secretKeyRef" (dict "name" .Values.sharedRateLimit.existingSecret "key" .Values.sharedRateLimit.storageUriKey))) }}
           {{- if $v.auth.existingSecret }}
-          {{- range $suffix, $key := dict "USERNAME" $v.auth.usernameKey "PASSWORD" $v.auth.passwordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key "optional" true))) }}{{- end }}
-          {{- if eq $v.discovery "sentinel" }}{{- range $suffix, $key := dict "SENTINEL_USERNAME" $v.auth.sentinelUsernameKey "SENTINEL_PASSWORD" $v.auth.sentinelPasswordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key "optional" true))) }}{{- end }}{{- end }}
+          {{- range $suffix, $key := dict "USERNAME" $v.auth.usernameKey "PASSWORD" $v.auth.passwordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key))) }}{{- end }}
+          {{- if eq $v.discovery "sentinel" }}{{- range $suffix, $key := dict "SENTINEL_USERNAME" $v.auth.sentinelUsernameKey "SENTINEL_PASSWORD" $v.auth.sentinelPasswordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key))) }}{{- end }}{{- end }}
           {{- end }}
           {{- if $v.tls.enabled }}
-          {{- range $suffix, $key := dict "TLS_CA_CERT" $v.tls.caKey "TLS_CLIENT_CERT" $v.tls.clientCertKey "TLS_CLIENT_KEY" $v.tls.clientKeyKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "/var/run/tokenplace-valkey-tls/%s" $key)) }}{{- end }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT" (dict "name" "TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT" "value" (printf "/var/run/tokenplace-valkey-tls/%s" $v.tls.caKey)) }}
+          {{- if $v.tls.clientCertKey }}
+          {{- range $suffix, $key := dict "TLS_CLIENT_CERT" $v.tls.clientCertKey "TLS_CLIENT_KEY" $v.tls.clientKeyKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "/var/run/tokenplace-valkey-tls/%s" $key)) }}{{- end }}
+          {{- end }}
           {{- end }}
           {{- end }}
           {{- if .Values.metrics.enabled }}
@@ -226,27 +229,20 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.affinity }}
+      {{- $affinity := deepCopy .Values.affinity }}
+      {{- if .Values.podAntiAffinity.enabled }}
+      {{- $term := dict "labelSelector" (dict "matchLabels" (include "tokenplace.selectorLabels" . | fromYaml)) "topologyKey" .Values.podAntiAffinity.topologyKey }}
+      {{- $podAntiAffinity := dict }}
+      {{- if eq .Values.podAntiAffinity.type "required" }}
+      {{- $_ := set $podAntiAffinity "requiredDuringSchedulingIgnoredDuringExecution" (list $term) }}
+      {{- else }}
+      {{- $_ := set $podAntiAffinity "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term)) }}
+      {{- end }}
+      {{- $_ := set $affinity "podAntiAffinity" $podAntiAffinity }}
+      {{- end }}
+      {{- if $affinity }}
       affinity:
-        {{- toYaml .Values.affinity | nindent 8 }}
-      {{- else if .Values.podAntiAffinity.enabled }}
-      affinity:
-        podAntiAffinity:
-          {{- if eq .Values.podAntiAffinity.type "required" }}
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  {{- include "tokenplace.selectorLabels" . | nindent 18 }}
-              topologyKey: {{ .Values.podAntiAffinity.topologyKey | quote }}
-          {{- else }}
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    {{- include "tokenplace.selectorLabels" . | nindent 20 }}
-                topologyKey: {{ .Values.podAntiAffinity.topologyKey | quote }}
-          {{- end }}
+        {{- toYaml $affinity | nindent 8 }}
       {{- end }}
       {{- with .Values.topologySpreadConstraints }}
       topologySpreadConstraints:

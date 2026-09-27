@@ -42,8 +42,9 @@ stateBackend:
       enabled: false
       existingSecret: ""
       caKey: ca.crt
-      clientCertKey: tls.crt
-      clientKeyKey: tls.key
+      # Set both client keys only when the server requires mutual TLS.
+      clientCertKey: ""
+      clientKeyKey: ""
     timeouts:
       connectSeconds: 1
       socketSeconds: 2

@@ -70,6 +70,7 @@ def test_direct_valkey_renders_runtime_contract_and_secret_refs() -> None:
     assert deployment["spec"]["template"]["spec"]["topologySpreadConstraints"]
     assert deployment["spec"]["template"]["spec"]["affinity"]["podAntiAffinity"]
     assert "value" not in env["TOKENPLACE_RELAY_VALKEY_PASSWORD"]
+    assert "optional" not in env["TOKENPLACE_RELAY_VALKEY_PASSWORD"]["valueFrom"]["secretKeyRef"]
     assert not any(doc.get("kind", "").lower().startswith(("redis", "valkey")) for doc in docs)
 
 
@@ -90,9 +91,39 @@ def test_sentinel_tls_renders_endpoints_and_mounted_secret_paths() -> None:
     assert env["TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE"]["value"] == "relay-primary"
     assert env["TOKENPLACE_RELAY_VALKEY_TLS"]["value"] == "true"
     assert env["TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT"]["value"] == "/var/run/tokenplace-valkey-tls/ca.crt"
+    assert "TOKENPLACE_RELAY_VALKEY_TLS_CLIENT_CERT" not in env
+    assert "TOKENPLACE_RELAY_VALKEY_TLS_CLIENT_KEY" not in env
     assert {volume["name"]: volume for volume in pod["volumes"]}["valkey-tls"]["secret"] == {
         "secretName": "relay-valkey-tls"
     }
+
+
+def test_custom_affinity_preserves_generated_pod_anti_affinity() -> None:
+    docs = _valkey_render(
+        "--set", "replicaCount=2",
+        "--set", "stateBackend.valkey.direct.host=valkey",
+        "--set", "podDisruptionBudget.enabled=true",
+        "--set", "podAntiAffinity.enabled=true",
+        "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os",
+        "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In",
+        "--set", "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=linux",
+    )
+    affinity = _kind(docs, "Deployment")[0]["spec"]["template"]["spec"]["affinity"]
+    assert affinity["nodeAffinity"]
+    assert affinity["podAntiAffinity"]
+
+
+def test_mutual_tls_renders_client_certificate_paths() -> None:
+    docs = _valkey_render(
+        "--set", "stateBackend.valkey.direct.host=valkey",
+        "--set", "stateBackend.valkey.tls.enabled=true",
+        "--set", "stateBackend.valkey.tls.existingSecret=relay-valkey-tls",
+        "--set", "stateBackend.valkey.tls.clientCertKey=tls.crt",
+        "--set", "stateBackend.valkey.tls.clientKeyKey=tls.key",
+    )
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    assert env["TOKENPLACE_RELAY_VALKEY_TLS_CLIENT_CERT"]["value"].endswith("/tls.crt")
+    assert env["TOKENPLACE_RELAY_VALKEY_TLS_CLIENT_KEY"]["value"].endswith("/tls.key")
 
 
 @pytest.mark.parametrize(
@@ -105,6 +136,10 @@ def test_sentinel_tls_renders_endpoints_and_mounted_secret_paths() -> None:
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "sharedRateLimit.existingSecret="), "sharedRateLimit.existingSecret is required"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "env.TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES=1"), "chart-managed"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "relay.workers=2", "--set", "env.RELAY_WORKERS=1"), "chart-managed"),
+        (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.environment=Staging"), "/stateBackend/valkey/environment"),
+        (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.timeouts.connectSeconds=31"), "/stateBackend/valkey/timeouts/connectSeconds"),
+        (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.retryAttempts=6"), "/stateBackend/valkey/retryAttempts"),
+        (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.tls.clientCertKey=tls.crt"), "clientCertKey and clientKeyKey"),
     ),
 )
 def test_invalid_deployment_contract_fails_render(args: tuple[str, ...], message: str) -> None:

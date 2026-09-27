@@ -280,11 +280,13 @@
             },
             "environment": {
               "type": "string",
-              "maxLength": 63
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9][a-z0-9._-]{0,127}$"
             },
             "cluster": {
               "type": "string",
-              "maxLength": 63
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9][a-z0-9._-]{0,127}$"
             },
             "schema": {
               "type": "object",
@@ -425,12 +427,10 @@
                 },
                 "clientCertKey": {
                   "type": "string",
-                  "minLength": 1,
                   "maxLength": 253
                 },
                 "clientKeyKey": {
                   "type": "string",
-                  "minLength": 1,
                   "maxLength": 253
                 }
               }
@@ -448,29 +448,29 @@
                 "connectSeconds": {
                   "type": "number",
                   "exclusiveMinimum": 0,
-                  "maximum": 60
+                  "maximum": 30
                 },
                 "socketSeconds": {
                   "type": "number",
                   "exclusiveMinimum": 0,
-                  "maximum": 60
+                  "maximum": 30
                 },
                 "commandSeconds": {
                   "type": "number",
                   "exclusiveMinimum": 0,
-                  "maximum": 60
+                  "maximum": 30
                 },
                 "retrySeconds": {
                   "type": "number",
                   "exclusiveMinimum": 0,
-                  "maximum": 60
+                  "maximum": 30
                 }
               }
             },
             "retryAttempts": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 10
+              "maximum": 5
             }
           }
         }

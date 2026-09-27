@@ -25,6 +25,7 @@
 {{- if not .Values.stateBackend.valkey.sentinel.endpoints -}}{{ fail "stateBackend.valkey.sentinel.endpoints is required for Sentinel discovery" }}{{- end -}}
 {{- else -}}{{ fail "stateBackend.valkey.discovery must be direct or sentinel" }}{{- end -}}
 {{- if and .Values.stateBackend.valkey.tls.enabled (not .Values.stateBackend.valkey.tls.existingSecret) -}}{{ fail "stateBackend.valkey.tls.existingSecret is required when TLS is enabled" }}{{- end -}}
+{{- if ne (not (empty .Values.stateBackend.valkey.tls.clientCertKey)) (not (empty .Values.stateBackend.valkey.tls.clientKeyKey)) -}}{{ fail "stateBackend.valkey.tls.clientCertKey and clientKeyKey must either both be set or both be empty" }}{{- end -}}
 {{- range $source := list .Values.env .Values.extraEnv -}}
 {{- range $key, $entry := $source -}}
 {{- $name := $key -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = get $entry "name" -}}{{- end -}}

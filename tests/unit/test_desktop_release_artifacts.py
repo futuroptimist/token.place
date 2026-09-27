@@ -6812,7 +6812,54 @@ def test_windows_installer_identity_terminate_processes_runs_stop_and_verify(mon
 
     assert len(calls) == 2
     assert 'Stop-Process -Force' in calls[0][-1]
+    assert 'ProcessName' in calls[1][-1]
     assert 'exit 9' in calls[1][-1]
+
+
+def test_windows_installer_identity_terminate_processes_accepts_timed_out_stop_after_verified_absence(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+        return subprocess.CompletedProcess(cmd, 0, '')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    guard._terminate_processes()
+
+    assert len(calls) == 2
+    assert 'Stop-Process -Force' in calls[0][-1]
+    assert 'ProcessName' in calls[1][-1]
+
+
+def test_windows_installer_identity_terminate_processes_rejects_remaining_process_after_timed_out_stop(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+        return subprocess.CompletedProcess(cmd, 9, 'token.place pid=1234')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=r'Stop-Process timed out after 30 seconds.*token\.place pid=1234',
+    ):
+        guard._terminate_processes()
+
+    assert len(calls) == 2
 
 
 def test_windows_installer_identity_canonical_path_falls_back_on_resolve_error(monkeypatch, tmp_path) -> None:

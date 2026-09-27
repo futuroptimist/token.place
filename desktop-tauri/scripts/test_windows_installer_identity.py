@@ -335,10 +335,36 @@ def _terminate_processes() -> None:
     if sys.platform != "win32":
         return
     script = ";".join(f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force" for name in APP_PROCESS_NAMES)
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
+    stop_timed_out = False
+    try:
+        _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        # Stop-Process can outlive the processes it stopped. Treat its timeout as
+        # inconclusive and let the independent inventory below decide whether it
+        # is safe to proceed.
+        stop_timed_out = True
     time.sleep(0.5)
-    verify = ";".join(f"if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ exit 9 }}" for name in APP_PROCESS_NAMES)
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify], timeout=30)
+    verify = ";".join(
+        f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
+        "ForEach-Object { Write-Output \"$($_.ProcessName) pid=$($_.Id)\"; $global:remaining = $true }"
+        for name in APP_PROCESS_NAMES
+    ) + ";if ($global:remaining) { exit 9 }"
+    try:
+        result = _run(
+            [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify],
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stop_diagnostic = " after Stop-Process also timed out after 30 seconds" if stop_timed_out else ""
+        raise InstallerIdentityError(
+            f"process-absence verification timed out after 30 seconds{stop_diagnostic}; "
+            f"could not verify absence of: {', '.join(APP_PROCESS_NAMES)}"
+        ) from exc
+    if result.returncode != 0:
+        stop_diagnostic = " (Stop-Process timed out after 30 seconds)" if stop_timed_out else ""
+        remaining = result.stdout.strip() or ", ".join(APP_PROCESS_NAMES)
+        raise InstallerIdentityError(f"process cleanup failed{stop_diagnostic}; remaining processes: {remaining}")
 
 
 def _canonical_path(path: Path) -> str:

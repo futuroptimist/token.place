@@ -166,6 +166,74 @@ def test_mutual_tls_renders_client_certificate_paths() -> None:
     assert env["TOKENPLACE_RELAY_VALKEY_TLS_CLIENT_KEY"]["value"].endswith("/tls.key")
 
 
+def test_valkey_namespace_accepts_runtime_maximum_length() -> None:
+    coordinate = "a" * 128
+    docs = _valkey_render(
+        "--set", f"stateBackend.valkey.environment={coordinate}",
+        "--set", f"stateBackend.valkey.cluster={coordinate}",
+        "--set", "stateBackend.valkey.direct.host=valkey.internal",
+    )
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    assert env["TOKENPLACE_RELAY_VALKEY_ENVIRONMENT"]["value"] == coordinate
+    assert env["TOKENPLACE_RELAY_VALKEY_CLUSTER"]["value"] == coordinate
+
+
+@pytest.mark.parametrize(
+    "args, path",
+    (
+        (
+            (
+                "--set",
+                f"stateBackend.valkey.environment={'a' * 129}",
+                "--set",
+                "stateBackend.valkey.direct.host=valkey",
+            ),
+            "/stateBackend/valkey/environment",
+        ),
+        (
+            ("--set", "stateBackend.valkey.direct.host=valkey primary"),
+            "/stateBackend/valkey/direct/host",
+        ),
+        (
+            ("--set", "stateBackend.valkey.direct.host=valkey/internal"),
+            "/stateBackend/valkey/direct/host",
+        ),
+        (
+            ("--set", "stateBackend.valkey.direct.host=user@valkey"),
+            "/stateBackend/valkey/direct/host",
+        ),
+        (
+            (
+                "--set",
+                "stateBackend.valkey.discovery=sentinel",
+                "--set-json",
+                'stateBackend.valkey.sentinel.endpoints=[["sentinel/a",26379]]',
+                "--set",
+                "stateBackend.valkey.sentinel.service=relay-primary",
+            ),
+            "/stateBackend/valkey/sentinel/endpoints/0/0",
+        ),
+        (
+            (
+                "--set",
+                "stateBackend.valkey.discovery=sentinel",
+                "--set-json",
+                'stateBackend.valkey.sentinel.endpoints=[["sentinel-a",26379]]',
+                "--set",
+                "stateBackend.valkey.sentinel.service=Relay Primary",
+            ),
+            "/stateBackend/valkey/sentinel/service",
+        ),
+    ),
+)
+def test_valkey_runtime_address_rules_fail_schema(
+    args: tuple[str, ...], path: str
+) -> None:
+    result = _helm_template(*VALKEY_BASE, *args, check=False)
+    assert result.returncode != 0
+    assert path in result.stderr
+
+
 @pytest.mark.parametrize(
     "args, message",
     (

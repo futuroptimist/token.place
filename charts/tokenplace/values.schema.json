@@ -234,7 +234,8 @@
               "properties": {
                 "host": {
                   "type": "string",
-                  "maxLength": 253
+                  "maxLength": 253,
+                  "pattern": "^$|^[^\\s/@]+$"
                 },
                 "port": {
                   "type": "integer",
@@ -262,7 +263,7 @@
                       {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 253
+                        "pattern": "^[^\\s/@]+$"
                       },
                       {
                         "type": "integer",
@@ -274,18 +275,19 @@
                 },
                 "service": {
                   "type": "string",
-                  "maxLength": 253
+                  "maxLength": 128,
+                  "pattern": "^$|^[a-z0-9][a-z0-9._-]{0,127}$"
                 }
               }
             },
             "environment": {
               "type": "string",
-              "maxLength": 63,
+              "maxLength": 128,
               "pattern": "^$|^[a-z0-9][a-z0-9._-]{0,127}$"
             },
             "cluster": {
               "type": "string",
-              "maxLength": 63,
+              "maxLength": 128,
               "pattern": "^$|^[a-z0-9][a-z0-9._-]{0,127}$"
             },
             "schema": {

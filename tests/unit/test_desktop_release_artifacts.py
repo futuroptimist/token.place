@@ -6862,6 +6862,42 @@ def test_windows_installer_identity_terminate_processes_rejects_remaining_proces
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(
+    ('stop_times_out', 'diagnostic'),
+    [
+        (False, 'verification timed out after 30 seconds;'),
+        (True, 'verification timed out after 30 seconds after Stop-Process also timed out after 30 seconds;'),
+    ],
+)
+def test_windows_installer_identity_terminate_processes_rejects_unverified_absence(
+    monkeypatch,
+    stop_times_out,
+    diagnostic,
+) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1 and not stop_times_out:
+            return subprocess.CompletedProcess(cmd, 0, '')
+        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=rf'{diagnostic}.*token\.place, tokenplace, token-place',
+    ) as exc_info:
+        guard._terminate_processes()
+
+    assert len(calls) == 2
+    assert isinstance(exc_info.value.__cause__, subprocess.TimeoutExpired)
+
+
 def test_windows_installer_identity_canonical_path_falls_back_on_resolve_error(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     class BrokenPath(type(Path())):

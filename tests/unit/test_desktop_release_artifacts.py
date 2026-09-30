@@ -6814,6 +6814,7 @@ def test_windows_installer_identity_terminate_processes_runs_stop_and_verify(mon
     assert 'Stop-Process -Force' in calls[0][-1]
     assert 'ProcessName' in calls[1][-1]
     assert 'exit 9' in calls[1][-1]
+    assert 'exit 0' in calls[1][-1]
 
 
 def test_windows_installer_identity_terminate_processes_accepts_timed_out_stop_after_verified_absence(monkeypatch) -> None:
@@ -6836,6 +6837,44 @@ def test_windows_installer_identity_terminate_processes_accepts_timed_out_stop_a
     assert len(calls) == 2
     assert 'Stop-Process -Force' in calls[0][-1]
     assert 'ProcessName' in calls[1][-1]
+
+
+def test_windows_installer_identity_terminate_processes_accepts_no_matching_process(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 1, ''),
+            subprocess.CompletedProcess([], 0, '', ''),
+        ]
+    )
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: next(results))
+
+    guard._terminate_processes()
+
+
+def test_windows_installer_identity_terminate_processes_reports_empty_verification_error(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 0, ''),
+            subprocess.CompletedProcess([], 1, '', ''),
+        ]
+    )
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: next(results))
+
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=r'process-absence verification failed with exit status 1; no command output',
+    ):
+        guard._terminate_processes()
 
 
 def test_windows_installer_identity_terminate_processes_rejects_remaining_process_after_timed_out_stop(monkeypatch) -> None:

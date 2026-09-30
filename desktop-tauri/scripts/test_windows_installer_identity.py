@@ -344,16 +344,17 @@ def _terminate_processes() -> None:
         # is safe to proceed.
         stop_timed_out = True
     time.sleep(0.5)
-    verify = ";".join(
+    verify = "$global:remaining = $false;" + ";".join(
         f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
         "ForEach-Object { Write-Output \"$($_.ProcessName) pid=$($_.Id)\"; $global:remaining = $true }"
         for name in APP_PROCESS_NAMES
-    ) + ";if ($global:remaining) { exit 9 }"
+    ) + ";if ($global:remaining) { exit 9 } else { exit 0 }"
     try:
         result = _run(
             [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify],
             timeout=30,
             check=False,
+            separate_stderr=True,
         )
     except subprocess.TimeoutExpired as exc:
         stop_diagnostic = " after Stop-Process also timed out after 30 seconds" if stop_timed_out else ""
@@ -361,10 +362,16 @@ def _terminate_processes() -> None:
             f"process-absence verification timed out after 30 seconds{stop_diagnostic}; "
             f"could not verify absence of: {', '.join(APP_PROCESS_NAMES)}"
         ) from exc
-    if result.returncode != 0:
+    observed = result.stdout.strip()
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr or "") if part.strip())
+    if result.returncode == 9 and observed:
         stop_diagnostic = " (Stop-Process timed out after 30 seconds)" if stop_timed_out else ""
-        remaining = result.stdout.strip() or ", ".join(APP_PROCESS_NAMES)
-        raise InstallerIdentityError(f"process cleanup failed{stop_diagnostic}; remaining processes: {remaining}")
+        raise InstallerIdentityError(f"process cleanup failed{stop_diagnostic}; remaining processes: {observed}")
+    if result.returncode != 0:
+        diagnostic = f"; output: {output}" if output else "; no command output"
+        raise InstallerIdentityError(
+            f"process-absence verification failed with exit status {result.returncode}{diagnostic}"
+        )
 
 
 def _canonical_path(path: Path) -> str:

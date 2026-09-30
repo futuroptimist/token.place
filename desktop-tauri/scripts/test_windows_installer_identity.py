@@ -344,11 +344,19 @@ def _terminate_processes() -> None:
         # is safe to proceed.
         stop_timed_out = True
     time.sleep(0.5)
-    verify = "$global:remaining = $false;" + ";".join(
-        f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
-        "ForEach-Object { Write-Output \"$($_.ProcessName) pid=$($_.Id)\"; $global:remaining = $true }"
-        for name in APP_PROCESS_NAMES
-    ) + ";if ($global:remaining) { exit 9 } else { exit 0 }"
+    # Enumerate once with errors made terminating, then filter. Name-based lookup
+    # reports an error for expected absence; suppressing it would also hide an
+    # actual inventory failure and let the explicit success exit fail open.
+    names = ",".join(f"'{name}'" for name in APP_PROCESS_NAMES)
+    verify = (
+        "$ErrorActionPreference = 'Stop';try {"
+        f"$names = @({names});"
+        "$remaining = @(Get-Process -ErrorAction Stop | "
+        "Where-Object { $names -contains $_.ProcessName });"
+        "$remaining | ForEach-Object { Write-Output \"$($_.ProcessName) pid=$($_.Id)\" };"
+        "if ($remaining.Count) { exit 9 } else { exit 0 }"
+        "} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
+    )
     try:
         result = _run(
             [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify],

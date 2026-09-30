@@ -6856,6 +6856,64 @@ def test_windows_installer_identity_terminate_processes_accepts_no_matching_proc
     guard._terminate_processes()
 
 
+@pytest.mark.parametrize(
+    ('inventory', 'expected_status', 'expected_output'),
+    [
+        ('$null', 0, ''),
+        ("[pscustomobject]@{ ProcessName = 'unrelated'; Id = 1234 }", 0, ''),
+        ("[pscustomobject]@{ ProcessName = 'token.place'; Id = 1234 }", 9, 'token.place pid=1234'),
+        ("Write-Error 'inventory unavailable'", 1, 'inventory unavailable'),
+        ("throw 'inventory unavailable'", 1, 'inventory unavailable'),
+        (
+            "[pscustomobject]@{ ProcessName = 'token.place'; Id = 1234 }; "
+            "Write-Error 'inventory unavailable'",
+            1,
+            'inventory unavailable',
+        ),
+    ],
+)
+def test_windows_installer_identity_process_inventory_script_fails_closed(
+    monkeypatch,
+    inventory,
+    expected_status,
+    expected_output,
+) -> None:
+    powershell = shutil.which('powershell') or shutil.which('pwsh')
+    if powershell is None:
+        pytest.skip('PowerShell is required to exercise process inventory command semantics')
+    guard = _load_windows_installer_identity()
+    calls = []
+    with monkeypatch.context() as patch:
+        patch.setattr(guard.sys, 'platform', 'win32')
+        patch.setattr(guard.time, 'sleep', lambda seconds: None)
+        patch.setattr(
+            guard,
+            '_run',
+            lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+        )
+        guard._terminate_processes()
+
+    # Exercise the actual generated command, but never inspect or stop live processes.
+    fake_inventory = (
+        'function Get-Process { [CmdletBinding()] param([string]$Name) '
+        f'$processes = @(& {{ {inventory} }});'
+        '$processes | Where-Object { $null -ne $_ -and (!$Name -or $_.ProcessName -eq $Name) }; };'
+    )
+    result = subprocess.run(
+        [powershell, '-NoProfile', '-NonInteractive', '-Command', fake_inventory + calls[1][-1]],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
+    if expected_status == 1:
+        assert expected_output in result.stderr
+    else:
+        assert result.stdout.strip() == expected_output
+        assert result.stderr == ''
+
+
 def test_windows_installer_identity_terminate_processes_reports_empty_verification_error(monkeypatch) -> None:
     guard = _load_windows_installer_identity()
 

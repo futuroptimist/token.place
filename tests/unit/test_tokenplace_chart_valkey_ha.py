@@ -113,6 +113,32 @@ def test_sentinel_tls_renders_endpoints_and_mounted_secret_paths() -> None:
     }
 
 
+def test_sentinel_endpoint_host_accepts_runtime_maximum_length() -> None:
+    host = "a" * 253
+    docs = _valkey_render(
+        "--set", "stateBackend.valkey.discovery=sentinel",
+        "--set-json", f'stateBackend.valkey.sentinel.endpoints=[["{host}",26379]]',
+        "--set", "stateBackend.valkey.sentinel.service=relay-primary",
+    )
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    assert env["TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON"]["value"] == (
+        f'[["{host}",26379]]'
+    )
+
+
+def test_sentinel_endpoint_host_rejects_over_runtime_maximum_length() -> None:
+    host = "a" * 254
+    result = _helm_template(
+        *VALKEY_BASE,
+        "--set", "stateBackend.valkey.discovery=sentinel",
+        "--set-json", f'stateBackend.valkey.sentinel.endpoints=[["{host}",26379]]',
+        "--set", "stateBackend.valkey.sentinel.service=relay-primary",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "/stateBackend/valkey/sentinel/endpoints/0/0" in result.stderr
+
+
 def test_custom_affinity_preserves_generated_pod_anti_affinity() -> None:
     docs = _valkey_render(
         "--set", "replicaCount=2",
@@ -243,6 +269,7 @@ def test_valkey_runtime_address_rules_fail_schema(
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.acknowledgementKey.existingSecret="), "acknowledgementKey.existingSecret is required"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "sharedRateLimit.existingSecret="), "sharedRateLimit.existingSecret is required"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "env.TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES=1"), "chart-managed"),
+        (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "env.TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES.name=SAFE", "--set-string", "env.TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES.value=1"), "chart-managed"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "relay.workers=2", "--set", "env.RELAY_WORKERS=1"), "chart-managed"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.environment=Staging"), "/stateBackend/valkey/environment"),
         (VALKEY_BASE + ("--set", "stateBackend.valkey.direct.host=valkey", "--set", "stateBackend.valkey.timeouts.connectSeconds=31"), "/stateBackend/valkey/timeouts/connectSeconds"),

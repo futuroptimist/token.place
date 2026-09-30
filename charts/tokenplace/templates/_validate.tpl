@@ -35,9 +35,12 @@
 {{- if ne (not (empty .Values.stateBackend.valkey.tls.clientCertKey)) (not (empty .Values.stateBackend.valkey.tls.clientKeyKey)) -}}{{ fail "stateBackend.valkey.tls.clientCertKey and clientKeyKey must either both be set or both be empty" }}{{- end -}}
 {{- range $source := list .Values.env .Values.extraEnv -}}
 {{- range $key, $entry := $source -}}
-{{- $name := $key -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $name = get $entry "name" -}}{{- end -}}
-{{- if or (eq (printf "%v" $name) "TOKENPLACE_RELAY_STATE_BACKEND") (hasPrefix "TOKENPLACE_RELAY_VALKEY_" (printf "%v" $name)) (eq (printf "%v" $name) "TOKENPLACE_RATE_LIMIT_STORAGE_URI") (eq (printf "%v" $name) "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES") -}}
+{{- $keyName := printf "%v" $key -}}
+{{- $nestedName := "" -}}{{- if and (kindIs "map" $entry) (hasKey $entry "name") -}}{{- $nestedName = printf "%v" (get $entry "name") -}}{{- end -}}
+{{- range $name := list $keyName $nestedName -}}
+{{- if and $name (or (eq $name "TOKENPLACE_RELAY_STATE_BACKEND") (hasPrefix "TOKENPLACE_RELAY_VALKEY_" $name) (eq $name "TOKENPLACE_RATE_LIMIT_STORAGE_URI") (eq $name "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES")) -}}
 {{- fail (printf "environment override %s is chart-managed when Valkey is selected" $name) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}{{- end -}}
 {{- end -}}

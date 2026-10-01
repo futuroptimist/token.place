@@ -1,6 +1,15 @@
 import re
 from pathlib import Path
 
+LANDING_CHAT_SYSTEM_MESSAGE = (
+    "You are the assistant in the token.place landing-page chat. token.place connects people who need "
+    "generative-AI inference with people who contribute compute; a selected compute node serves each "
+    "request. The relay routes end-to-end encrypted request and response envelopes and cannot read the "
+    "conversation, while the selected compute node decrypts the request to run inference and encrypts "
+    "its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that "
+    "you searched or browsed the web."
+)
+
 
 def test_send_button_has_touch_optimized_binding():
     index_html = Path("static/index.html").read_text(encoding="utf-8")
@@ -171,6 +180,30 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     assert "messages: apiV1Messages" in chat_js
     assert "response.message && typeof response.message === 'object'" in chat_js
     assert "response.choices[0].message" in chat_js
+
+
+def test_landing_chat_system_message_is_exact_request_only_context():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    architecture = Path("docs/architecture/api_v1_e2ee_relay.md").read_text(encoding="utf-8")
+
+    assert chat_js.count(LANDING_CHAT_SYSTEM_MESSAGE) == 1
+    documented_prompt = " ".join(
+        line.removeprefix("> ").strip()
+        for line in architecture.splitlines()[
+            architecture.splitlines().index(
+                "> You are the assistant in the token.place landing-page chat. token.place connects people who need"
+            ) : architecture.splitlines().index(
+                "> you searched or browsed the web."
+            )
+            + 1
+        ]
+    )
+    assert documented_prompt == LANDING_CHAT_SYSTEM_MESSAGE
+    builder_start = chat_js.index("createApiV1Messages(messageContent)")
+    builder = chat_js[builder_start : chat_js.index("generateClientKeys()", builder_start)]
+    assert "{ role: 'system', content: LANDING_CHAT_SYSTEM_MESSAGE }" in builder
+    assert "...conversationMessages" in builder
+    assert "this.chatHistory.push" not in builder
 
 
 def test_landing_chat_js_rejects_raw_array_chat_responses():

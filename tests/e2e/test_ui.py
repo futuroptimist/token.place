@@ -8,8 +8,25 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from encrypt import decrypt
 from playwright.sync_api import Page, expect
 import time
+
+
+LANDING_PAGE_SYSTEM_MESSAGE = (
+    "You are the assistant in the token.place landing-page chat. token.place connects people who "
+    "need generative-AI inference with people who contribute compute; a selected compute node "
+    "serves each request. The relay routes end-to-end encrypted request and response envelopes and "
+    "cannot read the conversation, while the selected compute node decrypts the request to run "
+    "inference and encrypts its response for the requesting browser. If you are uncertain, say so. "
+    "Do not claim or imply that you searched or browsed the web."
+)
+
+
+def landing_system_message():
+    return {"role": "system", "content": LANDING_PAGE_SYSTEM_MESSAGE}
 
 
 
@@ -1705,7 +1722,10 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     request_envelope = json.loads(state["relay_requests"][0]["ciphertext"])
     assert request_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
     assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
-    assert request_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert request_envelope["api_v1_request"]["messages"] == [
+        landing_system_message(),
+        {"role": "user", "content": "hello"},
+    ]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -1740,8 +1760,12 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     assert len(state["relay_requests"]) == 2
     assert {payload["server_public_key"] for payload in state["relay_requests"]} == {SERVER_PUBLIC_KEY_B64}
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
-    assert envelopes[0]["api_v1_request"]["messages"] == [{"role": "user", "content": "first turn"}]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        landing_system_message(),
+        {"role": "user", "content": "first turn"},
+    ]
     assert envelopes[1]["api_v1_request"]["messages"] == [
+        landing_system_message(),
         {"role": "user", "content": "first turn"},
         {"role": "assistant", "content": "Sticky relay response."},
         {"role": "user", "content": "second turn"},
@@ -1749,6 +1773,140 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     assert all(envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct" for envelope in envelopes)
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
+
+
+def test_landing_chat_uses_api_v1_only_non_streaming_system_message_fallback_estimation_and_auto_retry(
+    page: Page, base_url: str, setup_servers
+):
+    """The request-only instruction participates in estimation and survives the direct retry path."""
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {"error": {"code": "compute_node_context_window_exceeded"}},
+            {"error": {"code": "compute_node_context_window_exceeded"}},
+            {"message": {"role": "assistant", "content": "Retried with more context."}},
+        ],
+        next_server_keys=[SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    estimate = page.evaluate(
+        """() => {
+            const vm = document.querySelector('#app').__vue__;
+            const content = 'x'.repeat(24200);
+            const conversationOnly = [{ role: 'user', content }];
+            const complete = vm.createApiV1Messages(content);
+            return {
+                withoutSystem: vm.resolveContextTierForRequest(conversationOnly, 'auto'),
+                withSystem: vm.resolveContextTierForRequest(complete, 'auto'),
+                complete
+            };
+        }"""
+    )
+    assert estimate["withoutSystem"]["requestedContextTier"] == "8k-fast"
+    assert estimate["withSystem"]["requestedContextTier"] == "64k-full"
+    assert estimate["withSystem"]["estimate"]["totalCharacters"] == (
+        len(LANDING_PAGE_SYSTEM_MESSAGE) + 24200
+    )
+    assert estimate["complete"][0] == landing_system_message()
+
+    # Exercise sendMessageApiOnce's own builder fallback rather than supplying apiV1Messages.
+    direct_result = page.evaluate(
+        "document.querySelector('#app').__vue__.sendMessageApiOnce('direct fallback')"
+    )
+    assert direct_result["error"]["code"] == "compute_node_context_window_exceeded"
+    direct_messages = json.loads(state["relay_requests"][0]["ciphertext"])["api_v1_request"]["messages"]
+    assert direct_messages == [landing_system_message(), {"role": "user", "content": "direct fallback"}]
+
+    textarea = page.locator("textarea").first
+    textarea.fill("automatic retry")
+    wait_for_landing_send_enabled(page).click()
+    page.locator(".assistant-message").last.wait_for(state="visible")
+    retry_messages = [
+        json.loads(payload["ciphertext"])["api_v1_request"]["messages"]
+        for payload in state["relay_requests"][1:]
+    ]
+    assert len(retry_messages) == 2
+    assert retry_messages[0] == retry_messages[1]
+    assert retry_messages[0].count(landing_system_message()) == 1
+    assert state["requested_context_tiers"][-2:] == ["8k-fast", "64k-full"]
+
+    history = page.evaluate("document.querySelector('#app').__vue__.chatHistory")
+    assert [entry["role"] for entry in history] == ["user", "assistant"]
+    assert all(entry.get("content") != LANDING_PAGE_SYSTEM_MESSAGE for entry in history)
+    page.evaluate("document.querySelector('#app').__vue__.startNewChatAfterSelectedServerFailure()")
+    assert page.evaluate("document.querySelector('#app').__vue__.chatHistory") == []
+
+
+def test_landing_chat_uses_api_v1_only_non_streaming_real_browser_encryption_preserves_system_message_on_failover(
+    page: Page, base_url: str, setup_servers
+):
+    """Decrypt only at controlled compute boundaries; relay payloads remain opaque."""
+    key_pairs = []
+    for _ in range(2):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_pem = private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        public_pem = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        key_pairs.append((base64.b64encode(public_pem).decode("ascii"), private_pem))
+
+    state = route_landing_relay_chat(
+        page,
+        assistant_content="Encrypted boundary response.",
+        next_server_keys=[key_pairs[0][0], key_pairs[0][0], key_pairs[0][0], key_pairs[1][0]],
+        request_statuses=[200, 200, 404, 200],
+        diagnostics_count=2,
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    # Responses are fixture plaintext, but request encryption remains the production browser path.
+    page.evaluate("document.querySelector('#app').__vue__.decrypt = async ciphertext => ciphertext")
+
+    textarea = page.locator("textarea").first
+    for index, prompt in enumerate(("encrypted first", "encrypted second", "encrypted failover")):
+        textarea.fill(prompt)
+        wait_for_landing_send_enabled(page).click()
+        page.locator(".assistant-message").nth(index).wait_for(state="visible")
+
+    decrypted_envelopes = []
+    private_keys = {public_key: private_key for public_key, private_key in key_pairs}
+    for payload in state["relay_requests"]:
+        plaintext = decrypt(
+            {
+                "ciphertext": base64.b64decode(payload["ciphertext"]),
+                "iv": base64.b64decode(payload["iv"]),
+            },
+            base64.b64decode(payload["cipherkey"]),
+            private_keys[payload["server_public_key"]],
+        )
+        assert plaintext is not None
+        decrypted_envelopes.append(json.loads(plaintext))
+
+        relay_owned_payload = json.dumps(payload)
+        for secret_text in (LANDING_PAGE_SYSTEM_MESSAGE, "encrypted first", "encrypted second", "encrypted failover"):
+            assert secret_text not in relay_owned_payload
+
+    assert len(decrypted_envelopes) == 4
+    for envelope in decrypted_envelopes:
+        messages = envelope["api_v1_request"]["messages"]
+        assert messages[0] == landing_system_message()
+        assert messages.count(landing_system_message()) == 1
+    assert decrypted_envelopes[0]["api_v1_request"]["messages"] == [
+        landing_system_message(),
+        {"role": "user", "content": "encrypted first"},
+    ]
+    assert decrypted_envelopes[2]["api_v1_request"]["messages"] == decrypted_envelopes[3]["api_v1_request"]["messages"]
+    assert [entry["role"] for entry in page.evaluate("document.querySelector('#app').__vue__.chatHistory")] == [
+        "user", "assistant", "user", "assistant", "user", "assistant"
+    ]
 
 
 @pytest.mark.e2e
@@ -1843,6 +2001,8 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
     retried_envelope = envelopes[3]
     assert retried_envelope["request_id"] != envelopes[2]["request_id"]
+    assert retried_envelope["api_v1_request"]["messages"] == envelopes[2]["api_v1_request"]["messages"]
+    assert retried_envelope["api_v1_request"]["messages"].count(landing_system_message()) == 1
     assert retried_envelope["api_v1_request"]["messages"][-1] == {
         "role": "user",
         "content": "third turn triggers failover",

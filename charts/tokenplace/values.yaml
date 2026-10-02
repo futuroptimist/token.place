@@ -2,6 +2,63 @@ replicaCount: 1
 
 strategy:
   type: Recreate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+relay:
+  workers: 1
+  legacyRoutesEnabled: false
+
+# Memory is intentionally the safe single-process development default. Valkey
+# consumes an externally managed direct primary or Sentinel deployment; this
+# chart never installs Valkey.
+stateBackend:
+  type: memory
+  valkey:
+    discovery: direct
+    direct:
+      host: ""
+      port: 6379
+    sentinel:
+      endpoints: []
+      service: ""
+      auth:
+        existingSecret: ""
+        usernameKey: username
+        passwordKey: password
+    environment: ""
+    cluster: ""
+    schema:
+      major: 1
+      readerRevision: 1
+      writerRevision: 1
+      supportedReadMin: 1
+      supportedReadMax: 1
+      supportedWriterMin: 1
+      supportedWriterMax: 1
+      activeRevision: 1
+      activeWriterRevision: 1
+      migrationEpoch: 1
+    acknowledgementKey:
+      existingSecret: ""
+      secretKey: acknowledgement-key-base64
+    auth:
+      existingSecret: ""
+      usernameKey: username
+      passwordKey: password
+    tls:
+      enabled: false
+      existingSecret: ""
+      caCertKey: ca.crt
+      clientCertKey: tls.crt
+      clientKeyKey: tls.key
+    timeouts:
+      connectSeconds: 1
+      socketSeconds: 2
+      commandSeconds: 2
+      retrySeconds: 1
+    retryAttempts: 1
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
@@ -119,3 +176,8 @@ probes:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+topologySpreadConstraints: []
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1

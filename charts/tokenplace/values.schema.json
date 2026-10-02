@@ -64,15 +64,36 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean", "default": false },
-        "path": { "type": "string", "const": "/metrics", "default": "/metrics" },
-        "mode": { "type": "string", "enum": ["normal", "degraded"], "default": "normal" },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "path": {
+          "type": "string",
+          "const": "/metrics",
+          "default": "/metrics"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "degraded"
+          ],
+          "default": "normal"
+        },
         "auth": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "existingSecret": { "type": "string", "default": "" },
-            "secretKey": { "type": "string", "default": "token", "minLength": 1 }
+            "existingSecret": {
+              "type": "string",
+              "default": ""
+            },
+            "secretKey": {
+              "type": "string",
+              "default": "token",
+              "minLength": 1
+            }
           }
         }
       }
@@ -81,23 +102,436 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean", "default": false },
-        "interval": { "type": "string", "default": "30s" },
-        "scrapeTimeout": { "type": "string", "default": "10s" },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval": {
+          "type": "string",
+          "default": "30s"
+        },
+        "scrapeTimeout": {
+          "type": "string",
+          "default": "10s"
+        },
         "additionalLabels": {
           "type": "object",
-          "default": { "release": "kube-prometheus-stack" },
-          "additionalProperties": { "type": "string" }
+          "default": {
+            "release": "kube-prometheus-stack"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "relabelings": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "app": { "type": "string", "default": "tokenplace" },
-            "environment": { "type": "string", "default": "" },
-            "release": { "type": "string", "default": "" },
-            "cluster": { "type": "string", "default": "" }
+            "app": {
+              "type": "string",
+              "default": "tokenplace"
+            },
+            "environment": {
+              "type": "string",
+              "default": ""
+            },
+            "release": {
+              "type": "string",
+              "default": ""
+            },
+            "cluster": {
+              "type": "string",
+              "default": ""
+            }
           }
+        }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "Recreate",
+            "RollingUpdate"
+          ]
+        },
+        "rollingUpdate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxUnavailable": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "maxSurge": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workers",
+        "legacyRoutesEnabled"
+      ],
+      "properties": {
+        "workers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "legacyRoutesEnabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "stateBackend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "valkey"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory",
+            "valkey"
+          ]
+        },
+        "valkey": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "discovery",
+            "direct",
+            "sentinel",
+            "environment",
+            "cluster",
+            "schema",
+            "acknowledgementKey",
+            "auth",
+            "tls",
+            "timeouts",
+            "retryAttempts"
+          ],
+          "properties": {
+            "discovery": {
+              "type": "string",
+              "enum": [
+                "direct",
+                "sentinel"
+              ]
+            },
+            "direct": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "host",
+                "port"
+              ],
+              "properties": {
+                "host": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                }
+              }
+            },
+            "sentinel": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "endpoints",
+                "service",
+                "auth"
+              ],
+              "properties": {
+                "endpoints": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "host",
+                      "port"
+                    ],
+                    "properties": {
+                      "host": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 253,
+                        "pattern": "^[^\\s/@]+$"
+                      },
+                      "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535
+                      }
+                    }
+                  }
+                },
+                "service": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "auth": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "existingSecret",
+                    "usernameKey",
+                    "passwordKey"
+                  ],
+                  "properties": {
+                    "existingSecret": {
+                      "type": "string",
+                      "default": ""
+                    },
+                    "usernameKey": {
+                      "type": "string"
+                    },
+                    "passwordKey": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "environment": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^(?:|[A-Za-z0-9][A-Za-z0-9_.-]*)$"
+            },
+            "cluster": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^(?:|[A-Za-z0-9][A-Za-z0-9_.-]*)$"
+            },
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "major",
+                "readerRevision",
+                "writerRevision",
+                "supportedReadMin",
+                "supportedReadMax",
+                "supportedWriterMin",
+                "supportedWriterMax",
+                "activeRevision",
+                "activeWriterRevision",
+                "migrationEpoch"
+              ],
+              "properties": {
+                "major": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "readerRevision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "writerRevision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "supportedReadMin": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "supportedReadMax": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "supportedWriterMin": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "supportedWriterMax": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "activeRevision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "activeWriterRevision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "migrationEpoch": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "acknowledgementKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "existingSecret",
+                "secretKey"
+              ],
+              "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "default": ""
+                },
+                "secretKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "existingSecret",
+                "usernameKey",
+                "passwordKey"
+              ],
+              "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "default": ""
+                },
+                "usernameKey": {
+                  "type": "string"
+                },
+                "passwordKey": {
+                  "type": "string"
+                }
+              }
+            },
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "enabled",
+                "existingSecret",
+                "caCertKey",
+                "clientCertKey",
+                "clientKeyKey"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "existingSecret": {
+                  "type": "string",
+                  "default": ""
+                },
+                "caCertKey": {
+                  "type": "string"
+                },
+                "clientCertKey": {
+                  "type": "string"
+                },
+                "clientKeyKey": {
+                  "type": "string"
+                }
+              }
+            },
+            "timeouts": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "connectSeconds",
+                "socketSeconds",
+                "commandSeconds",
+                "retrySeconds"
+              ],
+              "properties": {
+                "connectSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 30
+                },
+                "socketSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 30
+                },
+                "commandSeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 30
+                },
+                "retrySeconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 30
+                }
+              }
+            },
+            "retryAttempts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            }
+          }
+        }
+      }
+    },
+    "topologySpreadConstraints": {
+      "type": "array"
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "maxUnavailable"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "maxUnavailable": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string"
+            }
+          ]
         }
       }
     }

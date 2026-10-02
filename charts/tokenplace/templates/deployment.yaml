@@ -1,3 +1,37 @@
+{{- $backend := .Values.stateBackend.type -}}
+{{- $workers := int .Values.relay.workers -}}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $ha := or (gt $workers 1) (gt $replicas 1) -}}
+{{- if and (eq $backend "memory") $ha -}}
+{{- fail "stateBackend.type=memory requires replicaCount=1 and relay.workers=1" -}}
+{{- end -}}
+{{- if and $ha (ne $backend "valkey") -}}
+{{- fail "multiple replicas or workers require stateBackend.type=valkey" -}}
+{{- end -}}
+{{- if and $ha .Values.relay.legacyRoutesEnabled -}}
+{{- fail "legacy relay routes are forbidden with multiple replicas or workers" -}}
+{{- end -}}
+{{- if eq $backend "valkey" -}}
+{{- $v := .Values.stateBackend.valkey -}}
+{{- $_ := required "stateBackend.valkey.environment is required" $v.environment -}}
+{{- $_ := required "stateBackend.valkey.cluster is required" $v.cluster -}}
+{{- $_ := required "stateBackend.valkey.acknowledgementKey.existingSecret is required" $v.acknowledgementKey.existingSecret -}}
+{{- if eq $v.discovery "direct" -}}
+{{- $_ := required "stateBackend.valkey.direct.host is required for direct discovery" $v.direct.host -}}
+{{- else if eq $v.discovery "sentinel" -}}
+{{- $_ := required "stateBackend.valkey.sentinel.service is required for Sentinel discovery" $v.sentinel.service -}}
+{{- if not $v.sentinel.endpoints }}{{ fail "stateBackend.valkey.sentinel.endpoints is required for Sentinel discovery" }}{{ end -}}
+{{- end -}}
+{{- if and $v.auth.existingSecret (not (or $v.auth.usernameKey $v.auth.passwordKey)) }}{{ fail "stateBackend.valkey.auth requires a usernameKey or passwordKey" }}{{ end -}}
+{{- if and $v.sentinel.auth.existingSecret (not (or $v.sentinel.auth.usernameKey $v.sentinel.auth.passwordKey)) }}{{ fail "stateBackend.valkey.sentinel.auth requires a usernameKey or passwordKey" }}{{ end -}}
+{{- if and $v.tls.enabled (not $v.tls.existingSecret) }}{{ fail "stateBackend.valkey.tls.existingSecret is required when TLS is enabled" }}{{ end -}}
+{{- end -}}
+{{- if and $ha (ne .Values.strategy.type "RollingUpdate") }}{{ fail "multiple replicas or workers require strategy.type=RollingUpdate" }}{{ end -}}
+{{- if and $ha (not .Values.podDisruptionBudget.enabled) }}{{ fail "multiple replicas or workers require podDisruptionBudget.enabled=true" }}{{ end -}}
+{{- if and $ha (not .Values.topologySpreadConstraints) }}{{ fail "multiple replicas or workers require topologySpreadConstraints" }}{{ end -}}
+{{- if and $ha (not .Values.preStop.enabled) }}{{ fail "multiple replicas or workers require preStop.enabled=true" }}{{ end -}}
+{{- if and $ha (lt (int .Values.terminationGracePeriodSeconds) 10) }}{{ fail "multiple replicas or workers require terminationGracePeriodSeconds>=10" }}{{ end -}}
+{{- if and (gt $replicas 1) .Values.podDisruptionBudget.enabled (ge (int .Values.podDisruptionBudget.maxUnavailable) $replicas) }}{{ fail "podDisruptionBudget.maxUnavailable must be less than replicaCount" }}{{ end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -54,6 +88,11 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if and (eq $backend "valkey") .Values.stateBackend.valkey.tls.enabled }}
+        - name: valkey-tls
+          secret:
+            secretName: {{ .Values.stateBackend.valkey.tls.existingSecret }}
+        {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: relay
@@ -75,7 +114,8 @@ spec:
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
-                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" (printf "%v" .Values.relay.workers))
+                "RELAY_REPLICAS" (dict "name" "RELAY_REPLICAS" "value" (printf "%v" .Values.replicaCount))
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
                 "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" (join "," .Values.rateLimit.trustedProxies))
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)
@@ -123,7 +163,32 @@ spec:
           {{- end }}
           {{- end }}
           {{- end }}
+          {{- range $name := keys $mergedEnv }}{{- if or (hasPrefix "TOKENPLACE_RELAY_VALKEY_" $name) (eq $name "TOKENPLACE_RELAY_STATE_BACKEND") (eq $name "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES") (eq $name "RELAY_WORKERS") (eq $name "RELAY_REPLICAS") }}{{- $_ := unset $mergedEnv $name }}{{- end }}{{- end }}
+          {{- $_ := set $mergedEnv "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" (printf "%v" .Values.relay.workers)) }}
+          {{- $_ := set $mergedEnv "RELAY_REPLICAS" (dict "name" "RELAY_REPLICAS" "value" (printf "%v" .Values.replicaCount)) }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_MODE" (dict "name" "TOKENPLACE_METRICS_MODE" "value" .Values.metrics.mode) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_STATE_BACKEND" (dict "name" "TOKENPLACE_RELAY_STATE_BACKEND" "value" $backend) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES" (dict "name" "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES" "value" (ternary "1" "0" .Values.relay.legacyRoutesEnabled)) }}
+          {{- if eq $backend "valkey" }}
+          {{- $v := .Values.stateBackend.valkey }}
+          {{- $plain := dict
+                "DISCOVERY" $v.discovery "ENVIRONMENT" $v.environment "CLUSTER" $v.cluster
+                "SCHEMA_MAJOR" $v.schema.major "READER_REVISION" $v.schema.readerRevision "WRITER_REVISION" $v.schema.writerRevision
+                "SUPPORTED_SCHEMA_READ_MIN" $v.schema.supportedReadMin "SUPPORTED_SCHEMA_READ_MAX" $v.schema.supportedReadMax
+                "SUPPORTED_WRITER_MIN" $v.schema.supportedWriterMin "SUPPORTED_WRITER_MAX" $v.schema.supportedWriterMax
+                "ACTIVE_SCHEMA_REVISION" $v.schema.activeRevision "ACTIVE_WRITER_REVISION" $v.schema.activeWriterRevision
+                "MIGRATION_EPOCH" $v.schema.migrationEpoch "CONNECT_TIMEOUT_SECONDS" $v.timeouts.connectSeconds
+                "SOCKET_TIMEOUT_SECONDS" $v.timeouts.socketSeconds "COMMAND_TIMEOUT_SECONDS" $v.timeouts.commandSeconds
+                "RETRY_TIMEOUT_SECONDS" $v.timeouts.retrySeconds "RETRY_ATTEMPTS" $v.retryAttempts "TLS" (ternary "true" "false" $v.tls.enabled) }}
+          {{- if eq $v.discovery "direct" }}{{- $_ := set $plain "HOST" $v.direct.host }}{{- $_ := set $plain "PORT" $v.direct.port }}{{- else }}
+          {{- $eps := list }}{{- range $v.sentinel.endpoints }}{{- $eps = append $eps (list .host .port) }}{{- end }}
+          {{- $_ := set $plain "SENTINELS_JSON" (toJson $eps) }}{{- $_ := set $plain "SENTINEL_SERVICE" $v.sentinel.service }}{{- end }}
+          {{- range $suffix, $value := $plain }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "%v" $value)) }}{{- end }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" (dict "name" "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" "valueFrom" (dict "secretKeyRef" (dict "name" $v.acknowledgementKey.existingSecret "key" $v.acknowledgementKey.secretKey))) }}
+          {{- range $suffix, $key := dict "USERNAME" $v.auth.usernameKey "PASSWORD" $v.auth.passwordKey }}{{- if and $v.auth.existingSecret $key }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key))) }}{{- end }}{{- end }}
+          {{- range $suffix, $key := dict "SENTINEL_USERNAME" $v.sentinel.auth.usernameKey "SENTINEL_PASSWORD" $v.sentinel.auth.passwordKey }}{{- if and $v.sentinel.auth.existingSecret $key }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.sentinel.auth.existingSecret "key" $key))) }}{{- end }}{{- end }}
+          {{- if $v.tls.enabled }}{{- range $suffix, $key := dict "TLS_CA_CERT" $v.tls.caCertKey "TLS_CLIENT_CERT" $v.tls.clientCertKey "TLS_CLIENT_KEY" $v.tls.clientKeyKey }}{{- if $key }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "/var/run/secrets/tokenplace/valkey-tls/%s" $key)) }}{{- end }}{{- end }}{{- end }}
+          {{- end }}
           {{- if .Values.metrics.enabled }}
           {{- $metricsSecret := required "metrics.auth.existingSecret is required when metrics.enabled=true" .Values.metrics.auth.existingSecret }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_TOKEN" (dict "name" "TOKENPLACE_METRICS_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $metricsSecret "key" .Values.metrics.auth.secretKey))) }}
@@ -187,12 +252,33 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if and (eq $backend "valkey") .Values.stateBackend.valkey.tls.enabled }}
+            - name: valkey-tls
+              mountPath: /var/run/secrets/tokenplace/valkey-tls
+              readOnly: true
+            {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      {{- if $ha }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "tokenplace.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}

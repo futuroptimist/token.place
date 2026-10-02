@@ -1,0 +1,13 @@
+{{- if and (eq .Values.stateBackend.type "valkey") .Values.stateBackend.valkey.highAvailability }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tokenplace.fullname" . }}
+  labels:
+    {{- include "tokenplace.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "tokenplace.selectorLabels" . | nindent 6 }}
+{{- end }}

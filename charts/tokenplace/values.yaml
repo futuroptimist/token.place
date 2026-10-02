@@ -3,6 +3,64 @@ replicaCount: 1
 strategy:
   type: Recreate
 
+# Memory is intentionally the development default and is restricted to one
+# replica and one worker. Valkey endpoints are externally managed; this chart
+# never installs a datastore.
+relay:
+  workers: 1
+  legacyRoutesEnabled: false
+
+stateBackend:
+  type: memory
+  valkey:
+    highAvailability: false
+    discovery: direct
+    environment: ""
+    cluster: ""
+    direct:
+      host: ""
+      port: 6379
+    sentinel:
+      endpoints: []
+      service: ""
+      auth:
+        existingSecret: ""
+        usernameKey: username
+        passwordKey: password
+    auth:
+      existingSecret: ""
+      usernameKey: username
+      passwordKey: password
+    acknowledgementKey:
+      existingSecret: ""
+      key: acknowledgement-key-base64
+    tls:
+      enabled: false
+      existingSecret: ""
+      caCertKey: ca.crt
+      clientCertKey: tls.crt
+      clientKeyKey: tls.key
+    schema:
+      major: 1
+      readerRevision: 1
+      writerRevision: 1
+      supportedReadMin: 1
+      supportedReadMax: 1
+      supportedWriterMin: 1
+      supportedWriterMax: 1
+      activeRevision: 1
+      activeWriterRevision: 1
+      migrationEpoch: 1
+    timeouts:
+      connectSeconds: 1
+      socketSeconds: 2
+      commandSeconds: 2
+      retrySeconds: 1
+    retryAttempts: 1
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
   tag: "main-latest"

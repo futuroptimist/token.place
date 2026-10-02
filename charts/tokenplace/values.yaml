@@ -2,6 +2,61 @@ replicaCount: 1
 
 strategy:
   type: Recreate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+relay:
+  workers: 1
+  legacyRoutes:
+    enabled: false
+
+stateBackend:
+  type: memory
+  valkey:
+    discovery: direct
+    direct:
+      host: ""
+      port: 6379
+    sentinel:
+      endpointsJson: ""
+      service: ""
+      auth:
+        existingSecret: ""
+        usernameKey: sentinel-username
+        passwordKey: sentinel-password
+    environment: ""
+    cluster: ""
+    schema:
+      major: 1
+      readerRevision: 1
+      writerRevision: 1
+      supportedSchemaReadMin: 1
+      supportedSchemaReadMax: 1
+      supportedWriterMin: 1
+      supportedWriterMax: 1
+      activeSchemaRevision: 1
+      activeWriterRevision: 1
+      migrationEpoch: 1
+    acknowledgementKey:
+      existingSecret: ""
+      secretKey: acknowledgement-key-base64
+    auth:
+      existingSecret: ""
+      usernameKey: username
+      passwordKey: password
+    tls:
+      enabled: false
+      existingSecret: ""
+      caCertKey: ca.crt
+      clientCertKey: tls.crt
+      clientKeyKey: tls.key
+    timeouts:
+      connectSeconds: 1
+      socketSeconds: 2
+      commandSeconds: 2
+      retrySeconds: 1
+    retryAttempts: 1
 
 image:
   repository: ghcr.io/futuroptimist/tokenplace-relay
@@ -61,6 +116,9 @@ service:
 # only the observed immediate Traefik peer CIDRs/addresses after live validation.
 rateLimit:
   trustedProxies: []
+  storage:
+    existingSecret: ""
+    secretKey: uri
 
 metrics:
   enabled: false
@@ -119,3 +177,8 @@ probes:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+topologySpreadConstraints: []
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1

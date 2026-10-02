@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from encrypt import decrypt, generate_keys
 from playwright.sync_api import Page, expect
 import time
 
@@ -27,6 +28,15 @@ ALT_SERVER_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 alt-test-public-key
 -----END PUBLIC KEY-----"""
 ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
+LANDING_CHAT_SYSTEM_MESSAGE = (
+    "You are the assistant in the token.place landing-page chat. token.place connects people who "
+    "need generative-AI inference with people who contribute compute; a selected compute node "
+    "serves each request. The relay routes end-to-end encrypted request and response envelopes and "
+    "cannot read the conversation, while the selected compute node decrypts the request to run "
+    "inference and encrypts its response for the requesting browser. If you are uncertain, say so. "
+    "Do not claim or imply that you searched or browsed the web."
+)
+LANDING_CHAT_SYSTEM_ENTRY = {"role": "system", "content": LANDING_CHAT_SYSTEM_MESSAGE}
 
 
 
@@ -1705,9 +1715,162 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     request_envelope = json.loads(state["relay_requests"][0]["ciphertext"])
     assert request_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
     assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
-    assert request_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert request_envelope["api_v1_request"]["messages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "hello"},
+    ]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
+
+
+def test_landing_chat_system_message_is_request_only_and_affects_auto_context(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    result = page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.chatHistory = [
+                {role: 'user', content: 'first question'},
+                {role: 'assistant', content: 'first answer'},
+                {role: 'system', content: 'display history must ignore this'},
+                {role: 'user', content: 'next question'}
+            ];
+            const subsequent = vm.createApiV1Messages('next question');
+            const historyAfterBuild = JSON.parse(JSON.stringify(vm.chatHistory));
+
+            const content = 'x'.repeat(24544);
+            const withoutSystem = vm.resolveContextTierForRequest(
+                [{role: 'user', content}], 'auto'
+            );
+            const withSystem = vm.resolveContextTierForRequest(
+                vm.createApiV1Messages(content), 'auto'
+            );
+            return {
+                subsequent,
+                historyAfterBuild,
+                withoutSystem,
+                withSystem,
+                newChatMessages: (() => {
+                    vm.startNewChatAfterSelectedServerFailure();
+                    return vm.createApiV1Messages('fresh question');
+                })()
+            };
+        }
+        """,
+    )
+
+    assert result["subsequent"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "next question"},
+    ]
+    assert result["historyAfterBuild"] == [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "system", "content": "display history must ignore this"},
+        {"role": "user", "content": "next question"},
+    ]
+    assert result["newChatMessages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "fresh question"},
+    ]
+    assert result["withoutSystem"]["requestedContextTier"] == "8k-fast"
+    assert result["withSystem"]["requestedContextTier"] == "64k-full"
+    assert result["withSystem"]["estimate"]["promptEstimate"] > result["withoutSystem"]["estimate"]["promptEstimate"]
+
+
+def test_landing_chat_auto_context_retry_reuses_complete_system_message_array(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        api_v1_responses=[
+            {"error": {"code": "compute_node_context_window_exceeded"}},
+            {"message": {"role": "assistant", "content": "Retried with full context."}},
+        ],
+        next_server_keys=[SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64],
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("retry this request")
+    wait_for_landing_send_enabled(page).click()
+    expect(page.locator(".assistant-message").last).to_contain_text("Retried with full context.")
+
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert len(envelopes) == 2
+    expected_messages = [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "retry this request"},
+    ]
+    assert [envelope["api_v1_request"]["messages"] for envelope in envelopes] == [
+        expected_messages,
+        expected_messages,
+    ]
+    assert state["requested_context_tiers"] == ["8k-fast", "64k-full"]
+
+
+def test_landing_chat_send_once_fallback_builds_system_message_request(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page, assistant_content="Direct fallback response.")
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    response = page.evaluate(
+        "document.querySelector('#app').__vue__.sendMessageApiOnce('direct fallback')"
+    )
+
+    assert response["message"]["content"] == "Direct fallback response."
+    envelope = json.loads(state["relay_requests"][0]["ciphertext"])
+    assert envelope["api_v1_request"]["messages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "direct fallback"},
+    ]
+
+
+def test_landing_chat_real_browser_encryption_hides_system_and_conversation_from_relay(
+    page: Page, base_url: str, setup_servers
+):
+    private_key, public_key = generate_keys()
+    public_key_b64 = base64.b64encode(public_key).decode("ascii")
+    state = route_landing_relay_chat(
+        page,
+        next_server_keys=[public_key_b64],
+        request_statuses=[500],
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    page.evaluate(
+        "document.querySelector('#app').__vue__.sendMessageApiOnce('encrypted boundary proof')"
+    )
+
+    relay_payload = state["relay_requests"][0]
+    serialized_relay_payload = json.dumps(relay_payload)
+    assert LANDING_CHAT_SYSTEM_MESSAGE not in serialized_relay_payload
+    assert "encrypted boundary proof" not in serialized_relay_payload
+    plaintext = decrypt(
+        {
+            "ciphertext": base64.b64decode(relay_payload["ciphertext"]),
+            "iv": base64.b64decode(relay_payload["iv"]),
+        },
+        base64.b64decode(relay_payload["cipherkey"]),
+        private_key,
+    )
+    envelope = json.loads(plaintext)
+    assert envelope["api_v1_request"]["messages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "encrypted boundary proof"},
+    ]
 
 
 def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url: str, setup_servers):
@@ -1740,8 +1903,12 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     assert len(state["relay_requests"]) == 2
     assert {payload["server_public_key"] for payload in state["relay_requests"]} == {SERVER_PUBLIC_KEY_B64}
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
-    assert envelopes[0]["api_v1_request"]["messages"] == [{"role": "user", "content": "first turn"}]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
+        {"role": "user", "content": "first turn"},
+    ]
     assert envelopes[1]["api_v1_request"]["messages"] == [
+        LANDING_CHAT_SYSTEM_ENTRY,
         {"role": "user", "content": "first turn"},
         {"role": "assistant", "content": "Sticky relay response."},
         {"role": "user", "content": "second turn"},
@@ -1843,6 +2010,8 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
     retried_envelope = envelopes[3]
     assert retried_envelope["request_id"] != envelopes[2]["request_id"]
+    assert retried_envelope["api_v1_request"]["messages"] == envelopes[2]["api_v1_request"]["messages"]
+    assert retried_envelope["api_v1_request"]["messages"].count(LANDING_CHAT_SYSTEM_ENTRY) == 1
     assert retried_envelope["api_v1_request"]["messages"][-1] == {
         "role": "user",
         "content": "third turn triggers failover",

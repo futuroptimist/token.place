@@ -1,3 +1,4 @@
+{{- include "tokenplace.validateDeploymentContract" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -54,6 +55,11 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if and (eq .Values.stateBackend.type "valkey") .Values.stateBackend.valkey.tls.enabled }}
+        - name: valkey-tls
+          secret:
+            secretName: {{ .Values.stateBackend.valkey.tls.existingSecret }}
+        {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: relay
@@ -75,7 +81,7 @@ spec:
           {{- $defaultEnv := dict
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
-                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
+                "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" (printf "%v" .Values.relay.workers))
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
                 "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" (join "," .Values.rateLimit.trustedProxies))
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)
@@ -124,6 +130,35 @@ spec:
           {{- end }}
           {{- end }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_MODE" (dict "name" "TOKENPLACE_METRICS_MODE" "value" .Values.metrics.mode) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_STATE_BACKEND" (dict "name" "TOKENPLACE_RELAY_STATE_BACKEND" "value" .Values.stateBackend.type) }}
+          {{- if eq .Values.stateBackend.type "valkey" }}
+          {{- $v := .Values.stateBackend.valkey }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES" (dict "name" "TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES" "value" "0") }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_DISCOVERY" (dict "name" "TOKENPLACE_RELAY_VALKEY_DISCOVERY" "value" $v.discovery) }}
+          {{- if eq $v.discovery "direct" }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_HOST" (dict "name" "TOKENPLACE_RELAY_VALKEY_HOST" "value" $v.direct.host) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_PORT" (dict "name" "TOKENPLACE_RELAY_VALKEY_PORT" "value" (printf "%v" $v.direct.port)) }}
+          {{- else }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON" (dict "name" "TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON" "value" (toJson $v.sentinel.endpoints)) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE" (dict "name" "TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE" "value" $v.sentinel.service) }}
+          {{- end }}
+          {{- $plain := dict "ENVIRONMENT" $v.environment "CLUSTER" $v.cluster "SCHEMA_MAJOR" $v.schema.major "READER_REVISION" $v.schema.readerRevision "WRITER_REVISION" $v.schema.writerRevision "SUPPORTED_SCHEMA_READ_MIN" $v.schema.supportedReadMin "SUPPORTED_SCHEMA_READ_MAX" $v.schema.supportedReadMax "SUPPORTED_WRITER_MIN" $v.schema.supportedWriterMin "SUPPORTED_WRITER_MAX" $v.schema.supportedWriterMax "ACTIVE_SCHEMA_REVISION" $v.schema.activeRevision "ACTIVE_WRITER_REVISION" $v.schema.activeWriterRevision "MIGRATION_EPOCH" $v.schema.migrationEpoch "CONNECT_TIMEOUT_SECONDS" $v.timeouts.connectSeconds "SOCKET_TIMEOUT_SECONDS" $v.timeouts.socketSeconds "COMMAND_TIMEOUT_SECONDS" $v.timeouts.commandSeconds "RETRY_TIMEOUT_SECONDS" $v.timeouts.retrySeconds "RETRY_ATTEMPTS" $v.retryAttempts "TLS" $v.tls.enabled }}
+          {{- range $suffix, $value := $plain }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "%v" $value)) }}{{- end }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" (dict "name" "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64" "valueFrom" (dict "secretKeyRef" (dict "name" $v.acknowledgementKey.existingSecret "key" $v.acknowledgementKey.key))) }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RATE_LIMIT_STORAGE_URI" (dict "name" "TOKENPLACE_RATE_LIMIT_STORAGE_URI" "valueFrom" (dict "secretKeyRef" (dict "name" .Values.sharedRateLimit.existingSecret "key" .Values.sharedRateLimit.storageUriKey))) }}
+          {{- if $v.auth.existingSecret }}
+          {{- range $suffix, $key := dict "USERNAME" $v.auth.usernameKey "PASSWORD" $v.auth.passwordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.existingSecret "key" $key))) }}{{- end }}
+          {{- end }}
+          {{- if and (eq $v.discovery "sentinel") $v.auth.sentinelExistingSecret }}
+          {{- range $suffix, $key := dict "SENTINEL_USERNAME" $v.auth.sentinelUsernameKey "SENTINEL_PASSWORD" $v.auth.sentinelPasswordKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "valueFrom" (dict "secretKeyRef" (dict "name" $v.auth.sentinelExistingSecret "key" $key))) }}{{- end }}
+          {{- end }}
+          {{- if $v.tls.enabled }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT" (dict "name" "TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT" "value" (printf "/var/run/tokenplace-valkey-tls/%s" $v.tls.caKey)) }}
+          {{- if $v.tls.clientCertKey }}
+          {{- range $suffix, $key := dict "TLS_CLIENT_CERT" $v.tls.clientCertKey "TLS_CLIENT_KEY" $v.tls.clientKeyKey }}{{- $_ := set $mergedEnv (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) (dict "name" (printf "TOKENPLACE_RELAY_VALKEY_%s" $suffix) "value" (printf "/var/run/tokenplace-valkey-tls/%s" $key)) }}{{- end }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
           {{- if .Values.metrics.enabled }}
           {{- $metricsSecret := required "metrics.auth.existingSecret is required when metrics.enabled=true" .Values.metrics.auth.existingSecret }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_TOKEN" (dict "name" "TOKENPLACE_METRICS_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" $metricsSecret "key" .Values.metrics.auth.secretKey))) }}
@@ -187,12 +222,32 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if and (eq .Values.stateBackend.type "valkey") .Values.stateBackend.valkey.tls.enabled }}
+            - name: valkey-tls
+              mountPath: /var/run/tokenplace-valkey-tls
+              readOnly: true
+            {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- $affinity := deepCopy .Values.affinity }}
+      {{- if .Values.podAntiAffinity.enabled }}
+      {{- $term := dict "labelSelector" (dict "matchLabels" (include "tokenplace.selectorLabels" . | fromYaml)) "topologyKey" .Values.podAntiAffinity.topologyKey }}
+      {{- $podAntiAffinity := dict }}
+      {{- if eq .Values.podAntiAffinity.type "required" }}
+      {{- $_ := set $podAntiAffinity "requiredDuringSchedulingIgnoredDuringExecution" (list $term) }}
+      {{- else }}
+      {{- $_ := set $podAntiAffinity "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term)) }}
+      {{- end }}
+      {{- $_ := set $affinity "podAntiAffinity" $podAntiAffinity }}
+      {{- end }}
+      {{- if $affinity }}
       affinity:
+        {{- toYaml $affinity | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}

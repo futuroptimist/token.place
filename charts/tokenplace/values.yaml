@@ -33,7 +33,9 @@ stateBackend:
       existingSecret: ""
       key: acknowledgement-key-base64
     auth:
+      # Primary credentials and optional Sentinel credentials may use different Secrets.
       existingSecret: ""
+      sentinelExistingSecret: ""
       usernameKey: username
       passwordKey: password
       sentinelUsernameKey: sentinel-username

@@ -113,6 +113,60 @@ def test_sentinel_tls_renders_endpoints_and_mounted_secret_paths() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "primary_secret, sentinel_secret, expected, absent",
+    (
+        (
+            "primary-auth",
+            "",
+            {"USERNAME": ("primary-auth", "username"), "PASSWORD": ("primary-auth", "password")},
+            ("SENTINEL_USERNAME", "SENTINEL_PASSWORD"),
+        ),
+        (
+            "",
+            "sentinel-auth",
+            {
+                "SENTINEL_USERNAME": ("sentinel-auth", "sentinel-username"),
+                "SENTINEL_PASSWORD": ("sentinel-auth", "sentinel-password"),
+            },
+            ("USERNAME", "PASSWORD"),
+        ),
+        (
+            "primary-auth",
+            "sentinel-auth",
+            {
+                "USERNAME": ("primary-auth", "username"),
+                "PASSWORD": ("primary-auth", "password"),
+                "SENTINEL_USERNAME": ("sentinel-auth", "sentinel-username"),
+                "SENTINEL_PASSWORD": ("sentinel-auth", "sentinel-password"),
+            },
+            (),
+        ),
+    ),
+)
+def test_sentinel_credentials_use_independent_secrets(
+    primary_secret: str,
+    sentinel_secret: str,
+    expected: dict[str, tuple[str, str]],
+    absent: tuple[str, ...],
+) -> None:
+    docs = _valkey_render(
+        "--set", "stateBackend.valkey.discovery=sentinel",
+        "--set-json", 'stateBackend.valkey.sentinel.endpoints=[["sentinel-a",26379]]',
+        "--set", "stateBackend.valkey.sentinel.service=relay-primary",
+        "--set", f"stateBackend.valkey.auth.existingSecret={primary_secret}",
+        "--set", f"stateBackend.valkey.auth.sentinelExistingSecret={sentinel_secret}",
+    )
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+
+    for suffix, (secret_name, key) in expected.items():
+        entry = env[f"TOKENPLACE_RELAY_VALKEY_{suffix}"]
+        assert "value" not in entry
+        assert entry["valueFrom"]["secretKeyRef"] == {"name": secret_name, "key": key}
+    for suffix in absent:
+        assert f"TOKENPLACE_RELAY_VALKEY_{suffix}" not in env
+
+
 def test_sentinel_endpoint_host_accepts_runtime_maximum_length() -> None:
     host = "a" * 253
     docs = _valkey_render(

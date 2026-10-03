@@ -373,6 +373,7 @@
               "additionalProperties": false,
               "required": [
                 "existingSecret",
+                "sentinelExistingSecret",
                 "usernameKey",
                 "passwordKey",
                 "sentinelUsernameKey",
@@ -380,6 +381,10 @@
               ],
               "properties": {
                 "existingSecret": {
+                  "type": "string",
+                  "maxLength": 253
+                },
+                "sentinelExistingSecret": {
                   "type": "string",
                   "maxLength": 253
                 },

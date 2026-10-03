@@ -1878,7 +1878,7 @@ def test_landing_chat_system_message_is_inside_real_encryption(
 
 
 def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url: str, setup_servers):
-    """A browser chat session selects one compute node once and reuses it across turns."""
+    """Each browser chat request selects a compute node while retaining history."""
 
     state = route_landing_relay_chat(page, assistant_content="Sticky relay response.")
 
@@ -1903,7 +1903,7 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").nth(1).wait_for(state="visible")
 
-    assert state["next_calls"] == 1
+    assert state["next_calls"] == 2
     assert len(state["relay_requests"]) == 2
     assert {payload["server_public_key"] for payload in state["relay_requests"]} == {SERVER_PUBLIC_KEY_B64}
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
@@ -1948,7 +1948,14 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     state = route_landing_relay_chat(
         page,
         assistant_content="Replacement server answered.",
-        next_server_keys=[SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        next_server_keys=[
+            SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+        ],
         diagnostics_counts=[1, 2],
         **route_kwargs,
     )
@@ -1970,7 +1977,7 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     textarea.fill("second turn")
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").nth(1).wait_for(state="visible")
-    assert state["next_calls"] == 1
+    assert state["next_calls"] == 2
     assert page.get_by_test_id("landing-server-key-label").inner_text() == first_label
 
     textarea.fill("third turn triggers failover")
@@ -2002,7 +2009,9 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
         """
     )
 
-    assert state["next_calls"] == 3
+    # Each of the four turns selects for its dispatch. The failed third turn
+    # additionally probes for a replacement before its retry dispatch selects.
+    assert state["next_calls"] == 6
     assert state["diagnostics_calls"] >= 2
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
         SERVER_PUBLIC_KEY_B64,
@@ -2015,11 +2024,18 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     retried_envelope = envelopes[3]
     assert retried_envelope["request_id"] != envelopes[2]["request_id"]
     assert retried_envelope["api_v1_request"]["messages"] == envelopes[2]["api_v1_request"]["messages"]
-    assert retried_envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
-    assert retried_envelope["api_v1_request"]["messages"][-1] == {
-        "role": "user",
-        "content": "third turn triggers failover",
-    }
+    assert retried_envelope["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn"},
+        {"role": "assistant", "content": "Replacement server answered."},
+        {"role": "user", "content": "second turn"},
+        {"role": "assistant", "content": "Replacement server answered."},
+        {"role": "user", "content": "third turn triggers failover"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in (envelopes[2], retried_envelope)
+    )
     assert envelopes[4]["api_v1_request"]["messages"][-1] == {
         "role": "user",
         "content": "fourth turn stays sticky",
@@ -2729,7 +2745,19 @@ def test_landing_chat_decrypted_terminal_error_triggers_failover(
         SERVER_PUBLIC_KEY_B64,
         ALT_SERVER_PUBLIC_KEY_B64,
     ]
-    assert state["next_calls"] == 2
+    # The request-bound initial and retry selections surround one failover probe.
+    assert state["next_calls"] == 3
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[1]["request_id"] != envelopes[0]["request_id"]
+    assert envelopes[1]["api_v1_request"]["messages"] == envelopes[0]["api_v1_request"]["messages"]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "hello decrypted terminal"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in envelopes
+    )
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

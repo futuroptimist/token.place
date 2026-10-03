@@ -5,12 +5,14 @@ import base64
 import dataclasses
 import json
 import io
+import logging
 from pathlib import Path
 from flask import Flask
 import sys
 import os
 from datetime import datetime, timedelta
 import relay as relay_module
+from encrypt import decrypt, encrypt, generate_keys
 from utils.networking.relay_client import RelayClient
 
 # Add project root to the Python path
@@ -3206,6 +3208,145 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert retrieved_payload['iv'] == 'iv-response-provider-style'
     assert response_plaintext not in json.dumps(retrieved_payload)
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
+
+
+def test_api_v1_landing_system_message_remains_ciphertext_only(client):
+    """The real relay boundary exposes landing plaintext only to the selected compute node."""
+    system_message = (
+        "You are the assistant in the token.place landing-page chat. token.place connects people "
+        "who need generative-AI inference with people who contribute compute; a selected compute "
+        "node serves each request. The relay routes end-to-end encrypted request and response "
+        "envelopes and cannot read the conversation, while the selected compute node decrypts the "
+        "request to run inference and encrypts its response for the requesting browser. If you are "
+        "uncertain, say so. Do not claim or imply that you searched or browsed the web."
+    )
+    user_message = "RELAY_BOUNDARY_USER_PLAINTEXT"
+    assistant_message = "RELAY_BOUNDARY_ASSISTANT_PLAINTEXT"
+    plaintext_sentinels = (system_message, user_message, assistant_message)
+    compute_private_key, compute_public_key = generate_keys()
+    client_private_key, client_public_key = generate_keys()
+    compute_public_key_b64 = base64.b64encode(compute_public_key).decode("ascii")
+    client_public_key_b64 = base64.b64encode(client_public_key).decode("ascii")
+    control_payload = _api_v1_registered_control_payload(
+        client,
+        compute_public_key_b64,
+        capabilities=_capabilities("8k-fast"),
+    )
+
+    log_output = io.StringIO()
+    log_handler = logging.StreamHandler(log_output)
+    relay_module.LOGGER.addHandler(log_handler)
+    try:
+        request_messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ]
+        request_envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": "req-landing-system-message",
+            "api_v1_request": {"model": "test-model", "messages": request_messages},
+        }
+        request_ciphertext, request_cipherkey, request_iv = encrypt(
+            json.dumps(request_envelope).encode("utf-8"), compute_public_key
+        )
+        request_payload = {
+            "server_public_key": compute_public_key_b64,
+            "client_public_key": client_public_key_b64,
+            "request_id": request_envelope["request_id"],
+            "protocol": request_envelope["protocol"],
+            "version": request_envelope["version"],
+            "chat_history": base64.b64encode(request_ciphertext["ciphertext"]).decode("ascii"),
+            "cipherkey": base64.b64encode(request_cipherkey).decode("ascii"),
+            "iv": base64.b64encode(request_iv).decode("ascii"),
+            "cancel_token": "landing-cancel-proof",
+        }
+        queued = client.post("/api/v1/relay/requests", json=request_payload)
+        assert queued.status_code == 200
+        retrieval_credential = queued.get_json()["retrieval_credential"]
+
+        stored_requests = relay_module._api_v1_store().queued_requests(compute_public_key_b64)
+        assert len(stored_requests) == 1
+        diagnostics_while_queued = client.get("/relay/diagnostics").get_json()
+        polled = client.post("/api/v1/relay/servers/poll", json=control_payload)
+        assert polled.status_code == 200
+        polled_payload = polled.get_json()
+        decrypted_request = decrypt(
+            {
+                "ciphertext": base64.b64decode(polled_payload["ciphertext"]),
+                "iv": base64.b64decode(polled_payload["iv"]),
+            },
+            base64.b64decode(polled_payload["cipherkey"]),
+            compute_private_key,
+        )
+        assert decrypted_request is not None
+        assert json.loads(decrypted_request)["api_v1_request"]["messages"] == request_messages
+
+        response_envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": request_envelope["request_id"],
+            "message": {"role": "assistant", "content": assistant_message},
+        }
+        response_ciphertext, response_cipherkey, response_iv = encrypt(
+            json.dumps(response_envelope).encode("utf-8"), client_public_key
+        )
+        response_payload = {
+            "server_public_key": compute_public_key_b64,
+            "client_public_key": client_public_key_b64,
+            "request_id": request_envelope["request_id"],
+            "protocol": response_envelope["protocol"],
+            "version": response_envelope["version"],
+            "chat_history": base64.b64encode(response_ciphertext["ciphertext"]).decode("ascii"),
+            "cipherkey": base64.b64encode(response_cipherkey).decode("ascii"),
+            "iv": base64.b64encode(response_iv).decode("ascii"),
+            "control_credential": control_payload["control_credential"],
+            "claim_generation": polled_payload["claim_generation"],
+        }
+        submitted = client.post("/api/v1/relay/responses", json=response_payload)
+        assert submitted.status_code == 200
+        stored_responses = relay_module._api_v1_store().response_records()
+        assert len(stored_responses) == 1
+        diagnostics_with_response = client.get("/relay/diagnostics").get_json()
+
+        retrieved = client.post(
+            "/api/v1/relay/responses/retrieve",
+            json={
+                "client_public_key": client_public_key_b64,
+                "request_id": request_envelope["request_id"],
+                "retrieval_credential": retrieval_credential,
+            },
+        )
+        assert retrieved.status_code == 200
+        retrieved_payload = retrieved.get_json()
+        decrypted_response = decrypt(
+            {
+                "ciphertext": base64.b64decode(retrieved_payload["ciphertext"]),
+                "iv": base64.b64decode(retrieved_payload["iv"]),
+            },
+            base64.b64decode(retrieved_payload["cipherkey"]),
+            client_private_key,
+        )
+        assert decrypted_response is not None
+        assert json.loads(decrypted_response)["message"] == response_envelope["message"]
+
+        relay_owned_surfaces = (
+            request_payload,
+            queued.get_json(),
+            stored_requests,
+            diagnostics_while_queued,
+            polled_payload,
+            response_payload,
+            stored_responses,
+            diagnostics_with_response,
+            retrieved_payload,
+            log_output.getvalue(),
+        )
+        serialized_relay_surfaces = repr(relay_owned_surfaces)
+        for plaintext in plaintext_sentinels:
+            assert plaintext not in serialized_relay_surfaces
+    finally:
+        relay_module.LOGGER.removeHandler(log_handler)
 
 
 def test_api_v1_poll_fails_closed_if_server_unregistered_before_authoritative_claim(client, monkeypatch):

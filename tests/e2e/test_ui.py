@@ -11,6 +11,8 @@ import urllib.parse
 from playwright.sync_api import Page, expect
 import time
 
+from encrypt import decrypt, generate_keys
+
 
 
 SERVER_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
@@ -27,6 +29,16 @@ ALT_SERVER_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 alt-test-public-key
 -----END PUBLIC KEY-----"""
 ALT_SERVER_PUBLIC_KEY_B64 = base64.b64encode(ALT_SERVER_PUBLIC_KEY_PEM.encode("utf-8")).decode("ascii")
+
+LANDING_CHAT_SYSTEM_MESSAGE = (
+    "You are the assistant in the token.place landing-page chat. token.place connects people "
+    "who need generative-AI inference with people who contribute compute; a selected compute "
+    "node serves each request. The relay routes end-to-end encrypted request and response "
+    "envelopes and cannot read the conversation, while the selected compute node decrypts the "
+    "request to run inference and encrypts its response for the requesting browser. If you are "
+    "uncertain, say so. Do not claim or imply that you searched or browsed the web."
+)
+SYSTEM_MESSAGE = {"role": "system", "content": LANDING_CHAT_SYSTEM_MESSAGE}
 
 
 
@@ -1705,13 +1717,168 @@ def test_landing_chat_uses_api_v1_only_non_streaming(
     request_envelope = json.loads(state["relay_requests"][0]["ciphertext"])
     assert request_envelope["protocol"] == "tokenplace_api_v1_relay_e2ee"
     assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
-    assert request_envelope["api_v1_request"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert request_envelope["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "hello"},
+    ]
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
 
+@pytest.mark.e2e
+def test_landing_chat_system_message_builder_history_estimation_and_once_fallback(
+    page: Page, base_url: str, setup_servers
+):
+    """The request-only instruction is stable, hidden, estimated, and used by the direct fallback."""
+    state = route_landing_relay_chat(page, assistant_content="Direct fallback response.")
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    result = page.evaluate(
+        """
+        async ({ systemText, boundaryContent }) => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.chatHistory = [
+                { role: 'system', content: 'display-state system entry must be ignored' },
+                { role: 'user', content: 'prior question' },
+                { role: 'assistant', content: 'prior answer' },
+                { role: 'user', content: 'current question' }
+            ];
+            const messages = vm.createApiV1Messages('current question');
+            const historyBefore = JSON.parse(JSON.stringify(vm.chatHistory));
+            const withoutSystem = vm.estimateApiV1MessagesForAutoContextTier([
+                { role: 'user', content: boundaryContent }
+            ]);
+            const withSystem = vm.estimateApiV1MessagesForAutoContextTier([
+                { role: 'system', content: systemText },
+                { role: 'user', content: boundaryContent }
+            ]);
+            vm.chatHistory = [];
+            const fallbackResponse = await vm.sendMessageApiOnce('direct fallback');
+            const historyAfterFallback = JSON.parse(JSON.stringify(vm.chatHistory));
+            vm.startNewChatAfterSelectedServerFailure();
+            return {
+                messages,
+                historyBefore,
+                withoutSystem,
+                withSystem,
+                fallbackResponse,
+                historyAfterFallback,
+                historyAfterNewChat: vm.chatHistory,
+                bodyText: document.body.innerText
+            };
+        }
+        """,
+        {"systemText": LANDING_CHAT_SYSTEM_MESSAGE, "boundaryContent": "x" * 24544},
+    )
+
+    assert result["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "prior question"},
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "current question"},
+    ]
+    assert result["messages"].count(SYSTEM_MESSAGE) == 1
+    assert result["historyBefore"][0]["content"] == "display-state system entry must be ignored"
+    assert all(entry != SYSTEM_MESSAGE for entry in result["historyBefore"])
+    assert result["withoutSystem"]["resolvedContextTier"] == "8k-fast"
+    assert result["withSystem"]["resolvedContextTier"] == "64k-full"
+    assert result["historyAfterFallback"] == []
+    assert result["historyAfterNewChat"] == []
+    assert LANDING_CHAT_SYSTEM_MESSAGE not in result["bodyText"]
+
+    assert len(state["relay_requests"]) == 1
+    fallback_envelope = json.loads(state["relay_requests"][0]["ciphertext"])
+    assert fallback_envelope["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "direct fallback"},
+    ]
+
+
+@pytest.mark.e2e
+def test_landing_chat_system_message_is_inside_real_encryption(
+    page: Page, base_url: str, setup_servers
+):
+    """Decrypt only at a controlled compute boundary; relay payloads remain opaque."""
+    private_key, public_key = generate_keys()
+    public_key_b64 = base64.b64encode(public_key).decode("ascii")
+    state = route_landing_relay_chat(
+        page,
+        assistant_content="Encrypted boundary response.",
+        next_server_keys=[public_key_b64],
+        api_v1_responses=[
+            {"error": {"code": "compute_node_context_window_exceeded"}},
+            {"message": {"role": "assistant", "content": "Encrypted boundary response."}},
+            {"message": {"role": "assistant", "content": "Encrypted boundary response."}},
+        ],
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    # Responses in this focused route fixture are plaintext test envelopes. Keep the
+    # production request encryptor intact and replace only response decryption.
+    page.evaluate(
+        "document.querySelector('#app').__vue__.decrypt = async (ciphertext) => ciphertext"
+    )
+
+    for prompt in ("encrypted first turn", "encrypted second turn"):
+        assistant_count = page.locator(".assistant-message").count()
+        page.locator("textarea").first.fill(prompt)
+        wait_for_landing_send_enabled(page).click()
+        page.wait_for_function(
+            """
+            ({ expectedText, previousCount }) => {
+                const messages = document.querySelectorAll('.assistant-message');
+                return messages.length > previousCount && messages[messages.length - 1].textContent.includes(expectedText);
+            }
+            """,
+            arg={
+                "expectedText": "Encrypted boundary response.",
+                "previousCount": assistant_count,
+            },
+        )
+
+    assert len(state["relay_requests"]) == 3
+    decrypted_envelopes = []
+    for relay_payload in state["relay_requests"]:
+        plaintext = decrypt(
+            {
+                "ciphertext": base64.b64decode(relay_payload["ciphertext"]),
+                "iv": base64.b64decode(relay_payload["iv"]),
+            },
+            base64.b64decode(relay_payload["cipherkey"]),
+            private_key,
+        )
+        assert plaintext is not None
+        decrypted_envelopes.append(json.loads(plaintext))
+
+        serialized_relay_payload = json.dumps(relay_payload)
+        assert "encrypted first turn" not in serialized_relay_payload
+        assert "encrypted second turn" not in serialized_relay_payload
+        assert LANDING_CHAT_SYSTEM_MESSAGE not in serialized_relay_payload
+
+    expected_first_turn = [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "encrypted first turn"},
+    ]
+    assert decrypted_envelopes[0]["api_v1_request"]["messages"] == expected_first_turn
+    assert decrypted_envelopes[1]["api_v1_request"]["messages"] == expected_first_turn
+    assert decrypted_envelopes[0]["api_v1_request"]["routing"]["context_tier"] == "8k-fast"
+    assert decrypted_envelopes[1]["api_v1_request"]["routing"]["context_tier"] == "64k-full"
+    assert decrypted_envelopes[2]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "encrypted first turn"},
+        {"role": "assistant", "content": "Encrypted boundary response."},
+        {"role": "user", "content": "encrypted second turn"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in decrypted_envelopes
+    )
+
+
 def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url: str, setup_servers):
-    """A browser chat session selects one compute node once and reuses it across turns."""
+    """Each browser chat request selects a compute node while retaining history."""
 
     state = route_landing_relay_chat(page, assistant_content="Sticky relay response.")
 
@@ -1736,12 +1903,16 @@ def test_landing_chat_sticky_server_two_turns_and_key_label(page: Page, base_url
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").nth(1).wait_for(state="visible")
 
-    assert state["next_calls"] == 1
+    assert state["next_calls"] == 2
     assert len(state["relay_requests"]) == 2
     assert {payload["server_public_key"] for payload in state["relay_requests"]} == {SERVER_PUBLIC_KEY_B64}
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
-    assert envelopes[0]["api_v1_request"]["messages"] == [{"role": "user", "content": "first turn"}]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn"},
+    ]
     assert envelopes[1]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
         {"role": "user", "content": "first turn"},
         {"role": "assistant", "content": "Sticky relay response."},
         {"role": "user", "content": "second turn"},
@@ -1777,7 +1948,14 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     state = route_landing_relay_chat(
         page,
         assistant_content="Replacement server answered.",
-        next_server_keys=[SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64, ALT_SERVER_PUBLIC_KEY_B64],
+        next_server_keys=[
+            SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+        ],
         diagnostics_counts=[1, 2],
         **route_kwargs,
     )
@@ -1799,7 +1977,7 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     textarea.fill("second turn")
     wait_for_landing_send_enabled(page).click()
     page.locator(".assistant-message").nth(1).wait_for(state="visible")
-    assert state["next_calls"] == 1
+    assert state["next_calls"] == 2
     assert page.get_by_test_id("landing-server-key-label").inner_text() == first_label
 
     textarea.fill("third turn triggers failover")
@@ -1831,7 +2009,9 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
         """
     )
 
-    assert state["next_calls"] == 3
+    # Each of the four turns selects for its dispatch. The failed third turn
+    # additionally probes for a replacement before its retry dispatch selects.
+    assert state["next_calls"] == 6
     assert state["diagnostics_calls"] >= 2
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
         SERVER_PUBLIC_KEY_B64,
@@ -1843,10 +2023,19 @@ def test_landing_chat_sticky_server_auto_failover_preserves_history(
     envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
     retried_envelope = envelopes[3]
     assert retried_envelope["request_id"] != envelopes[2]["request_id"]
-    assert retried_envelope["api_v1_request"]["messages"][-1] == {
-        "role": "user",
-        "content": "third turn triggers failover",
-    }
+    assert retried_envelope["api_v1_request"]["messages"] == envelopes[2]["api_v1_request"]["messages"]
+    assert retried_envelope["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn"},
+        {"role": "assistant", "content": "Replacement server answered."},
+        {"role": "user", "content": "second turn"},
+        {"role": "assistant", "content": "Replacement server answered."},
+        {"role": "user", "content": "third turn triggers failover"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in (envelopes[2], retried_envelope)
+    )
     assert envelopes[4]["api_v1_request"]["messages"][-1] == {
         "role": "user",
         "content": "fourth turn stays sticky",
@@ -2556,7 +2745,19 @@ def test_landing_chat_decrypted_terminal_error_triggers_failover(
         SERVER_PUBLIC_KEY_B64,
         ALT_SERVER_PUBLIC_KEY_B64,
     ]
-    assert state["next_calls"] == 2
+    # The request-bound initial and retry selections surround one failover probe.
+    assert state["next_calls"] == 3
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[1]["request_id"] != envelopes[0]["request_id"]
+    assert envelopes[1]["api_v1_request"]["messages"] == envelopes[0]["api_v1_request"]["messages"]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "hello decrypted terminal"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in envelopes
+    )
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

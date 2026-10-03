@@ -2056,7 +2056,7 @@ def test_landing_chat_failover_no_servers_keeps_history(
     state = route_landing_relay_chat(
         page,
         assistant_content="Initial answer.",
-        next_statuses=[200, 503],
+        next_statuses=[200, 200],
         request_statuses=[200, 404],
         next_server_keys=[SERVER_PUBLIC_KEY_B64],
         diagnostics_count=1,
@@ -2084,8 +2084,20 @@ def test_landing_chat_failover_no_servers_keeps_history(
     assert "Initial answer." in body_text
     assert "second turn cannot fail over" in body_text
     assert "The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here." in body_text
-    assert state["next_calls"] == 1
+    assert state["next_calls"] == 2
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64]
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[0]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn remains visible"},
+    ]
+    assert envelopes[1]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn remains visible"},
+        {"role": "assistant", "content": "Initial answer."},
+        {"role": "user", "content": "second turn cannot fail over"},
+    ]
+    assert all(envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1 for envelope in envelopes)
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -2101,7 +2113,7 @@ def test_landing_chat_failover_rejects_repeated_same_server_after_stale_count_re
     state = route_landing_relay_chat(
         page,
         assistant_content="Initial answer remains visible.",
-        next_server_keys=[SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64, SERVER_PUBLIC_KEY_B64],
+        next_server_keys=[SERVER_PUBLIC_KEY_B64] * 4,
         request_statuses=[200, 404],
         diagnostics_counts=[1, 2],
     )
@@ -2133,12 +2145,20 @@ def test_landing_chat_failover_rejects_repeated_same_server_after_stale_count_re
     assert "The previous LLM server disconnected. No replacement LLM server accepted this request. Your chat history is still here." in body_text
 
     assert state["diagnostics_calls"] >= 2
-    assert state["next_calls"] == 3
+    assert state["next_calls"] == 4
     assert [payload["server_public_key"] for payload in state["relay_requests"]] == [
         SERVER_PUBLIC_KEY_B64,
         SERVER_PUBLIC_KEY_B64,
     ]
     assert len(state["relay_requests"]) == 2
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[1]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn survives"},
+        {"role": "assistant", "content": "Initial answer remains visible."},
+        {"role": "user", "content": "second turn terminal failure"},
+    ]
+    assert all(envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1 for envelope in envelopes)
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []
     assert state["chat_completions"] == []
@@ -2157,6 +2177,10 @@ def test_landing_chat_failover_rejects_all_terminally_failed_servers(
         assistant_content="Initial answer before replacement failure.",
         next_server_keys=[
             SERVER_PUBLIC_KEY_B64,
+            SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
+            ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
@@ -2198,8 +2222,22 @@ def test_landing_chat_failover_rejects_all_terminally_failed_servers(
         ALT_SERVER_PUBLIC_KEY_B64,
     ]
     assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    assert envelopes[2]["request_id"] != envelopes[1]["request_id"]
+    assert envelopes[2]["api_v1_request"]["messages"] == envelopes[1]["api_v1_request"]["messages"]
+    assert envelopes[2]["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn remains visible after replacement fails"},
+        {"role": "assistant", "content": "Initial answer before replacement failure."},
+        {"role": "user", "content": "second turn cannot revisit failed replacement"},
+    ]
+    assert all(
+        envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1
+        for envelope in (envelopes[1], envelopes[2])
+    )
     assert state["diagnostics_calls"] >= 2
-    assert state["next_calls"] == 6
+    expected_selection_count = 2 + 2 + (2 + 2)
+    assert state["next_calls"] == expected_selection_count
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []
     assert state["chat_completions"] == []
@@ -2224,6 +2262,7 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
             SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
             ALT_SERVER_PUBLIC_KEY_B64,
+            live_server_public_key_b64,
             live_server_public_key_b64,
         ],
         request_statuses=[200, 404, 404, 200],
@@ -2329,10 +2368,22 @@ def test_landing_chat_failover_skips_failed_replacements_until_live_candidate(
     ]
     assert request_server_keys.count(ALT_SERVER_PUBLIC_KEY_B64) == 1
     assert request_server_keys.count(live_server_public_key_b64) == 1
+    envelopes = [json.loads(payload["ciphertext"]) for payload in state["relay_requests"]]
+    failed_envelope = envelopes[1]
+    for replacement_envelope in envelopes[2:]:
+        assert replacement_envelope["request_id"] != failed_envelope["request_id"]
+        assert replacement_envelope["api_v1_request"]["messages"] == failed_envelope["api_v1_request"]["messages"]
+    assert failed_envelope["api_v1_request"]["messages"] == [
+        SYSTEM_MESSAGE,
+        {"role": "user", "content": "first turn remains visible before live candidate"},
+        {"role": "assistant", "content": "Recovered on the live third server."},
+        {"role": "user", "content": "second turn reaches an untried live server"},
+    ]
+    assert all(envelope["api_v1_request"]["messages"].count(SYSTEM_MESSAGE) == 1 for envelope in envelopes)
     assert active_diagnostics["max"] == 1
     assert queued_followups_at_recovery == 1
     assert diagnostics_calls_at_recovery == 3
-    assert state["next_calls"] == 5
+    assert state["next_calls"] == 6
     assert len(navigations) == initial_navigation_count
     assert state["v2_requests"] == []
     assert state["chat_completions"] == []

@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from urllib.parse import urlparse
@@ -488,6 +488,7 @@ class ComputeNodeRuntimeConfig:
     relay_port: Optional[int]
     use_configured_relay_fallbacks: bool = True
     relay_urls: Tuple[str, ...] = ()
+    registration_credentials: Optional[Dict[str, str]] = field(default=None, repr=False)
 
 
 LEGACY_RELAY_REQUIRED_FIELDS = frozenset({"client_public_key", "chat_history", "cipherkey", "iv"})
@@ -743,6 +744,7 @@ class ComputeNodeRuntime:
             model_manager=self.model_manager,
             include_configured_servers=runtime_config.use_configured_relay_fallbacks,
             explicit_relay_urls=runtime_config.relay_urls[1:],
+            registration_credentials=runtime_config.registration_credentials,
         )
         if request_adapters is None:
             self.request_adapters = [
@@ -1115,6 +1117,7 @@ class ComputeNodeRuntime:
                             self.crypto_manager,
                             self.model_manager,
                             include_configured_servers=False,
+                            registration_credentials={},
                         )
                     smoke_envelope = generation_client._generate_api_v1_response_with_runtime_model(
                         request_id="api-v1-readiness-smoke",

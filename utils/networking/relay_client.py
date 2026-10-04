@@ -24,6 +24,9 @@ from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
 
 from utils.networking.http_requests_compat import requests
+from utils.networking.relay_credentials import (
+    canonical_relay_url, load_registration_credentials, validate_registration_credentials,
+)
 from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
 from utils.llm.model_profiles import build_model_aliases
 
@@ -151,7 +154,7 @@ class _ApiV1ProgressPublisher:
             "ciphertext": encrypted["chat_history"], "cipherkey": encrypted["cipherkey"], "iv": encrypted["iv"],
         }
         kwargs = {"json": payload, "timeout": 2.0}
-        headers = self.owner._auth_headers()
+        headers = self.owner._auth_headers(self.relay_url)
         if headers:
             kwargs["headers"] = headers
         return self.owner._build_api_v1_url(self.relay_url, "/relay/progress"), kwargs
@@ -854,16 +857,6 @@ def _sanitize_relay_target(relay_url: Any) -> str:
     return urlunparse((parsed.scheme, f"{host}{port}", "", "", "", ""))
 
 
-def _normalise_registration_token(value: Optional[str]) -> Optional[str]:
-    """Normalise optional registration tokens from config or environment."""
-
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped:
-            return stripped
-    return None
-
-
 def _coerce_optional_bool(value: Optional[Any]) -> Optional[bool]:
     """Interpret truthy values from config/environment settings."""
 
@@ -1133,6 +1126,7 @@ class RelayClient:
         *,
         include_configured_servers: bool = True,
         explicit_relay_urls: Optional[Sequence[str]] = None,
+        registration_credentials: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the RelayClient.
@@ -1147,6 +1141,8 @@ class RelayClient:
                 and relay cluster-only mode. When False, use only the explicit base relay.
             explicit_relay_urls: Additional explicit relay URLs supplied by the desktop
                 start request. These are included even when configured fallbacks are disabled.
+            registration_credentials: Pre-resolved URL-to-token bindings. None loads
+                configuration; an explicit empty map disables credential inheritance.
         """
         self.base_url = base_url
         self.port = port
@@ -1156,7 +1152,7 @@ class RelayClient:
         self.stop_polling = True  # Flag to control polling loop - starts as True so loop won't run until explicitly started
         self._polling_stopped_by_request = False
         self._api_v1_control_wakeup = threading.Event()
-        self._registration_token: Optional[str] = None
+        config = None
         self._api_v1_write_benchmark_stage("python_handoff_received")
         configured_servers: List[Any] = []
         self._cluster_only = False
@@ -1189,11 +1185,6 @@ class RelayClient:
                     self._cluster_only = parsed_cluster_only
                 elif isinstance(cluster_only_value, bool):
                     self._cluster_only = cluster_only_value
-
-            token_value = config.get('relay.server_registration_token', None)
-            if not token_value:
-                token_value = os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
-            self._registration_token = _normalise_registration_token(token_value)
 
         except Exception:
             self._request_timeout = 10  # Fallback default
@@ -1236,9 +1227,11 @@ class RelayClient:
                         if entry and entry not in configured_servers:
                             configured_servers.append(entry)
 
-            self._registration_token = _normalise_registration_token(
-                os.environ.get('TOKEN_PLACE_RELAY_SERVER_TOKEN')
-            )
+        # Do not catch validation errors or infer a credential target from a child runtime.
+        self._registration_credentials = (
+            load_registration_credentials(config) if registration_credentials is None
+            else validate_registration_credentials(registration_credentials)
+        )
 
         if explicit_relay_urls:
             for entry in explicit_relay_urls:
@@ -1477,9 +1470,10 @@ class RelayClient:
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
         """Normalise relay targets into canonical URLs."""
 
-        base = (base_url or '').strip()
+        base = base_url or ''
         if not base:
             return ''
+        canonical_relay_url(base if '://' in base else f'http://{base}', require_secure=False)
         base = base.rstrip('/')
 
         parsed = urlparse(base if '://' in base else f'http://{base}')
@@ -1586,12 +1580,11 @@ class RelayClient:
 
         return tuple(self._relay_urls)
 
-    def _auth_headers(self) -> Dict[str, str]:
-        """Return authentication headers when a registration token is configured."""
-
-        if not self._registration_token:
-            return {}
-        return {"X-Relay-Server-Token": self._registration_token}
+    def _auth_headers(self, relay_url: str) -> Dict[str, str]:
+        """Look up admission proof for the actual destination, never the active index."""
+        target = canonical_relay_url(relay_url, require_secure=False)
+        token = self._registration_credentials.get(target)
+        return {"X-Relay-Server-Token": token} if token else {}
 
     def reset_api_v1_polling_session(self, *, clear_registration: bool = False) -> None:
         """Reset stop/unregister state before a fresh API v1 polling session.
@@ -1726,7 +1719,7 @@ class RelayClient:
                 request_kwargs = {
                     'json': payload,
                 }
-                headers = self._auth_headers()
+                headers = self._auth_headers(candidate_url)
                 if headers:
                     request_kwargs['headers'] = headers
 
@@ -1854,7 +1847,7 @@ class RelayClient:
                     'json': {'server_public_key': self.crypto_manager.public_key_b64},
                     'timeout': self._request_timeout,
                 }
-                headers = self._auth_headers()
+                headers = self._auth_headers(candidate_url)
                 if headers:
                     request_kwargs['headers'] = headers
 
@@ -1997,7 +1990,7 @@ class RelayClient:
         path = parsed_url.path or "/"
         headers = _api_v1_response_headers(response)
         secrets = (
-            self._registration_token or "",
+            *self._registration_credentials.values(),
             getattr(self.crypto_manager, "public_key_b64", ""),
             self._api_v1_control_credential_for_request_url(url),
         )
@@ -2136,7 +2129,7 @@ class RelayClient:
         if control_credential:
             payload['control_credential'] = control_credential
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
-        headers = self._auth_headers()
+        headers = self._auth_headers(target_url)
         if headers:
             request_kwargs['headers'] = headers
         register_url = self._build_api_v1_url(target_url, "/relay/servers/register")
@@ -2407,7 +2400,7 @@ class RelayClient:
                     poll_wait,
                     request_kwargs['timeout'],
                 )
-                headers = self._auth_headers()
+                headers = self._auth_headers(candidate_url)
                 if headers:
                     request_kwargs['headers'] = headers
 
@@ -2638,7 +2631,7 @@ class RelayClient:
             'json': payload,
             'timeout': timeout_seconds if timeout_seconds is not None else self._request_timeout,
         }
-        headers = self._auth_headers()
+        headers = self._auth_headers(relay_url)
         if headers:
             request_kwargs['headers'] = headers
         control_url = self._build_api_v1_url(relay_url, '/relay/servers/control')
@@ -3112,7 +3105,7 @@ class RelayClient:
             request_kwargs = {
                 "json": source_payload,
             }
-            headers = self._auth_headers()
+            headers = self._auth_headers(self._api_v1_response_relay_url())
             if headers:
                 request_kwargs["headers"] = headers
 
@@ -5788,7 +5781,7 @@ class RelayClient:
                     'json': chunk_payload,
                     'timeout': self._request_timeout,
                 }
-                headers = self._auth_headers()
+                headers = self._auth_headers(self.relay_url)
                 if headers:
                     request_kwargs['headers'] = headers
 
@@ -5830,7 +5823,7 @@ class RelayClient:
                 'json': source_payload,
                 'timeout': self._request_timeout,
             }
-            headers = self._auth_headers()
+            headers = self._auth_headers(self.relay_url)
             if headers:
                 request_kwargs['headers'] = headers
 

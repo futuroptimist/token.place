@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from utils.networking.relay_credentials import canonical_relay_url, RelayCredentialError
+
 
 class RequestException(Exception):
     pass
@@ -69,6 +71,12 @@ def _normalize_headers(resp: Any) -> Dict[str, str]:
     return {str(k).lower(): str(v) for k, v in hdrs.items()}
 
 
+class _NoRedirect(urllib_request.HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+
 def _request(
     method: str,
     url: str,
@@ -77,6 +85,7 @@ def _request(
     headers: Optional[Dict[str, str]] = None,
     timeout: Optional[float] = None,
     stream: bool = False,
+    allow_redirects: bool = True,
 ) -> _Response:
     body = None
     req_headers = dict(headers or {})
@@ -85,7 +94,19 @@ def _request(
         req_headers.setdefault("Content-Type", "application/json")
     req = urllib_request.Request(url=url, data=body, headers=req_headers, method=method)
     try:
-        resp = urllib_request.urlopen(req, timeout=timeout)  # nosec B310 - relay URLs are app-configured network endpoints
+        credential_bearing = any(
+            key.lower() in {"x-relay-server-token", "authorization", "cookie"}
+            for key in req_headers
+        ) or bool(json_payload and "control_credential" in json_payload)
+        if credential_bearing:
+            try:
+                canonical_relay_url(url)
+            except RelayCredentialError:
+                raise RequestException("Credential-bearing requests require a valid HTTPS or explicit loopback URL.") from None
+        if credential_bearing or not allow_redirects:
+            resp = urllib_request.build_opener(_NoRedirect()).open(req, timeout=timeout)
+        else:
+            resp = urllib_request.urlopen(req, timeout=timeout)  # nosec B310 - app-configured endpoints
         if stream:
             return _Response(
                 status_code=getattr(resp, "status", 200),
@@ -115,12 +136,12 @@ class _CompatRequests:
     Timeout = Timeout
 
     @staticmethod
-    def post(url: str, json: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, headers: Optional[Dict[str, str]] = None, **_: Any) -> _Response:
-        return _request("POST", url, json_payload=json, headers=headers, timeout=timeout)
+    def post(url: str, json: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, headers: Optional[Dict[str, str]] = None, allow_redirects: bool = True, **_: Any) -> _Response:
+        return _request("POST", url, json_payload=json, headers=headers, timeout=timeout, allow_redirects=allow_redirects)
 
     @staticmethod
-    def get(url: str, timeout: Optional[float] = None, headers: Optional[Dict[str, str]] = None, stream: bool = False, **_: Any) -> _Response:
-        return _request("GET", url, headers=headers, timeout=timeout, stream=stream)
+    def get(url: str, timeout: Optional[float] = None, headers: Optional[Dict[str, str]] = None, stream: bool = False, allow_redirects: bool = True, **_: Any) -> _Response:
+        return _request("GET", url, headers=headers, timeout=timeout, stream=stream, allow_redirects=allow_redirects)
 
 
 requests = _CompatRequests()

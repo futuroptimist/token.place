@@ -2517,6 +2517,8 @@ def test_run_supplies_stop_requested_as_runtime_cancellation_predicate(monkeypat
 
 
 def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS',
+                       '{"http://127.0.0.1:5010":"synthetic-admission"}')
     _reset_cancel_queue()
     captured = {'configs': []}
 
@@ -2582,6 +2584,9 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
         ('http://127.0.0.1:5010',),
         ('https://staging.token.place',),
     ]
+    assert all(config.registration_credentials == {
+        'http://127.0.0.1:5010': 'synthetic-admission'
+    } for config in captured['configs'])
     assert unexpected_attempts == []
 
 
@@ -3676,6 +3681,17 @@ def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
     )
     (utils_dir / 'path_handling.py').write_text(
         (repo_utils / 'path_handling.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    networking = utils_dir / 'networking'
+    networking.mkdir()
+    (networking / '__init__.py').write_text('')
+    (networking / 'relay_credentials.py').write_text(
+        (repo_utils / 'networking' / 'relay_credentials.py').read_text(), encoding='utf-8'
+    )
+    (import_root / 'config.py').write_text(
+        'from types import SimpleNamespace\ndef get_config():\n'
+        '    return SimpleNamespace(get=lambda key, default=None: default)\n',
         encoding='utf-8',
     )
     (utils_dir / 'compute_node_runtime.py').write_text(

@@ -743,29 +743,49 @@ relay operators can verify who is online. The legacy `PERSONAL_GAMING_PC_URL`
 variable still works; it is treated as shorthand for a single-entry upstream
 list.
 
-#### Zero-trust relay verification
+#### Relay compute admission credentials
 
-`token.place` now ships with an opt-in challenge/response layer for compute
-nodes. Set `TOKEN_PLACE_RELAY_SERVER_TOKEN` before launching the relay and
-for deprecated legacy `/sink` or `/source` compatibility flows only, include an `X-Relay-Server-Token`
-header that matches the configured value. Requests missing the header are
-rejected with an HTTP 401 so unknown machines can no longer impersonate
-trusted servers. Sensitive tokens are stripped when saving config files, so
-store them in environment variables instead of `config.json`.
-
-The bundled `RelayClient` automatically reads the same configuration and sends
-the header, so volunteer operators only need to export the token once:
+A relay may require a compute registration token. Relay-side accepted tokens use
+`TOKEN_PLACE_RELAY_SERVER_TOKEN` or `TOKEN_PLACE_RELAY_SERVER_TOKENS`. On compute
+nodes, bind each token to its trusted relay base URL **before** starting the runtime:
 
 ```sh
-export TOKEN_PLACE_RELAY_SERVER_TOKEN="rotate-me-often"
-python relay.py --host 0.0.0.0
-# on the compute node
-python server.py --relay_url http://relay.example.com --relay_port 5010
+export TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS='{"https://example.com":"<relay-a-token>"}'
+python server.py --relay_url https://example.com
 ```
 
-Clients remain zero-auth: they never see or transmit the relay token. This
-keeps the network open for end users while letting operators quarantine
-suspicious server nodes using cryptography instead of static passwords.
+The equivalent in-memory config key is `relay.registration_credentials`, a
+URL-to-token object. It is redacted when saving config, as is the legacy token.
+Tokens must be nonempty printable ASCII without whitespace. Neither logs nor
+configuration exports should contain token values.
+
+Each relay receives only its own configured token. Unlisted relays receive no
+registration header and work when that relay permits open compute admission.
+Reordering targets, adding fallback relays, and desktop runtime fan-out do not
+change credential ownership. Any self-hosted HTTPS relay is supported; there is
+no token.place-only allowlist.
+
+To migrate `TOKEN_PLACE_RELAY_SERVER_TOKEN`, also set
+`TOKEN_PLACE_RELAY_SERVER_TOKEN_URL` to the exact trusted relay base URL
+(config: `relay.server_registration_token_url`), or remove the legacy token and
+use the map above. An unscoped legacy token is refused even for one target, so a
+later target change cannot silently transfer it. Duplicate canonical bindings
+and conflicting legacy/map entries are refused with redacted errors.
+
+Bindings include scheme, host, port and base path. Host case, default ports and a
+trailing slash are canonicalized; different base paths, ports, schemes and hosts
+remain separate. Userinfo, queries, fragments, encoded/ambiguous paths and invalid
+ports are rejected. Credential-bearing requests require HTTPS, except explicitly
+configured `http://localhost`, loopback IPv4 or `[::1]` development URLs. Wildcard
+and remote HTTP addresses are not credential destinations. Registration headers
+and per-relay owner-control proofs never follow HTTP redirects, including
+same-origin redirects; configure the final relay base URL directly.
+
+Registration tokens grant compute admission. Owner-control credentials remain
+separate and relay-specific; relay-blind E2EE remains unchanged. The packaged
+desktop launcher still clears inherited environment variables and exposes no
+registration-token settings field. These environment examples apply to CLI/direct
+Python launches, not a new packaged desktop credential feature.
 
 Once that upstream list is stable, export `TOKEN_PLACE_RELAY_CLUSTER_ONLY=1`
 before launching `server.py`. The background `RelayClient` will refuse to talk
@@ -1174,11 +1194,11 @@ For deployments that need to relocate the queue file, set `TOKEN_PLACE_CONTRIBUT
 
 Once an operator is ready to host `server.py`, generate an invitation token and expose it to the relay by
 setting `TOKEN_PLACE_RELAY_SERVER_TOKENS` (comma or newline delimited) before launching `relay.py`.
-Each joined node must supply the matching token via the `TOKEN_PLACE_RELAY_SERVER_TOKEN` environment
-variable, which the legacy relay client forwards to deprecated `/sink` and `/source` endpoints as the
-`X-Relay-Server-Token` header. Requests without a valid token are rejected, preventing uninvited nodes
-from queueing or retrieving encrypted workloads while still keeping the workflow simple for approved
-operators.
+Each joined node must bind its token to the relay's trusted HTTPS base URL using
+`TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS`, as described in
+[Relay compute admission credentials](#relay-compute-admission-credentials).
+The compute client supplies the matching `X-Relay-Server-Token` header on API v1
+requests; per-relay owner-control proof remains a separate requirement.
 
 #### Community Contribution Summary
 ```

@@ -167,6 +167,8 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_compute_node_status_keeps_first_paint_footprint_when_loading_label_is_blank",
     "tests/e2e/test_ui.py::test_landing_hydrates_compute_status_and_models_without_layout_jump",
     "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming",
+    "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_ui_semantics",
+    "tests/e2e/test_ui.py::test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal_lifecycle_cleanup",
     "tests/e2e/test_ui.py::test_landing_chat_system_message_builder_history_estimation_and_once_fallback",
     "tests/e2e/test_ui.py::test_landing_chat_system_message_is_inside_real_encryption",
     "tests/e2e/test_ui.py::test_landing_chat_timeout_cancels_relay_request_once",

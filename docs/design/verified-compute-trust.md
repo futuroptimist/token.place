@@ -2,8 +2,9 @@
 
 Status: proposed design, requested by Daniel; no runtime changes or deployment.
 K061 remains the kanban tracking item; the coordinating task owns its board updates.
-K069 owns the coordinated authenticated-envelope migration. Neither is implemented
-by this document. This design is separate from staging-shadow and relay-state ADR work.
+K069 owns the coordinated authenticated-envelope migration. Daniel requires a
+coordinated encryption design first, preserving the relay-blind goal for token.place,
+DSPACE and Gabriel. None of these migrations is implemented by this document. This design is separate from staging-shadow and relay-state ADR work.
 
 ## Problem and evidence
 
@@ -120,6 +121,38 @@ only. Clearing state/reinstall requires bootstrap again and must not erase rollb
 protection silently. Root compromise requires independent recovery, not signatures
 from the compromised root alone.
 
+### Who enrolls, and supported versus self-hosted setup
+
+Compute operators enroll their node encryption/signing keys under their own chosen
+operator root/issuer and maintain issuance, revocation, rotation and recovery. A
+relay operator does not acquire compute trust merely by hosting routing services.
+An operator running both roles must still distinguish compute plaintext processing
+from relay-owned state; co-location does not authorize plaintext relay ingress.
+
+On the client side, the person choosing where prompts may be decrypted selects the
+allowed operator roots: an individual user, or an organization's authorized client
+administrator distributing an explicit policy. DSPACE, Python, desktop and Gabriel
+adapters consume that policy. Enrollment is local trust configuration, not a
+mandatory token.place user account, relay account or central identity service.
+Do not ask ordinary users to create or custody an operator root private key.
+
+For a supported default deployment, a trusted client release or independently
+verified operator setup channel can offer a documented root bundle and operator
+identity. Setup must explain who receives plaintext and record the user's choice
+(or show the administrator-managed policy). The default relay URL is a convenience,
+not trust evidence; relay-fetched mutable configuration cannot silently add roots.
+Which operators/bundles ship as supported choices, their provenance and update
+owners must be approved at the coordination gate, not guessed by this proposal.
+
+For an arbitrary self-hosted relay such as `https://example.com`, configure its URL
+and independently import the chosen compute operator's bundle/fingerprint. Those
+operators may be the user's own nodes or third parties. The same verification,
+revocation, rotation and recovery rules apply; there is no central relay allowlist.
+Switching relays may preserve operator trust, while changing operators requires
+explicit policy enrollment. A missing root is a setup failure, not a reason to send
+plaintext. Recovery after lost policy or root compromise repeats independent
+bootstrap; a relay cannot repair trust by offering a new root without verification.
+
 ## Protocol direction and K069 contract
 
 Use established schemes through maintained libraries. The preferred review profile
@@ -220,10 +253,46 @@ an explicit compatibility selection before resuming. Policy and labels must be c
 landing-page clients. Trusted-relay mode is a documented threat-model choice, not
 an assertion of protection against its trusted relay becoming malicious.
 
+## Cross-repository coordination before implementation
+
+Preserve the relay-blind goal across token.place, DSPACE and Gabriel: client-side
+encryption terminates at the selected, verified compute node, which necessarily
+decrypts for inference. Relay-owned request handling, storage, logs and diagnostics
+must remain ciphertext-only plus safe routing metadata. An OpenAI-compatible API
+shape or HTTPS hop does not change where plaintext terminates.
+
+K085 option 1, documenting Gabriel's current HTTPS plaintext-to-relay behavior
+honestly, is an interim disclosure, not final privacy acceptance or an encrypted
+compatibility mode. It must not be labeled relay-blind, verified compute or E2EE.
+That disclosure does not authorize a new plaintext path in token.place or weaken
+its existing guards. Gabriel's adapter migration must encrypt before relay ingress;
+placing an encrypting adapter behind a plaintext relay endpoint does not meet the
+shared goal. A locally trusted adapter may process plaintext within the client's
+trust boundary, provided its placement and delivery are explicit.
+
+| Owner/surface | Coordinated design obligation before shipping verified mode |
+| --- | --- |
+| K061 / token.place design | Agree threat boundaries, operator trust enrollment, delivery trust, lifecycle and mode semantics. |
+| K069 / token.place protocol and compute | Specify authenticated envelope, descriptor/issuer rules, strict parsing and replay behavior; publish shared cross-language vectors and compatibility matrix. |
+| DSPACE client | Enroll/consume the user or administrator trust policy, verify before encryption and after decryption, preserve model/tier semantics, and audit its independent web delivery. |
+| Gabriel client adapter | Design pre-relay encryption and compute verification using the same profile and trust modes; identify the local plaintext boundary and migrate from the honestly disclosed K085 interim path. |
+| Compute operators and client maintainers | Provision node certificates, publish fresh revocation, rehearse rotation/recovery, and define supported bootstrap bundles without requiring central accounts. |
+
+Agree the wire profile and lifecycle before independent repositories implement
+incompatible variants. The release gate requires token.place compute plus DSPACE,
+Python/desktop and Gabriel adapter interoperability against shared vectors, a
+client-delivery review for each, and explicit behavior for every old/new pair.
+A client without the required encryption adapter cannot claim the goal is met:
+verified dispatch remains unavailable until migration passes. Trusted-relay
+compatibility in this document still requires encrypted API v1 payloads; it cannot
+be used to approve Gabriel's interim plaintext-to-relay path. Rollout dependencies
+and approvals must be tracked on K061/K069 and the Gabriel migration work by their
+coordinators. This PR changes token.place documentation only.
+
 ## Stages, dependencies and review gates
 
 1. **Design gate (this PR):** approve threat model, independent-root preference,
-   compatibility labels and ownership with K061/K069 reviewers. Parent coordinator
+   compatibility labels and ownership with K061/K069, DSPACE and Gabriel reviewers. Parent coordinator
    links this PR and follow-ups on K061; board tracking does not mean implementation
    is complete. No deployment is authorized by this design.
 2. **Protocol gate:** cryptographic review of the selected profile, exact schema,
@@ -284,6 +353,10 @@ Existing invariant tests remain mandatory; proposed cases are not yet implemente
 - Check bootstrap cancellation, fingerprint mismatch, explicit compatibility labels,
   TOFU first-use limitation and trust-store reset. Demonstrate the mutable-JS threat
   in an isolated fixture and verify the chosen independent delivery boundary.
+- Run the same substitution/forged-response/downgrade vectors through the Gabriel
+  adapter and DSPACE as well as Python/desktop. Assert synthetic plaintext never
+  reaches relay ingress, including adapter misplacement and old-client migration
+  failures; HTTPS-only plaintext must not pass as encrypted compatibility.
 - Retain ciphertext-only queue/log/diagnostic/egress sentinel assertions and disabled
   historical plaintext-route tests. No negative test may introduce a plaintext
   production fallback or re-enable deprecated endpoints.

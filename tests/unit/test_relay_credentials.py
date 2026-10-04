@@ -204,3 +204,24 @@ def test_unscoped_token_aborts_multi_relay_before_transport(monkeypatch, caplog)
         RelayClient("https://a.example", None, Mock(), Mock(), explicit_relay_urls=["https://b.example"])
     assert "synthetic-unscoped" not in str(caught.value) + caplog.text
     assert "TOKEN_PLACE_RELAY_SERVER_TOKEN_URL" in str(caught.value)
+
+
+@pytest.mark.parametrize("host", ["a..example", "a.-label.example", "a.label-.example", "a." + "x" * 64 + ".example"])
+def test_malformed_dns_labels_cannot_receive_credentials(host, caplog):
+    with pytest.raises(RelayCredentialError, match="Invalid relay URL") as caught:
+        validate_registration_credentials({f"https://{host}": "synthetic-admission"})
+    assert host not in str(caught.value) + caplog.text
+    assert "synthetic-admission" not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("legacy_token", ["synthetic-mapped", "synthetic-legacy"])
+def test_legacy_and_map_collision_is_rejected_even_for_same_token(monkeypatch, caplog, legacy_token):
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS", json.dumps({
+        "https://a.example/team": "synthetic-mapped",
+    }))
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", legacy_token)
+    monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN_URL", "https://A.example:443/team/")
+    with pytest.raises(RelayCredentialError, match="configure only one") as caught:
+        load_registration_credentials()
+    for token in ("synthetic-mapped", legacy_token):
+        assert token not in str(caught.value) + caplog.text

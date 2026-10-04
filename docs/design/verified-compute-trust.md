@@ -56,7 +56,10 @@ or observation of permitted routing metadata. The chosen compute operator still
 receives plaintext and can retain it or return misleading model output. Signatures
 prove key possession/authorization, not hardware attestation, correct inference,
 model provenance, or an operator's privacy practices. Compromised trusted roots,
-compute endpoints and client devices remain outside that guarantee.
+compute endpoints and client devices remain outside that guarantee. Request continuity
+is not client admission: anyone knowing the compute public key can submit a new
+request under their own ephemeral client key, including a malicious relay. Compute
+client authorization, abuse controls and rate limits need separate operator policy.
 
 Client delivery is part of the trust boundary. A malicious relay serving mutable
 JavaScript can replace the verifier, trust settings and UI before encryption.
@@ -65,7 +68,10 @@ trusted web origin distinct from the untrusted relay, with a reviewed update cha
 TLS or a checksum served by the same malicious origin is insufficient. Self-hosted
 clients are supported; trusting their delivery is an explicit user responsibility.
 The relay landing page cannot claim malicious-relay resistance merely by adding JS
-signature checks to code the relay can replace.
+signature checks to code the relay can replace. DSPACE may serve as the independent
+trusted web origin only when the user trusts its deploying party and update chain.
+Audit its build provenance and asset delivery; SRI supplied by mutable hostile HTML
+does not establish that trust by itself.
 
 ## Bootstrap and operator lifecycle
 
@@ -87,6 +93,8 @@ ID, distinct encryption and signing public keys, key IDs, allowed protocol suite
 validity times, generation/epoch and delegation scope. A self-signature by a newly
 advertised key is not independent identity. Keep roots offline where practical;
 use constrained issuing keys if operationally necessary and bound chain depth.
+Clients enforce every delegation constraint (including node and model scope) during
+chain validation; compute enforces its configured scope before accepting work.
 
 Planned rotation uses signed successor descriptors and bounded overlap. Pin trust
 roots rather than individual short-lived compute keys; retain the selected key
@@ -99,7 +107,14 @@ independently configured operator channel; relay mirrors are untrusted caches.
 Persist the highest accepted epoch, reject rollback, enforce freshness using a
 trusted clock with a specified skew bound, and fail closed once cached status
 expires. A relay can suppress updates, so revocation has a bounded freshness window,
-not instantaneous effect. Recheck validity/revocation before accepting a response;
+not instantaneous effect. A self-hosted operator may co-host a signed snapshot
+mirror with its relay: a separate hostname is not the security proof. Root-authorized
+signatures, persisted epochs and bounded expiry are required even for independent
+channels. Co-hosting permits suppression until cached status expires; after that,
+verified mode stops, rather than using descriptor lifetime as a silent revocation
+bypass. Review an independent update path for availability and emergency recovery.
+The client local clock is trusted for these checks; detected rollback, excessive
+skew or uncertainty fails closed. Recheck validity/revocation before accepting a response;
 revoked in-flight work fails closed. Offline clients may use unexpired cached policy
 only. Clearing state/reinstall requires bootstrap again and must not erase rollback
 protection silently. Root compromise requires independent recovery, not signatures
@@ -115,6 +130,10 @@ certification and transcript authentication. HPKE base mode alone is not sender
 authentication. K069 and security review must approve the composition, libraries
 and cross-language vectors before implementation; this is not a new deployed suite.
 Do not hand-roll cryptographic primitives or reuse RSA encryption keys for signing.
+Existing RSA-only clients cannot satisfy this verified profile: they must upgrade
+or explicitly choose trusted-relay compatibility. Browser support for the complete
+HPKE/Ed25519 library stack is a release gate; do not assume native WebCrypto support
+across every supported engine.
 
 Define one versioned wire profile jointly with K069. Specify exact signed bytes,
 domain separation for descriptors/requests/responses/progress, algorithm IDs,
@@ -144,7 +163,9 @@ Proposed transcript requirements (field names are design concepts, not an API):
   authenticated transcript and reject discrepancies. Relay reservation/control
   credentials remain separate; they are not operator certificates.
 - Compute maintains bounded replay state for accepted client-key/nonce pairs through
-  expiry, with an explicit restart/persistence and idempotent retry policy. Reject
+  expiry, with an explicit restart/persistence and idempotent retry policy. Enforce
+  a short, bounded maximum request lifetime independent of client-supplied expiry;
+  cache limits and admission limits must prevent unbounded state growth. Reject
   replay after expiry; never repeat inference merely because relay state reset.
   Client accepts at most one terminal response per outstanding request. Progress
   uses the same authenticated request binding plus monotonic sequence numbers;
@@ -154,6 +175,23 @@ Proposed transcript requirements (field names are design concepts, not an API):
   legacy CBC/PKCS#1 v1.5 data must fail in verified mode, never trigger fallback.
   Failover creates a fresh attempt/nonce and re-verifies the new operator; retries
   must remain within the user's allowed operator set.
+
+Current Python dispatch fields need the following explicit K069 treatment. This
+maps the existing provider payload; it does not freeze a future schema or require
+publishing currently encrypted values outside the envelope.
+
+| Current field | Proposed treatment |
+| --- | --- |
+| `protocol`, `version`, `request_id` | Bind inside authenticated transcript; validate any outer copy. Envelope revision/suite must be explicit. |
+| `client_public_key`, `server_public_key` | Bind recipient/sender key identities inside; replace legacy key representation under the new profile and reject outer substitutions. |
+| `requested_model`, `requested_context_tier` | Relay selection hints are untrusted. Bind the client's actual accepted model/tier policy inside; reject conflicting outer copies. |
+| `request_deadline_epoch` | Relay scheduling hint, not a security clock or authority to extend lifetime. Client/compute enforce authenticated expiry and their own maximum lifetime. |
+| `cancel_token`, `reservation_token` | Outer relay control/admission values, not identity proof. Do not reuse as crypto secrets; relay denial/cancellation remains an availability boundary. |
+| `chat_history`, `cipherkey`, `iv` | Current encrypted container; K069 replaces it with a versioned authenticated container. No legacy-container fallback in verified mode. |
+
+The current [Python provider dispatch](../../api/v1/compute_provider.py) is the
+source of this field list. K069 must also inventory DSPACE, desktop, response and
+progress variants before freezing the schema, preserving their request binding.
 
 K061 owns identity/bootstrap/policy; K069 owns the authenticated envelope and
 cross-language migration. Neither signed discovery alone nor AEAD alone closes
@@ -168,14 +206,17 @@ forward-secrecy claim after recipient private-key compromise.
 | --- | --- |
 | Verified compute (new-client default) | Requires independent roots, fresh authorization and the approved authenticated suite. Unknown/expired/revoked keys, invalid signatures, replay, mismatched transcript or unsupported suites stop dispatch/acceptance. Show a bounded diagnostic without prompts or decrypted output. |
 | Trusted-relay compatibility | Explicit per-profile opt-in for an existing deployment that still relies on relay-selected keys. Persist a visible “relay trusted for compute identity” label and warn before sending. Preserve encrypted API v1 and existing safeguards; no plaintext or legacy-route fallback. |
-| Optional TOFU | Explicit weaker choice that pins the first observed operator/root fingerprint. It cannot detect a malicious first relay or first-use substitution. Subsequent unexplained changes block; storage loss/reinstall loses continuity. Independently confirming the fingerprint is required to upgrade to verified status. |
+| Optional TOFU | Explicit weaker choice that pins the first observed operator/root fingerprint. It cannot detect a malicious first relay, first operator-bundle source or first-use substitution. Subsequent unexplained changes block; storage loss/reinstall loses continuity. Independently confirming the fingerprint is required to upgrade to verified status. |
 
 Never convert verified mode to compatibility/TOFU after a timeout or failure.
 An explicit user policy change may create a compatibility profile; it must not be
 an automatic retry of already queued prompts. Trust errors offer inspect/import,
 choose another already trusted operator, or cancel; no generic “ignore” button.
 Existing installations need an informed migration choice, not silent relabeling as
-verified. Policy and labels must be consistent across DSPACE, Python, desktop and
+verified. On upgrade, an installation without an explicit saved trust-mode choice
+blocks new dispatch until setup is completed; it does not auto-consent to trusted
+relay mode. Explain this pause in release notes, preserve drafts locally, and allow
+an explicit compatibility selection before resuming. Policy and labels must be consistent across DSPACE, Python, desktop and
 landing-page clients. Trusted-relay mode is a documented threat-model choice, not
 an assertion of protection against its trusted relay becoming malicious.
 
@@ -188,7 +229,8 @@ an assertion of protection against its trusted relay becoming malicious.
 2. **Protocol gate:** cryptographic review of the selected profile, exact schema,
    canonicalization, nonce/replay state, clock policy, signature placement and
    library support for Python/browser/desktop. Resolve payload limits, revocation
-   freshness/skew numbers, issuance custody and emergency recovery procedures.
+   freshness/skew numbers, maximum descriptor and request lifetimes, delegation
+   constraints, issuance custody and emergency recovery procedures.
    Publish shared positive/negative vectors before implementing clients.
 3. **Implementation gate:** separate reviewed K069/enrollment/client work; operator
    tooling and trust-store persistence must exist before advertising verified mode.
@@ -217,7 +259,8 @@ Use local fake relays, deterministic fixtures, generated test keys and synthetic
 sentinels. No production credentials, live compromise tests or deployment probes.
 Existing invariant tests remain mandatory; proposed cases are not yet implemented.
 
-- Reproduce relay key substitution on both current DSPACE/Python test paths; confirm
+- Reproduce relay key substitution on both current DSPACE/Python test paths (expected
+  pre-migration result: substitution succeeds under their trusted-relay model); confirm
   verified clients reject an unsigned key, wrong operator chain, substituted
   encryption/signing key, and a descriptor from an untrusted root before dispatch.
 - Forge a response using only the public client key and observed routing fields;

@@ -32,7 +32,7 @@ def canonical_relay_url(value: str, *, require_secure: bool = True) -> str:
             address = ipaddress.ip_address(host)
         except ValueError:
             address = None
-            if not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host):
+            if not re.fullmatch(r"[a-zA-Z0-9_](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9_])?", host):
                 raise invalid
             if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
                    for label in host.split(".")):
@@ -41,7 +41,7 @@ def canonical_relay_url(value: str, *, require_secure: bool = True) -> str:
         # Never reinterpret those authorities as DNS names or IPv6 literals.
         authority_pattern = (r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?"
                              if address is not None and address.version == 6
-                             else r"[a-zA-Z0-9.-]+(?::[0-9]+)?")
+                             else r"[a-zA-Z0-9_.-]+(?::[0-9]+)?")
         if not re.fullmatch(authority_pattern, parsed.netloc):
             raise invalid
         if require_secure and parsed.scheme != "https":
@@ -52,7 +52,7 @@ def canonical_relay_url(value: str, *, require_secure: bool = True) -> str:
             raise invalid
         if not re.fullmatch(r"[A-Za-z0-9/_~.\-]*", path):
             raise invalid
-        authority = f"[{host}]" if ":" in host else host.lower()
+        authority = f"[{address.compressed}]" if address is not None and address.version == 6 else host.lower()
         if port is not None and port != (443 if parsed.scheme == "https" else 80):
             authority += f":{port}"
         return urlunsplit((parsed.scheme, authority, path.rstrip("/"), "", ""))

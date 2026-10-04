@@ -225,3 +225,63 @@ def test_legacy_and_map_collision_is_rejected_even_for_same_token(monkeypatch, c
         load_registration_credentials()
     for token in ("synthetic-mapped", legacy_token):
         assert token not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("expanded,compressed", [
+    ("http://[0:0:0:0:0:0:0:1]:5010/team", "http://[::1]:5010/team"),
+    ("https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:8443/team", "https://[2001:db8::1]:8443/team"),
+    ("https://[::ffff:192.0.2.1]/team", "https://[::ffff:c000:201]/team"),
+])
+def test_equivalent_ipv6_spellings_match_credentials_and_reject_duplicate_bindings(
+    monkeypatch, expanded, compressed,
+):
+    # Python versions differ in the display form of IPv4-mapped IPv6 literals.
+    # Both spellings must resolve to the same key within the runtime.
+    assert canonical_relay_url(expanded) == canonical_relay_url(compressed)
+    for binding, target in [(expanded, compressed), (compressed, expanded)]:
+        client = make_client(monkeypatch, target, [], {binding: "synthetic-ipv6"})
+        assert client._auth_headers(target) == {"X-Relay-Server-Token": "synthetic-ipv6"}
+        assert client._auth_headers(target + "/other") == {}
+    with pytest.raises(RelayCredentialError, match="Duplicate canonical"):
+        validate_registration_credentials({expanded: "synthetic-one", compressed: "synthetic-two"})
+
+
+def test_internal_service_fallback_without_token_does_not_abort_protected_primary(monkeypatch):
+    primary = "https://a.example"
+    internal = "http://token_place_relay:5010"
+    client = make_client(monkeypatch, primary, [internal], {primary: "synthetic-a"})
+    seen = []
+    def post(url, **kwargs):
+        seen.append((url, kwargs.get("headers", {})))
+        return Mock(status_code=200, json=lambda: {})
+    monkeypatch.setattr("utils.networking.relay_client.requests.post", post)
+    for target in client.relay_urls:
+        client.register_api_v1_compute_node(target)
+    assert seen == [
+        (primary + "/api/v1/relay/servers/register", {"X-Relay-Server-Token": "synthetic-a"}),
+        (internal + "/api/v1/relay/servers/register", {}),
+    ]
+
+
+def test_https_internal_service_credentials_remain_exactly_bound(monkeypatch):
+    target = "https://token_place_relay:8443/team"
+    client = make_client(monkeypatch, target, [], {target: "synthetic-internal"})
+    assert client._auth_headers(target) == {"X-Relay-Server-Token": "synthetic-internal"}
+    assert client._auth_headers("https://token-place-relay:8443/team") == {}
+    assert client._auth_headers("https://token_place_relay:8444/team") == {}
+    with pytest.raises(RelayCredentialError, match="HTTPS"):
+        validate_registration_credentials({"http://token_place_relay:5010": "synthetic-internal"})
+
+
+def test_surrounding_configuration_whitespace_is_trimmed_but_bindings_remain_strict(monkeypatch):
+    target = "https://a.example/team"
+    padded = " \n" + target + "\n "
+    client = make_client(monkeypatch, padded, [" \nhttp://token_place_relay:5010\n "],
+                         {target: "synthetic-a"})
+    assert client.relay_urls == (target, "http://token_place_relay:5010")
+    assert client._auth_headers(client.relay_urls[0]) == {"X-Relay-Server-Token": "synthetic-a"}
+    assert client._auth_headers(client.relay_urls[1]) == {}
+    with pytest.raises(RelayCredentialError, match="Invalid relay URL"):
+        validate_registration_credentials({padded: "synthetic-a"})
+    with pytest.raises(RelayCredentialError, match="Invalid relay URL"):
+        make_client(monkeypatch, "https://a.\nexample/team", [], {target: "synthetic-a"})

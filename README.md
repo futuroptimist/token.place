@@ -772,9 +772,11 @@ use the map above. An unscoped legacy token is refused even for one target, so a
 later target change cannot silently transfer it. Duplicate canonical bindings
 and conflicting legacy/map entries are refused with redacted errors.
 
-Bindings include scheme, host, port and base path. Host case, default ports and a
-trailing slash are canonicalized; different base paths, ports, schemes and hosts
-remain separate. Userinfo, queries, fragments, encoded/ambiguous paths and invalid
+Bindings include scheme, host, port and base path. Host case, equivalent IPv6
+spellings, default ports and a trailing slash are canonicalized; different base
+paths, ports, schemes and hosts remain separate. Internal service names containing
+underscores are supported. Surrounding whitespace is trimmed from configured relay
+targets, but credential binding keys must be explicit URLs without whitespace. Userinfo, queries, fragments, encoded/ambiguous paths and invalid
 ports are rejected. Credential-bearing requests require HTTPS, except explicitly
 configured `http://localhost`, loopback IPv4 or `[::1]` development URLs. Wildcard
 and remote HTTP addresses are not credential destinations. Registration headers

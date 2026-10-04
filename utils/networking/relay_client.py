@@ -1470,7 +1470,7 @@ class RelayClient:
     def _compose_relay_url(base_url: str, port: Optional[int]) -> str:
         """Normalise relay targets into canonical URLs."""
 
-        base = base_url or ''
+        base = (base_url or '').strip()
         if not base:
             return ''
         canonical_relay_url(base if '://' in base else f'http://{base}', require_secure=False)

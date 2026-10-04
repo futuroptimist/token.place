@@ -4,7 +4,7 @@ This document provides an overview of the token.place architecture, explaining h
 
 ## System Overview
 
-token.place is an end-to-end encrypted proxy service that sits between clients and AI service providers (like OpenAI, Anthropic, etc.). It ensures that the plaintext content of prompts and responses never reaches the token.place servers, while maintaining API compatibility with the original services.
+token.place is an end-to-end encrypted proxy service that sits between clients and AI service providers (like OpenAI, Anthropic, etc.). In distributed inference, the selected compute node decrypts prompts and generates responses; an honest relay handles ciphertext and safe routing metadata. Current clients trust relay-selected compute keys rather than independently authenticating the operator. See the [K061 verified-compute proposal](design/verified-compute-trust.md) for that trust gap and the proposed migration.
 
 ```mermaid
 flowchart TD
@@ -27,10 +27,10 @@ flowchart TD
     cryptoClient -->|Decrypt for user| clientApp
 ```
 
-The diagram highlights how token.place keeps ciphertext opaque to relays and the core server while
-still proxying OpenAI-compatible API calls. Client-side helpers handle key generation and message
-encryption, relays forward ciphertext, and the server maintains compatibility with downstream AI
-providers without seeing plaintext content.
+Client helpers encrypt to the selected compute node. The honest relay forwards ciphertext;
+`server.py` decrypts it for inference. Any configured downstream provider receiving that request
+is also inside the plaintext trust boundary. The relay cannot independently certify its own
+honesty through key discovery.
 
 ## Key Components
 
@@ -46,7 +46,7 @@ providers without seeing plaintext content.
 
 - **Server Application** (`server.py`):
   - Handles client requests
-  - Proxies encrypted communications to AI providers
+  - Decrypts requests for inference and encrypts responses for clients
   - Manages server-side keys
   - Implements API-compatible endpoints
 
@@ -87,12 +87,12 @@ providers without seeing plaintext content.
 3. **Server Processing**:
    - Server receives the encrypted package
    - Server decrypts the AES key using its private RSA key
-   - Server forwards the still-encrypted message to the AI provider
-   - AI provider responds with encrypted data
-   - Server passes the encrypted response back to the client
+   - Compute decrypts the message and runs inference (or invokes its configured provider)
+   - Compute encrypts the completed response to the client public key
+   - Relay forwards the response ciphertext
 
 4. **Response Decryption**:
-   - Client decrypts the response using its AES key
+   - Client unwraps the response AES key with its private key and decrypts the response
    - Decrypted content is presented to the user
 
 ## Encryption Details
@@ -115,8 +115,11 @@ token.place uses a hybrid encryption approach:
 
 ## Security Considerations
 
-- **No Plaintext Storage**: Message content is never stored in plaintext on the server
-- **Forward Secrecy**: New AES keys for each message
+- **Relay boundary**: Honest relay state remains ciphertext-only; compute sees plaintext.
+- **Key authentication**: Current relay-selected keys require trust in that relay; response
+  encryption to a public client key alone does not authenticate the compute sender.
+- **Forward secrecy limit**: Fresh AES keys alone do not provide forward secrecy if recorded
+  wrapped keys can later be decrypted with a compromised recipient private key.
 - **Client-Side Key Generation**: Private keys never leave the client
 - **Error Handling**: Non-revealing error messages to prevent oracle attacks
 - **Cross-Platform Testing**: Rigorous testing across both Python and JavaScript implementations

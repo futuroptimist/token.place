@@ -5899,7 +5899,9 @@ def test_cancellation_and_deadline_expiry_converge_on_one_terminal(valkey_server
     identity = ("terminal-race-client", "terminal-race-request")
     try:
         stores[0].register(node, _capabilities(), owner)
-        deadline = stores[0]._foundation.server_time()[0] + 1
+        # Leave a full second for enqueue/claim even at an epoch boundary.
+        seconds, micros = stores[0]._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 1
         _enqueue_claim_fixture(stores[0], node, owner, *identity, deadline)
         stores[0].claim_queued_request(node, owner, consumer)
         _wait_for_server_epoch(stores[0], deadline)

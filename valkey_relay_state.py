@@ -2700,7 +2700,7 @@ local function canonical_number(v,zero)
   if string.sub(v,1,1)=='0' and string.len(v)>1 and string.sub(v,2,2)~='.' then return nil end
   local n=finite(v); if not n or n<0 or (not zero and n==0) then return nil end; return n
 end
--- Registration writes Lua numbers directly, which Valkey may persist in either
+-- Registration and reservation writers pass Lua numbers directly; Valkey may persist them in
 -- decimal or exponent form depending on the timestamp's significant digits.
 local function registration_epoch(v,zero)
   if not v or string.len(v)>32 then return nil end
@@ -2965,7 +2965,7 @@ for _,member in ipairs(members) do
   if r[1]=='reserved' then
     local rk=prefix..'reservation:'..r[7]; local rv=redis.call('HMGET',rk,'client','request','node_digest','node_id','deadline','token_digest','cancellation_digest','reservation_expires')
     for _,v in ipairs(rv) do if not v then return {'schema'} end end
-    local reservation_expiry=canonical_number(rv[8],false)
+    local reservation_expiry=registration_epoch(rv[8],false)
     if rv[1]~=client or rv[2]~=request or rv[3]~=node_digest or rv[4]~=node_id or rv[5]~=r[6] or rv[6]~=r[7] or rv[7]~=r[8] or not reservation_expiry or reservation_expiry>request_deadline or finite(redis.call('ZSCORE',reservation_expiries,r[7]))~=reservation_expiry or
        r[9] or r[10] or r[11] or r[12] or r[13] or r[14] or redis.call('EXISTS',prefix..'claim:'..client..':'..request)~=0 or redis.call('ZSCORE',claim_expiries,member) then return {'schema'} end
   else
@@ -3171,7 +3171,7 @@ NODE_TRANSITION_SOURCE = NODE_TRANSITION_SOURCE.replace("__CANONICAL_PROGRESS__"
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "ffcf60641460ffd7c8e1626c9d243258330e795b44383693a07508b696caf972",  # pragma: allowlist secret
+    "b5215acd1128ea799e2a2d0497c895e4299fc1d7b813ac72684502f60720175f",  # pragma: allowlist secret
     True,
 )
 

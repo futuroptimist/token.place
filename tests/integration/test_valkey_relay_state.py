@@ -12915,6 +12915,66 @@ def test_node_transition_capacity_fences_and_reports_admissible_prefix(
         observer.close()
 
 
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+@pytest.mark.parametrize("expiry_encoding", ("exponent", "nan", "inf", "0", "-1", "01", "1e309", "1e"))
+def test_node_transition_validates_backend_written_reservation_epoch(
+    valkey_server, cause, expiry_encoding
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = "reservation-epoch-node", _digest("reservation-epoch-owner")
+    identity = ("reservation-epoch-client", "reservation-epoch-request")
+    cfg, digest = store._foundation.config, store._node_digest(node)
+    selection = None
+    try:
+        store.register(node, _capabilities(), owner)
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+        )
+        token = _digest(selection.reservation_token)
+        reservation_key = cfg.key("reservation", token)
+        client, request = store._identity(*identity)
+        backend = store._foundation._client
+        expiry = float(backend.hget(reservation_key, "reservation_expires"))
+        # Lua-number arguments can be persisted in exponent form by Valkey 7.2.
+        # Pin that representation independently of the wall clock's microseconds.
+        encoded = f"{expiry:.16e}" if expiry_encoding == "exponent" else expiry_encoding
+        backend.hset(reservation_key, "reservation_expires", encoded)
+        backend.hset(cfg.key("request", client, request), "reservation_expires", encoded)
+        assert backend.zscore(cfg.key("reservations:expiry"), token) == expiry
+        if cause == "registration_lease_expired":
+            cutoff = time.time() - 1
+            backend.hset(cfg.key("node", digest), "lease_expires_at_epoch", str(cutoff))
+            backend.zadd(cfg.key("nodes:lease"), {digest: cutoff})
+        before = _node_transition_authority_snapshot(store, node, (identity,))
+        if expiry_encoding != "exponent":
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.unregister_node_and_transition_work(
+                    node, owner if cause == "explicit_unregister" else None, cause=cause
+                )
+            assert _node_transition_authority_snapshot(store, node, (identity,)) == before
+        else:
+            result = store.unregister_node_and_transition_work(
+                node, owner if cause == "explicit_unregister" else None, cause=cause
+            )
+            assert result.state == "complete"
+            assert result.processed_count == result.new_outcomes == result.reservations_terminalized == 1
+            assert not backend.exists(reservation_key)
+            assert backend.zscore(cfg.key("reservations:expiry"), token) is None
+            terminal, = store.terminal_records()
+            assert (terminal.outcome, terminal.reason) == ("cancelled", "server_unregistered")
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        if selection is not None:
+            store._foundation._client.delete(cfg.key("reservation", _digest(selection.reservation_token)))
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
 def test_node_transition_capacity_reclaims_bounded_expired_terminal_and_control(
     valkey_server,
 ):

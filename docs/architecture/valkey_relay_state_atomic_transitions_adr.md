@@ -97,6 +97,13 @@ reader and writer intersections; operators update the manifest ranges/active rev
 a reviewed compatibility transition proven against every version in those ranges. There is no
 opportunistic cross-major read, dual-write, or lazy conversion.
 
+Registration and reservation expiry writers pass Lua numbers to Valkey, whose encoding may use
+decimal or exponent notation. Node transitions accept both forms for these writer-owned epochs,
+while retaining finite, positive expiry bounds and exact hash/index agreement. This validation fix
+changes the reviewed `node_transition_v1` digest; manifests with the earlier digest remain
+incompatible. Deployments must use the explicit stopped-namespace compatibility or cutover process
+described here, rather than rewriting a live manifest during initialization.
+
 ### Families and limits
 
 All JSON-like fields use a canonical, length-checked encoding before a transaction. Hashes are

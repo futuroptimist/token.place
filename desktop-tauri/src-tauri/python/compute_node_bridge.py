@@ -1309,6 +1309,15 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    from config import get_config
+    from utils.networking.relay_credentials import load_registration_credentials, RelayCredentialError
+
+    try:
+        registration_credentials = load_registration_credentials(get_config())
+    except RelayCredentialError as exc:
+        emit_startup_error(str(exc))
+        return 1
+
     def make_runtime(target_relay_url: str, *, shared_runtime: Optional[Any] = None) -> Any:
         target_relay_port = resolve_relay_port(args.relay_port, target_relay_url)
         config = ComputeNodeRuntimeConfig(
@@ -1316,6 +1325,7 @@ def run(args: argparse.Namespace) -> int:
             relay_port=target_relay_port,
             use_configured_relay_fallbacks=False,
             relay_urls=(target_relay_url,),
+            registration_credentials=registration_credentials,
         )
         if shared_runtime is None:
             try:

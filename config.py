@@ -56,6 +56,7 @@ class SensitiveKey:
 
 SENSITIVE_CONFIG_KEYS: List[SensitiveKey] = [
     SensitiveKey("relay.server_registration_token"),
+    SensitiveKey("relay.registration_credentials"),
 ]
 
 class Config:

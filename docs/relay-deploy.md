@@ -149,9 +149,9 @@ Sugarkube staging or production.
    pip install --upgrade pip
    pip install -r config/requirements_server.txt
    ```
-5. If you use a relay registration token, export it before starting the server:
+5. If you use a relay registration token, bind it to the trusted relay URL before starting the server:
    ```powershell
-   $Env:TOKEN_PLACE_RELAY_SERVER_TOKEN = "<secure-token>"
+   $Env:TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS = '{"https://example.com":"<relay-token>"}'
    ```
 6. Start the server, binding to the port referenced by the Helm release (default `3000`):
    ```powershell

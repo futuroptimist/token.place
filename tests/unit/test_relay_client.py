@@ -44,7 +44,7 @@ class _ProgressOwner:
     def _api_v1_control_credential_for_relay(self, relay_url):
         return "credential"
 
-    def _auth_headers(self):
+    def _auth_headers(self, relay_url):
         return {"Authorization": "Bearer registration"}
 
     def _build_api_v1_url(self, relay_url, path):
@@ -1261,7 +1261,7 @@ class TestRelayClient:
 
         config_values = {
             'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            'relay.registration_credentials': {'http://localhost:5000': 'alpha-token'},
         }
 
         with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
@@ -1388,7 +1388,7 @@ class TestRelayClient:
 
         config_values = {
             'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            'relay.registration_credentials': {'http://localhost:5000': 'alpha-token'},
         }
 
         with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
@@ -1836,7 +1836,7 @@ class TestRelayClient:
     def test_register_api_v1_compute_node_403_html_logs_cloudflare_diagnostic(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
+        relay_client._registration_credentials = {'https://staging.token.place': 'super-secret-token'}
         relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
         response = MagicMock(status_code=403)
         response.headers = {
@@ -1899,7 +1899,7 @@ class TestRelayClient:
     def test_poll_api_v1_encrypted_work_propagates_register_http_diagnostic(
         self, mock_post, relay_client
     ):
-        relay_client._registration_token = 'super-secret-token'
+        relay_client._registration_credentials = {relay_client.relay_url: 'super-secret-token'}
         relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
         response = MagicMock(status_code=403)
         response.headers = {
@@ -1960,7 +1960,7 @@ class TestRelayClient:
     def test_register_api_v1_compute_node_401_json_logs_relay_error_safely(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
+        relay_client._registration_credentials = {'https://staging.token.place': 'super-secret-token'}
         relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
         response = MagicMock(status_code=401)
         response.headers = {
@@ -1999,7 +1999,7 @@ class TestRelayClient:
     def test_register_api_v1_compute_node_redacts_nested_json_error_and_hyphen_keys(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
+        relay_client._registration_credentials = {relay_client.relay_url: 'super-secret-token'}
         relay_client.crypto_manager.public_key_b64 = 'configured-public-key-secret'
         response = MagicMock(status_code=401)
         response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
@@ -2172,7 +2172,7 @@ class TestRelayClient:
     def test_register_api_v1_compute_node_redacts_json_error_known_secret_values(
         self, mock_post, relay_client, caplog
     ):
-        relay_client._registration_token = 'super-secret-token'
+        relay_client._registration_credentials = {relay_client.relay_url: 'super-secret-token'}
         relay_client.crypto_manager.public_key_b64 = 'server-public-key-secret'
         response = MagicMock(status_code=401)
         response.headers = {'server': 'gunicorn', 'content-type': 'application/json'}
@@ -4308,7 +4308,7 @@ class TestRelayClient:
 
         config_values = {
             'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            'relay.registration_credentials': {'http://localhost:5000': 'alpha-token'},
         }
 
         with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
@@ -4349,7 +4349,7 @@ class TestRelayClient:
 
         config_values = {
             'relay.request_timeout': 15,
-            'relay.server_registration_token': 'alpha-token',
+            'relay.registration_credentials': {'http://localhost:5000': 'alpha-token'},
         }
 
         with patch('utils.networking.relay_client.get_config_lazy') as mock_get_config:
@@ -4849,7 +4849,7 @@ def test_unregister_from_relay_rechecks_registration_after_previous_empty_skip(m
 @patch('utils.networking.relay_client.requests.post')
 def test_unregister_from_relay_logs_control_plane_429_diagnostic(mock_post, caplog):
     client = _standalone_relay_client()
-    client._registration_token = 'super-secret-token'
+    client._registration_credentials = {client.relay_url: 'super-secret-token'}
     client._api_v1_registered_relays.add('http://localhost:5000')
     client._api_v1_last_heartbeat_at['http://localhost:5000'] = 123.0
     client._api_v1_control_credentials_by_relay['http://localhost:5000'] = 'owner-secret'

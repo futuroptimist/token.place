@@ -3274,7 +3274,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.22') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.25') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -3334,7 +3334,7 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.22']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.25']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
@@ -3349,7 +3349,7 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.22'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.25'])
 
 
 def _extract_workflow_job_block(text: str, job_key: str) -> str:
@@ -6224,8 +6224,8 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
 
 def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.22-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.22-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.25-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.25-x64.msi'
     previous_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
     previous_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
@@ -6237,6 +6237,7 @@ def test_windows_installer_identity_main_non_windows_contract_success(monkeypatc
         '--windows-msi', str(current_msi),
         '--previous-windows-nsis', str(previous_nsis),
         '--previous-windows-msi', str(previous_msi),
+        '--previous-version', '0.1.21',
         '--expected-build-id', 'abcdef123456',
     ])
 
@@ -6811,7 +6812,187 @@ def test_windows_installer_identity_terminate_processes_runs_stop_and_verify(mon
 
     assert len(calls) == 2
     assert 'Stop-Process -Force' in calls[0][-1]
+    assert 'ProcessName' in calls[1][-1]
     assert 'exit 9' in calls[1][-1]
+    assert 'exit 0' in calls[1][-1]
+
+
+def test_windows_installer_identity_terminate_processes_accepts_timed_out_stop_after_verified_absence(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+        return subprocess.CompletedProcess(cmd, 0, '')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    guard._terminate_processes()
+
+    assert len(calls) == 2
+    assert 'Stop-Process -Force' in calls[0][-1]
+    assert 'ProcessName' in calls[1][-1]
+
+
+def test_windows_installer_identity_terminate_processes_accepts_no_matching_process(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 1, ''),
+            subprocess.CompletedProcess([], 0, '', ''),
+        ]
+    )
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: next(results))
+
+    guard._terminate_processes()
+
+
+@pytest.mark.parametrize(
+    ('inventory', 'expected_status', 'expected_output'),
+    [
+        ('$null', 0, ''),
+        ("[pscustomobject]@{ ProcessName = 'unrelated'; Id = 1234 }", 0, ''),
+        ("[pscustomobject]@{ ProcessName = 'token.place'; Id = 1234 }", 9, 'token.place pid=1234'),
+        ("Write-Error 'inventory unavailable'", 1, 'inventory unavailable'),
+        ("throw 'inventory unavailable'", 1, 'inventory unavailable'),
+        (
+            "[pscustomobject]@{ ProcessName = 'token.place'; Id = 1234 }; "
+            "Write-Error 'inventory unavailable'",
+            1,
+            'inventory unavailable',
+        ),
+    ],
+)
+def test_windows_installer_identity_process_inventory_script_fails_closed(
+    monkeypatch,
+    inventory,
+    expected_status,
+    expected_output,
+) -> None:
+    powershell = shutil.which('powershell') or shutil.which('pwsh')
+    if powershell is None:
+        pytest.skip('PowerShell is required to exercise process inventory command semantics')
+    guard = _load_windows_installer_identity()
+    calls = []
+    with monkeypatch.context() as patch:
+        patch.setattr(guard.sys, 'platform', 'win32')
+        patch.setattr(guard.time, 'sleep', lambda seconds: None)
+        patch.setattr(
+            guard,
+            '_run',
+            lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''),
+        )
+        guard._terminate_processes()
+
+    # Exercise the actual generated command, but never inspect or stop live processes.
+    fake_inventory = (
+        'function Get-Process { [CmdletBinding()] param([string]$Name) '
+        f'$processes = @(& {{ {inventory} }});'
+        '$processes | Where-Object { $null -ne $_ -and (!$Name -or $_.ProcessName -eq $Name) }; };'
+    )
+    result = subprocess.run(
+        [powershell, '-NoProfile', '-NonInteractive', '-Command', fake_inventory + calls[1][-1]],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
+    if expected_status == 1:
+        assert expected_output in result.stderr
+    else:
+        assert result.stdout.strip() == expected_output
+        assert result.stderr == ''
+
+
+def test_windows_installer_identity_terminate_processes_reports_empty_verification_error(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 0, ''),
+            subprocess.CompletedProcess([], 1, '', ''),
+        ]
+    )
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: next(results))
+
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=r'process-absence verification failed with exit status 1; no command output',
+    ):
+        guard._terminate_processes()
+
+
+def test_windows_installer_identity_terminate_processes_rejects_remaining_process_after_timed_out_stop(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+        return subprocess.CompletedProcess(cmd, 9, 'token.place pid=1234')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=r'Stop-Process timed out after 30 seconds.*token\.place pid=1234',
+    ):
+        guard._terminate_processes()
+
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ('stop_times_out', 'diagnostic'),
+    [
+        (False, 'verification timed out after 30 seconds;'),
+        (True, 'verification timed out after 30 seconds after Stop-Process also timed out after 30 seconds;'),
+    ],
+)
+def test_windows_installer_identity_terminate_processes_rejects_unverified_absence(
+    monkeypatch,
+    stop_times_out,
+    diagnostic,
+) -> None:
+    guard = _load_windows_installer_identity()
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, '_powershell', lambda: 'powershell.exe')
+    monkeypatch.setattr(guard.time, 'sleep', lambda seconds: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1 and not stop_times_out:
+            return subprocess.CompletedProcess(cmd, 0, '')
+        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    with pytest.raises(
+        guard.InstallerIdentityError,
+        match=rf'{diagnostic}.*token\.place, tokenplace, token-place',
+    ) as exc_info:
+        guard._terminate_processes()
+
+    assert len(calls) == 2
+    assert isinstance(exc_info.value.__cause__, subprocess.TimeoutExpired)
 
 
 def test_windows_installer_identity_canonical_path_falls_back_on_resolve_error(monkeypatch, tmp_path) -> None:
@@ -7116,20 +7297,20 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.22-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.22-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.25-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.25-x64.msi'
     previous_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
     previous_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = [guard.Scenario('clean-nsis-0.1.22', guard.Installer(current_nsis, 'nsis', '0.1.22'))]
+    scenarios = [guard.Scenario('clean-nsis-0.1.25', guard.Installer(current_nsis, 'nsis', '0.1.25'))]
     artifacts_seen = []
     def fake_runner(scenario, build_id):
         artifacts_seen.append((scenario.name, build_id))
 
     guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
-    assert artifacts_seen == [('clean-nsis-0.1.22', 'abcdef123456')]
+    assert artifacts_seen == [('clean-nsis-0.1.25', 'abcdef123456')]
 
     old_argv = sys.argv
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
@@ -7141,6 +7322,7 @@ def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, 
             '--windows-msi', str(current_msi),
             '--previous-windows-nsis', str(previous_nsis),
             '--previous-windows-msi', str(previous_msi),
+            '--previous-version', '0.1.21',
             '--expected-build-id', 'abcdef123456',
             '--artifact-dir', str(tmp_path / 'artifacts'),
         ]

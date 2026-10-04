@@ -97,6 +97,13 @@ reader and writer intersections; operators update the manifest ranges/active rev
 a reviewed compatibility transition proven against every version in those ranges. There is no
 opportunistic cross-major read, dual-write, or lazy conversion.
 
+Registration and reservation expiry writers pass Lua numbers to Valkey, whose encoding may use
+decimal or exponent notation. Node transitions accept both forms for these writer-owned epochs,
+while retaining finite, positive expiry bounds and exact hash/index agreement. This validation fix
+changes the reviewed `node_transition_v1` digest; manifests with the earlier digest remain
+incompatible. Deployments must use the explicit stopped-namespace compatibility or cutover process
+described here, rather than rewriting a live manifest during initialization.
+
 ### Families and limits
 
 All JSON-like fields use a canonical, length-checked encoding before a transaction. Hashes are
@@ -422,7 +429,15 @@ no process-local fallback after startup or during an outage.
 
 ## Migration, rollback, and verification gates
 
-Staging migration is a drain-and-cutover, never dual-write:
+Authoritative backend migration remains drain-and-cutover, never dual-write. The
+[staging validation and production cutover plan](valkey_staging_shadow_cutover.md) adds a narrow,
+proposed **staging-only** exception: memory alone serves while an isolated, disposable Valkey shadow
+replays ordered store operations for comparison. It cannot serve clients, dispatch work, affect
+readiness or production metrics, or become authoritative. Production shadowing and dual authority
+remain prohibited. The plan defines bootstrap, ordering, token/clock handling, bounded failure
+budgets and independent qualification gates; it does not implement or authorize a deployment.
+
+After that experiment and independent qualification, staging rehearses the authoritative cutover:
 
 1. implement the expanded memory contract and route adapters while retaining one process;
 2. implement the Valkey backend and run the identical contract against a real Valkey server;
@@ -432,8 +447,10 @@ Staging migration is a drain-and-cutover, never dual-write:
 5. prove restart recovery, then scale to node-spread replicas only after all gates below pass.
 
 Rollback after cutover scales to one relay replica while **retaining Valkey**. Reverting to process
-memory would strand accepted work and is prohibited. An incompatible schema release instead drains,
-creates a new major prefix while stopped, and cuts over once; it does not dual-write.
+memory would strand accepted work and is prohibited as a live fallback. A separately approved,
+stopped maintenance reset after drain (or explicit acceptance of unrecoverable state loss) is
+described in the cutover plan; it is not restoration of accepted work. An incompatible schema release
+instead drains, creates a new major prefix while stopped, and cuts over once; it does not dual-write.
 
 Before replicas scale above one, the memory and real-Valkey contract suites must cover TTL/expiry,
 renewal, scheduler choice/reservation, queue ordering and wakeup loss, claim/reclaim, retrieval,

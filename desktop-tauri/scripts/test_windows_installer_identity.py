@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.22"
+EXPECTED_VERSION = "0.1.25"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 EXPECTED_TARGET_TRIPLE = "x86_64-pc-windows-msvc"
@@ -335,10 +335,51 @@ def _terminate_processes() -> None:
     if sys.platform != "win32":
         return
     script = ";".join(f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force" for name in APP_PROCESS_NAMES)
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
+    stop_timed_out = False
+    try:
+        _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        # Stop-Process can outlive the processes it stopped. Treat its timeout as
+        # inconclusive and let the independent inventory below decide whether it
+        # is safe to proceed.
+        stop_timed_out = True
     time.sleep(0.5)
-    verify = ";".join(f"if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ exit 9 }}" for name in APP_PROCESS_NAMES)
-    _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify], timeout=30)
+    # Enumerate once with errors made terminating, then filter. Name-based lookup
+    # reports an error for expected absence; suppressing it would also hide an
+    # actual inventory failure and let the explicit success exit fail open.
+    names = ",".join(f"'{name}'" for name in APP_PROCESS_NAMES)
+    verify = (
+        "$ErrorActionPreference = 'Stop';try {"
+        f"$names = @({names});"
+        "$remaining = @(Get-Process -ErrorAction Stop | "
+        "Where-Object { $names -contains $_.ProcessName });"
+        "$remaining | ForEach-Object { Write-Output \"$($_.ProcessName) pid=$($_.Id)\" };"
+        "if ($remaining.Count) { exit 9 } else { exit 0 }"
+        "} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
+    )
+    try:
+        result = _run(
+            [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", verify],
+            timeout=30,
+            check=False,
+            separate_stderr=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stop_diagnostic = " after Stop-Process also timed out after 30 seconds" if stop_timed_out else ""
+        raise InstallerIdentityError(
+            f"process-absence verification timed out after 30 seconds{stop_diagnostic}; "
+            f"could not verify absence of: {', '.join(APP_PROCESS_NAMES)}"
+        ) from exc
+    observed = result.stdout.strip()
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr or "") if part.strip())
+    if result.returncode == 9 and observed:
+        stop_diagnostic = " (Stop-Process timed out after 30 seconds)" if stop_timed_out else ""
+        raise InstallerIdentityError(f"process cleanup failed{stop_diagnostic}; remaining processes: {observed}")
+    if result.returncode != 0:
+        diagnostic = f"; output: {output}" if output else "; no command output"
+        raise InstallerIdentityError(
+            f"process-absence verification failed with exit status {result.returncode}{diagnostic}"
+        )
 
 
 def _canonical_path(path: Path) -> str:

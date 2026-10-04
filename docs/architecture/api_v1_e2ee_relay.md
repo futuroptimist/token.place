@@ -83,13 +83,22 @@ plaintext model payload content, including:
 
 Any path that would expose plaintext to relay-owned surfaces must fail closed.
 
+## Current trust boundary
+
+The ciphertext-only invariant assumes an honest relay distributing the intended compute key.
+Current discovery does not independently authenticate compute identity, and encryption to the
+client public key does not authenticate the response sender. The
+[K061 design](../design/verified-compute-trust.md) proposes independently provisioned operator
+roots and authenticated transcripts coordinated with K069; these are not implemented guarantees.
+A relay serving mutable client JavaScript can also replace verification code.
+
 ## Landing-page system message
 
 The landing-page chat gives the model a small, factual description of token.place so it can answer
 product questions without inventing capabilities. The exact message is this single-line value:
 
 ```text
-You are the assistant in the token.place landing-page chat. token.place connects people who need generative-AI inference with people who contribute compute; a selected compute node serves each request. The relay routes end-to-end encrypted request and response envelopes and cannot read the conversation, while the selected compute node decrypts the request to run inference and encrypts its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that you searched or browsed the web.
+You are the assistant in the token.place landing-page chat. token.place connects people who need generative-AI inference with people who contribute compute; a selected compute node serves each request. With an honest relay distributing the intended compute key, the relay routes encrypted envelopes without reading the conversation. Current clients trust that relay for key selection; the selected compute node decrypts the request to run inference and encrypts its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that you searched or browsed the web.
 ```
 
 This wording deliberately limits the privacy claim to the relay boundary: the relay sees ciphertext

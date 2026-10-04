@@ -36,7 +36,9 @@ def test_codecov_publishes_project_and_patch_commit_statuses() -> None:
     assert project["threshold"] in (0, "0%")
     assert project["base"] == "auto"
     assert project["informational"] is False
-    assert statuses["patch"]["default"]["target"] in (90, "90%")
+    patch = statuses["patch"]["default"]
+    assert patch["target"] in (95, "95%")
+    assert patch["threshold"] in (0, "0%")
 
 
 def _workflow_on_block(data: dict, workflow_name: str) -> dict:
@@ -444,7 +446,7 @@ def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
 
-    assert chart["version"] == "0.1.7"
+    assert chart["version"] == "0.1.8"
     assert values["image"]["tag"] == "main-latest"
     assert values["image"]["pullPolicy"] == "Always"
 

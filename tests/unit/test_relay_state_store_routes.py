@@ -119,7 +119,9 @@ def test_real_shutdown_signals_do_not_deadlock_admission(
         if {handler_path!r} == 'serve':
             relay.make_server = lambda *args, **kwargs: server
             relay.serve('127.0.0.1', 0)
-            assert server.stopped.wait(2)
+            # The fake server can return before Python dispatches the signal.
+            # Keep yielding bytecode until its asynchronous shutdown is observed.
+            assert _wait_bounded(server.stopped.is_set)
         else:
             with relay._admission_gate():
                 sender = threading.Thread(target=send_signals)

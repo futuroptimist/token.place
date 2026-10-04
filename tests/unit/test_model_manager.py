@@ -5181,6 +5181,32 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
     from utils.llm import model_manager as model_manager_module
     from utils.llm.model_manager import ModelManager
 
+    stdout_ready = threading.Event()
+    original_send = model_manager_module._SubprocessLlamaProxy._send
+
+    def send_before_stdout_eof(proxy, payload, **kwargs):
+        # Pin the caller's empty legacy-queue check before the worker exits.
+        # The production response must then arrive on the command's own queue.
+        original_get = proxy._legacy_frames.get_nowait
+
+        def poll_before_stdout_eof():
+            with pytest.raises(queue.Empty):
+                original_get()
+            stdout_ready.set()
+            proxy._stdout_reader_thread.join(timeout=5)
+            assert not proxy._stdout_reader_thread.is_alive()
+            raise queue.Empty
+
+        proxy._legacy_frames.get_nowait = poll_before_stdout_eof
+        return original_send(proxy, payload, **kwargs)
+
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_send', send_before_stdout_eof)
+
+    class GatedStdout(StringIO):
+        def __next__(self):
+            assert stdout_ready.wait(timeout=5)
+            return super().__next__()
+
     class FakeStdin:
         def write(self, _data):
             return None
@@ -5191,9 +5217,10 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
     class FakeProcess:
         def __init__(self, *_args, **_kwargs):
             self.stdin = FakeStdin()
-            self.stdout = StringIO(
+            self.stdout = GatedStdout(
                 'TOKEN_PLACE_LLAMA_CPP_JSON:'
-                '{"status":"error","error":"Failed to create llama_context",'
+                '{"protocol_version":2,"command_id":"c1","done":true,'
+                '"status":"error","error":"Failed to create llama_context",'
                 '"exception_type":"RuntimeError","safe_error_category":"cuda_memory_allocation"}\n'
             )
             self.stderr = StringIO('')

@@ -1,6 +1,6 @@
 # token.place
 
-> token.place is a secure proxy service for AI models that implements end-to-end encryption between clients and AI services. It provides transparent API compatibility with original services while ensuring that message content is encrypted on the client before being sent to the server, preventing the service from accessing the plaintext content of user prompts or AI responses.
+> token.place is a secure proxy service for AI models that implements end-to-end encryption between clients and AI services. It provides transparent API compatibility with original services while ensuring that message content is encrypted on the client before being sent to the server, keeping payloads opaque to an honest forwarding relay. Compute nodes receive plaintext for inference, and current relay-selected keys are not independently authenticated; see [K061](design/verified-compute-trust.md).
 
 token.place uses a hybrid encryption approach combining RSA and AES for secure communication. The Python backend serves as a proxy between clients and AI model providers, while the JavaScript client library handles encryption and decryption in the browser.
 
@@ -96,7 +96,7 @@ The API is designed to be compatible with OpenAI's API format:
 - `/api/v1/completions`: Create completions (legacy)
 - `/api/v1/public-key`: Retrieve server's public key for encryption
 
-All API endpoints support both encrypted and unencrypted modes for maximum flexibility.
+Distributed relay inference requires encrypted API v1 envelopes. Historical distributed plaintext routes fail closed; local/direct plaintext processing does not authorize relay plaintext fallbacks.
 
 ## Testing
 

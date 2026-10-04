@@ -1505,6 +1505,11 @@ def test_invalid_expected_manifest_is_rejected_before_connection_or_creation():
         {},
         {**SCRIPT_DIGESTS, "extra_v1": "a" * 64},
         {SERVER_TIME_SCRIPT.name: "a" * 64},
+        {
+            **SCRIPT_DIGESTS,
+            # The pre-reservation-epoch node transition cannot share a manifest.
+            "node_transition_v1": "ffcf60641460ffd7c8e1626c9d243258330e795b44383693a07508b696caf972",
+        },
     ],
 )
 def test_expected_script_digests_must_exactly_match_registry_before_connection(

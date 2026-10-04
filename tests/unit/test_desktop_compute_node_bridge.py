@@ -2517,6 +2517,8 @@ def test_run_supplies_stop_requested_as_runtime_cancellation_predicate(monkeypat
 
 
 def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS',
+                       '{"http://127.0.0.1:5010":"synthetic-admission"}')
     _reset_cancel_queue()
     captured = {'configs': []}
 
@@ -2582,6 +2584,9 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
         ('http://127.0.0.1:5010',),
         ('https://staging.token.place',),
     ]
+    assert all(config.registration_credentials == {
+        'http://127.0.0.1:5010': 'synthetic-admission'
+    } for config in captured['configs'])
     assert unexpected_attempts == []
 
 
@@ -3676,6 +3681,17 @@ def maybe_reexec_for_runtime_refresh(_runtime_setup, *, allow_reexec=True):
     )
     (utils_dir / 'path_handling.py').write_text(
         (repo_utils / 'path_handling.py').read_text(encoding='utf-8'),
+        encoding='utf-8',
+    )
+    networking = utils_dir / 'networking'
+    networking.mkdir()
+    (networking / '__init__.py').write_text('')
+    (networking / 'relay_credentials.py').write_text(
+        (repo_utils / 'networking' / 'relay_credentials.py').read_text(), encoding='utf-8'
+    )
+    (import_root / 'config.py').write_text(
+        'from types import SimpleNamespace\ndef get_config():\n'
+        '    return SimpleNamespace(get=lambda key, default=None: default)\n',
         encoding='utf-8',
     )
     (utils_dir / 'compute_node_runtime.py').write_text(
@@ -8483,3 +8499,57 @@ def test_macos_gpu_failure_packaged_probe_simulates_darwin_platform(monkeypatch,
     )
 
     assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'
+
+
+@pytest.mark.parametrize("credential_error", ["unscoped", "conflict", "insecure"])
+def test_run_rejects_invalid_credentials_before_fanout_without_disclosing_values(
+    monkeypatch, capsys, credential_error,
+):
+    _reset_cancel_queue()
+    for key in ("TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS", "TOKEN_PLACE_RELAY_SERVER_TOKEN",
+                "TOKEN_PLACE_RELAY_SERVER_TOKEN_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr('config.get_config', lambda: SimpleNamespace(
+        get=lambda _key, default=None: default,
+    ))
+    token = "synthetic-bridge-admission"
+    if credential_error == "unscoped":
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", token)
+        expected_guidance = "TOKEN_PLACE_RELAY_SERVER_TOKEN_URL"
+    elif credential_error == "conflict":
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", token)
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN_URL", "https://A.example:443/")
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS", json.dumps({
+            "https://a.example": token,
+        }))
+        expected_guidance = "configure only one"
+    else:
+        monkeypatch.setenv("TOKEN_PLACE_RELAY_REGISTRATION_CREDENTIALS", json.dumps({
+            "http://remote.example": token,
+        }))
+        expected_guidance = "require HTTPS"
+
+    runtimes_created = []
+    def forbidden_runtime(*_args, **_kwargs):
+        runtimes_created.append(True)
+        pytest.fail("Invalid credentials must fail before constructing any relay runtime")
+    _install_fake_runtime_module(monkeypatch, runtime_cls=forbidden_runtime)
+    unexpected_attempts = _install_custom_runtime_isolation(
+        monkeypatch, sys.modules['utils.compute_node_runtime'],
+    )
+    monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: False)
+    args = SimpleNamespace(model='/tmp/model.gguf', mode='cpu',
+                           relay_url=['https://a.example', 'https://b.example'], relay_port=None)
+
+    assert compute_node_bridge.run(args) == 1
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    errors = [event for event in events if event.get('type') == 'error']
+    assert len(errors) == 1
+    assert errors[0]['running'] is False
+    assert errors[0]['registered'] is False
+    assert errors[0]['relay_runtime_state'] == 'failed'
+    assert expected_guidance in errors[0]['message']
+    assert token not in captured.out + captured.err
+    assert runtimes_created == []
+    assert unexpected_attempts == []

@@ -13,4 +13,6 @@ coverage:
         informational: false
     patch:
       default:
-        target: 90
+        # Require 95% of changed coverable lines, with no allowed shortfall.
+        target: 95%
+        threshold: 0%

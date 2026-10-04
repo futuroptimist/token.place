@@ -19,7 +19,7 @@ This plan neither requires a hosted relay nor silently changes existing installa
 |---|---|---|---|
 | Baseline | One memory relay | None | Recorded workload and overhead baseline |
 | Staging shadow | The same memory relay | Isolated, disposable comparison state | Valid epochs with explained comparisons and bounded overhead |
-| Staging cutover rehearsal | One Valkey relay after memory drain and stop | Fresh authoritative namespace | Recovery, rollback, compatibility and client re-registration evidence |
+| Staging cutover rehearsal | One Valkey relay after memory drain and stop | Fresh authoritative namespace | Drain, recovery, rollback, compatibility and client re-registration evidence |
 | Production cutover | Memory until stopped; then one Valkey relay | Fresh production authority | Separate operator go/no-go and monitored acceptance |
 | Later HA scale-out | Valkey | Shared authority | Independent concurrency, limiter, durability and failover gates |
 
@@ -64,7 +64,8 @@ renewal, scheduler updates, selection/reservation, enqueue, claim/reclaim, contr
 progress, response, retrieval/acknowledgement, cancellation, expiry and node-removal continuation.
 Include reads that reap, expire, acknowledge or otherwise change lifecycle state, and background
 cleanup invocations. Audit every method in the [store protocol](../../relay_state_store.py) for
-these effects; copying only writes would compare different histories. A shadow background worker
+these effects and attach a method-by-method audit checklist to the epoch manifest; copying only
+writes would compare different histories. A shadow background worker
 must not independently advance state outside this sequence. Internal time-based behavior of the
 Valkey operations still applies and needs the clock treatment below.
 
@@ -79,7 +80,8 @@ Compare each operation's fixed result class and normalized semantics. At bounded
 compare both stores at the **same completed sequence watermark**. This requires either a bounded
 capture barrier with side-effect-free snapshots, or reviewed immutable snapshots indexed by
 sequence. Do not compare a caught-up Valkey snapshot with newer live memory state. Comparison
-inspection must not introduce unrecorded cleanup calls. Include logical lifecycle, ownership,
+inspection must not introduce unrecorded cleanup calls, and snapshot cost counts against the
+checkpoint pause and resource budgets. Include logical lifecycle, ownership,
 generation, eligibility, scheduler choice/cursor effects, queue order, capacity accounting,
 response/progress presence, terminal outcome and tombstone retention, not physical key layout.
 
@@ -92,7 +94,9 @@ Retain mappings only for the required bounded lifecycle/replay window, including
 retries, then erase them. Map other backend-generated opaque identities only where the contract
 permits equivalence; do not normalize away different scheduler choices, generations or outcomes.
 A missing mapping makes the comparison inconclusive and requires investigation, not a successful
-match. Tokens and mappings never enter diagnostics or durable replay files.
+match. A late retry after mapping expiry is likewise inconclusive; mapping loss stops the epoch
+as specified below, so that retry cannot silently become a mismatch or a parity success. Tokens
+and mappings never enter diagnostics or durable replay files.
 
 Memory's process clock and Valkey's `TIME` are different authorities. Measure replay lag and clock
 uncertainty, and define a conservative exclusion window around reservation, claim, request, response
@@ -107,16 +111,19 @@ clocks belong in isolated test harnesses; real-time boundary behavior needs inde
 
 Before enabling capture, the experiment owner must publish numeric limits for queue entries/bytes,
 operation size, token-map size, replay lag, command timeout, total retry time, checkpoint pause,
-and incremental serving p95/p99 latency, CPU and memory. Also define a collection duration and
-minimum operation counts for each lifecycle class. These are approval inputs to be measured against
-a same-workload baseline, not measurements supplied by this document.
+and incremental serving p95/p99 latency, CPU and memory. Define a maximum inconclusive fraction,
+minimum comparable operation counts for each lifecycle class, collection duration, and maximum
+namespace/persistence-file lifetime. Record approval of these budgets before enabling capture.
+These are inputs to be measured against a same-workload baseline, not measurements supplied by
+this document. Exceeding the inconclusive ceiling cannot qualify an epoch even with zero mismatches.
 
-Capture must not wait for Valkey. A full queue, oversized event, timeout, failed shadow operation,
+Capture must not wait for Valkey. A full queue, oversized event, timeout, shadow execution failure,
 sequence gap, mapping loss or failed checkpoint invalidates the affected epoch's **clean-parity
 claim**; count it explicitly and stop shadow replay pending reset/triage. Never drop an event and
 continue claiming agreement. Preserve memory serving behavior, trip the kill switch if overhead
 exceeds budget, and report the epoch as failed/incomplete. Ambiguous shadow mutations must not be
 blindly retried; any recovery needs proof of exactly which sequence was applied. Otherwise reset.
+Expected contract rejections are compared as results, not classified as execution failures.
 Zero tolerated unexplained semantic mismatches and zero unaccounted gaps are acceptance requirements;
 a bounded failure experiment may intentionally cause failures but cannot count as clean parity.
 
@@ -165,7 +172,7 @@ watermark skew, token-map exhaustion, clock boundaries, kill-switch recovery and
 leakage. Verify that production configuration cannot enable it. These are future implementation
 gates, not additions made by this documentation PR.
 
-A staging report must link the exact commits, configuration and schema manifests, predefined budgets,
+A staging report must link the exact commits, configuration and schema manifests, approved budgets,
 workload/coverage matrix, all excluded/failed epochs, aggregate evidence, triage decisions and owner
 sign-off. Clean shadow parity alone does not qualify HA: serial replay cannot prove distributed
 atomicity, concurrent ordering, multi-relay behavior, or durability. Independently prove the ADR's
@@ -183,7 +190,8 @@ behavior remain mandatory before multiple relay processes/workers serve producti
 Require a separate operator-approved change window after a staging cutover rehearsal. The approval
 must name the exact release/digests, target namespace and topology, qualified client/compute versions,
 readiness evidence, observation window, abort thresholds, recovery owner and accepted state-loss
-policy. This PR grants none of that operational authorization. Memory remains production authority
+policy. Rehearse with that exact release and complete digest map; a release or digest change requires
+a fresh rehearsal before production approval. This PR grants none of that operational authorization. Memory remains production authority
 until that change window; there is no production shadow collection.
 
 1. **Prepare a fresh production namespace.** Never reuse a shadow namespace. Validate resource bounds,
@@ -213,7 +221,8 @@ until that change window; there is no production shadow collection.
 [`843bfff4cd380200c37fc9b7eda0275d561baad7`](https://github.com/futuroptimist/token.place/commit/843bfff4cd380200c37fc9b7eda0275d561baad7)
 from head `491d51ccc0968b423b1c3aede8b37ce6979676bf`. Its opt-in external Valkey/Sentinel chart
 contract and tests are available for qualification; merging it does not deploy or qualify a live
-topology. It changes the reviewed `node_transition_v1` digest.
+topology. These SHAs record the historical baseline; the following compatibility rules apply to
+subsequent releases too. It changes the reviewed `node_transition_v1` digest.
 Manifests carrying the predecessor map remain incompatible. Do not rewrite a live manifest during
 initialization or assume mixed-version rolling compatibility. Verify the
 full compiled digest map for the exact release chosen for cutover. Reusing any nonempty authoritative
@@ -226,7 +235,9 @@ Before stopping memory, abort by disabling the shadow (staging only) or reopenin
 same memory authority. After memory stops, its state is gone; restarting memory is not restoration.
 If a fresh Valkey relay has not accepted any work, operators may return to a fresh single memory
 relay only after fencing Valkey, explicitly accepting the lost registrations/history and arranging
-re-registration. Verify that no admissions occurred rather than assuming the window was empty.
+re-registration. Prove zero admissions using the maintained admission fence plus reviewed aggregate
+authority inspection and admission accounting. Missing/reset counters or an unavailable store cannot
+prove that the window was empty; use the accepted-work recovery path when evidence is uncertain.
 
 After Valkey has accepted work, the normal rollback is **one compatible relay retaining Valkey and
 its namespace**, as required by the ADR. Roll back application code only if its entire script map

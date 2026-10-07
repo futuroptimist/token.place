@@ -98,13 +98,56 @@ The landing-page chat gives the model a small, factual description of token.plac
 product questions without inventing capabilities. The exact message is this single-line value:
 
 ```text
-You are the assistant in the token.place landing-page chat. token.place connects people who need generative-AI inference with people who contribute compute; a selected compute node serves each request. With an honest relay distributing the intended compute key, the relay routes encrypted envelopes without reading the conversation. Current clients trust that relay for key selection; the selected compute node decrypts the request to run inference and encrypts its response for the requesting browser. If you are uncertain, say so. Do not claim or imply that you searched or browsed the web.
+You are the assistant in the token.place landing-page chat. Answer product questions using these facts, and distinguish implemented behavior from proposed designs and unverified deployment details. token.place connects people requesting generative-AI inference with people contributing compute. A selected compute node runs the model. The client encrypts request context for that node, which decrypts it and encrypts its response for the client. Retained conversation context may accompany later turns and failover to another node. Compatible self-hosted HTTPS relays are supported; token.place is not the only permitted relay hostname. Configurable compute nodes can target a chosen relay, which may require admission credentials. This landing page uses its serving origin; do not invent configuration controls. Active API v1 chat is text-only and non-streaming. Progress indicators describe processing status, not partial answer text. API v2 is incomplete. Model availability, context and output limits, speed, and capacity depend on configuration and eligible compute nodes. Do not promise a particular live model, node count, response time, or successful request. The relay-blind goal keeps conversation plaintext out of relay-owned payloads, state, logs, and diagnostics. Current protection assumes an honest relay distributes the intended compute key. Clients currently trust relay-selected keys; independent compute identity and response-sender authentication are not implemented guarantees. Compute operators receive plaintext and may retain it. Routing metadata remains visible. A relay serving mutable client JavaScript can replace that code. Proposed independent operator trust and authenticated transcripts are future work, not current protection. Requests can fail because suitable capacity is unavailable, limits are exceeded, nodes disconnect, or deadlines expire. Suggest actions consistent with the displayed error, such as shortening context, choosing an available tier, or retrying later. Do not promise immediate cancellation or successful failover. If you are uncertain, say so. Do not invent pricing, retention policies, supported features, deployment status, or current availability. Do not claim or imply that you searched or browsed the web.
 ```
 
 This wording deliberately limits the privacy claim to the relay boundary: the relay sees ciphertext
 and safe routing metadata, but the selected compute node necessarily receives plaintext request
 context for inference. It does not claim that the model has current information or that the compute
 node cannot access or retain plaintext.
+
+### Grounded FAQ scope and budget (K232)
+
+The instruction is at most **3,072 UTF-8 bytes**, enforced by
+`test_landing_faq_prompt_has_bounded_utf8_budget` in `tests/unit/test_touch_ui.py`.
+This is a maintenance budget for the fixed instruction, not a tokenizer count or an increase
+to any context/output limit. The entire instruction still participates in context estimation
+and compute-side admission. Keep volatile model names, version numbers, capacity counts, timing
+promises, and deployment observations out of this static prompt. Repository support is not proof
+that a particular relay has deployed that behavior.
+
+The factual boundaries come from these implementation and architecture sources:
+
+| FAQ area | Source and boundary |
+| --- | --- |
+| Request flow and retained history | `static/chat.js`: `createApiV1Messages`, `sendMessageApiOnce`, and bounded failover reuse the conversation context. The selected compute node receives plaintext. |
+| Self-hosted relays and compute admission | [README admission credentials](../../README.md#relay-compute-admission-credentials), `server.py`, and `utils/networking/relay_credentials.py`: configurable relays, destination-bound admission credentials, no token.place-only allowlist. This does not create a packaged desktop credential UI or a relay selector in the landing page. |
+| API and model limitations | This document's API v1 baseline and `static/chat.js`: text-only, non-streaming, capability/tier-dependent requests. A model catalogue entry is not a guarantee of eligible live capacity. |
+| Progress and failures | This document's encrypted-progress contract and `static/chat.js`: telemetry is not answer streaming; cancellation can remain unconfirmed, and retries/failover do not guarantee success. |
+| Privacy and future designs | [K061/K069 design](../design/verified-compute-trust.md): the honest-relay/key-selection assumption remains current. Independent operator trust, authenticated transcripts, and trusted-client distribution are proposed protections, not shipped guarantees. |
+
+Offline regression tests verify documentation/constant equality, the byte budget, required factual
+qualifications, a single leading request-only instruction, context estimation, retained history,
+retry/failover preservation, and encrypted relay boundaries. Browser scenarios use controlled
+responses; these checks do **not** measure generated-answer accuracy or prove a deployed version.
+No model inference is needed for these focused regressions.
+
+Use the following answer rubric for a separately authorized future model evaluation. Accept
+accurate paraphrases; fail unsupported guarantees even if the answer otherwise sounds helpful.
+Record the exact model/build, prompt revision, settings, and outputs before claiming answer quality.
+
+| Example question | Required answer boundary |
+| --- | --- |
+| What is token.place, and who runs my request? | Explain clients, relays, and selected compute nodes; do not claim the relay runs the model. |
+| Can I use my own relay or contribute compute? | Support compatible self-hosted relays and configurable compute nodes; distinguish relay admission from client verification of compute identity. |
+| Can this page switch to my relay? | Do not invent a control: the landing page uses its serving origin. |
+| Can I send images or stream the answer? | API v1 chat is text-only and non-streaming; progress is status telemetry. |
+| Which model is online, and how fast will it answer? | Do not infer current model availability, node counts, latency, or capacity from this static instruction. |
+| Can a malicious relay or the compute operator read my prompt? | State the honest-relay/key-selection assumption, compute plaintext access, and mutable-client-code risk; do not promise malicious-relay resistance or non-retention. |
+| Are independently verified compute and signed responses implemented? | Distinguish the K061/K069 proposal from current behavior. |
+| Why did my request fail, and does cancel stop it immediately? | Follow the displayed error; explain limits, capacity, disconnects, deadlines, and potentially unconfirmed cancellation without promising recovery. |
+| Will another node see earlier turns after failover? | Retained context can accompany failover to another selected compute node. |
+| Is this version deployed, always available, free, or based on a web search? | Admit missing evidence; do not invent deployment, availability, pricing, retention policy, or browsing claims. |
 
 ### Request construction
 

@@ -1,6 +1,48 @@
 import re
 from pathlib import Path
 
+import pytest
+
+
+def _landing_system_message():
+    source = Path("static/chat.js").read_text(encoding="utf-8")
+    match = re.search(r"const LANDING_CHAT_SYSTEM_MESSAGE = '([^'\\]*(?:\\.[^'\\]*)*)';", source)
+    assert match is not None
+    # The canonical instruction is plain text without JavaScript escapes.
+    assert "\\" not in match.group(1)
+    return match.group(1)
+
+
+def test_landing_faq_prompt_has_bounded_utf8_budget():
+    """Bound instruction overhead without changing runtime context/output limits."""
+    assert len(_landing_system_message().encode("utf-8")) <= 3072
+    architecture = Path("docs/architecture/api_v1_e2ee_relay.md").read_text(encoding="utf-8")
+    assert "at most **3,072 UTF-8 bytes**" in architecture
+
+
+@pytest.mark.parametrize("required_guidance", [
+    "Retained conversation context may accompany later turns and failover to another node.",
+    "Compatible self-hosted HTTPS relays are supported; token.place is not the only permitted relay hostname.",
+    "This landing page uses its serving origin; do not invent configuration controls.",
+    "Active API v1 chat is text-only and non-streaming.",
+    "Progress indicators describe processing status, not partial answer text.",
+    "API v2 is incomplete.",
+    "Model availability, context and output limits, speed, and capacity depend on configuration and eligible compute nodes.",
+    "Do not promise a particular live model, node count, response time, or successful request.",
+    "Current protection assumes an honest relay distributes the intended compute key.",
+    "independent compute identity and response-sender authentication are not implemented guarantees.",
+    "Compute operators receive plaintext and may retain it.",
+    "A relay serving mutable client JavaScript can replace that code.",
+    "Proposed independent operator trust and authenticated transcripts are future work, not current protection.",
+    "Do not promise immediate cancellation or successful failover.",
+    "Requests can fail because suitable capacity is unavailable, limits are exceeded, nodes disconnect, or deadlines expire.",
+    "Do not invent pricing, retention policies, supported features, deployment status, or current availability.",
+    "Do not claim or imply that you searched or browsed the web.",
+])
+def test_landing_faq_prompt_retains_required_guidance(required_guidance):
+    """Check the supplied instruction contract, not generated-answer quality."""
+    assert required_guidance in _landing_system_message()
+
 
 def test_send_button_has_touch_optimized_binding():
     index_html = Path("static/index.html").read_text(encoding="utf-8")
@@ -167,13 +209,32 @@ def test_landing_chat_js_preserves_context_and_handles_api_v1_message_envelopes(
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     architecture = Path("docs/architecture/api_v1_e2ee_relay.md").read_text(encoding="utf-8")
     system_message = (
-        "You are the assistant in the token.place landing-page chat. token.place connects people "
-        "who need generative-AI inference with people who contribute compute; a selected compute "
-        "node serves each request. With an honest relay distributing the intended compute key, the "
-        "relay routes encrypted envelopes without reading the conversation. Current clients trust "
-        "that relay for key selection; the selected compute node decrypts the request to run "
-        "inference and encrypts its response for the requesting browser. If you are uncertain, say "
-        "so. Do not claim or imply that you searched or browsed the web."
+        "You are the assistant in the token.place landing-page chat. Answer product questions using"
+        " these facts, and distinguish implemented behavior from proposed designs and unverified "
+        "deployment details. token.place connects people requesting generative-AI inference with "
+        "people contributing compute. A selected compute node runs the model. The client encrypts "
+        "request context for that node, which decrypts it and encrypts its response for the client."
+        " Retained conversation context may accompany later turns and failover to another node. "
+        "Compatible self-hosted HTTPS relays are supported; token.place is not the only permitted "
+        "relay hostname. Configurable compute nodes can target a chosen relay, which may require "
+        "admission credentials. This landing page uses its serving origin; do not invent "
+        "configuration controls. Active API v1 chat is text-only and non-streaming. Progress "
+        "indicators describe processing status, not partial answer text. API v2 is incomplete. "
+        "Model availability, context and output limits, speed, and capacity depend on configuration"
+        " and eligible compute nodes. Do not promise a particular live model, node count, response "
+        "time, or successful request. The relay-blind goal keeps conversation plaintext out of "
+        "relay-owned payloads, state, logs, and diagnostics. Current protection assumes an honest "
+        "relay distributes the intended compute key. Clients currently trust relay-selected keys; "
+        "independent compute identity and response-sender authentication are not implemented "
+        "guarantees. Compute operators receive plaintext and may retain it. Routing metadata "
+        "remains visible. A relay serving mutable client JavaScript can replace that code. Proposed"
+        " independent operator trust and authenticated transcripts are future work, not current "
+        "protection. Requests can fail because suitable capacity is unavailable, limits are "
+        "exceeded, nodes disconnect, or deadlines expire. Suggest actions consistent with the "
+        "displayed error, such as shortening context, choosing an available tier, or retrying "
+        "later. Do not promise immediate cancellation or successful failover. If you are uncertain,"
+        " say so. Do not invent pricing, retention policies, supported features, deployment status,"
+        " or current availability. Do not claim or imply that you searched or browsed the web."
     )
     assert "createApiV1Messages" in chat_js
     assert "this.chatHistory" in chat_js

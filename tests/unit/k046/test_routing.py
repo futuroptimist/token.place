@@ -131,6 +131,7 @@ def test_n09_cached_distributed_cannot_survive_local_switch(routing, payload, mo
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "local")
     with monkeypatch.context() as patch:
         lock_distributed(patch, cp)
+        assert isinstance(cp.get_api_v1_compute_provider(), cp.LocalApiV1ComputeProvider)
         assert routing.client.post("/chat", json=payload(markers="none")).status_code == 200
         routing.local.side_effect = cp.ComputeProviderError("opaque-private-detail")
         response = routing.client.post("/chat", json=payload(markers="none"))
@@ -142,6 +143,8 @@ def test_n09_cached_distributed_cannot_survive_local_switch(routing, payload, mo
     namespace = {"os": os, "LOGGER": Mock()}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "relay.py", "exec"), namespace)
     monkeypatch.setenv("TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED", "1")
+    # Record the variable before the initializer writes it, so teardown restores it.
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "")
     namespace[function.name]()
     assert os.environ["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] == "local"
 
@@ -262,7 +265,8 @@ def test_n23_lan_rejects_unauthorized_targets_before_construction(routing, monke
         monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
     elif case in {"conflict", "out-of-profile"}:
         monkeypatch.setenv(TARGETS[0], "https://external.example")
-        monkeypatch.setenv(TARGETS[3], "http://lan.example")
+        if case == "conflict":
+            monkeypatch.setenv(TARGETS[3], "http://lan.example")
     elif case in {"duplicate", "malformed", "public-ip"}:
         monkeypatch.setenv(TARGETS[0], "http://lan.example")
         monkeypatch.setenv("TOKENPLACE_API_V1_TRUSTED_LAN_TARGETS", {
@@ -469,6 +473,39 @@ def test_launch_sources_declare_explicit_bridge_without_overriding_local():
         assert f'"TOKENPLACE_API_V1_{name}" "value" "{value}"' in chart
     assert '"TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL' in chart
     assert chart.index('$defaultEnv := dict') < chart.index('$mergedEnv := deepCopy $defaultEnv') < chart.index('range $key, $val := .Values.env') < chart.index('range $item := .Values.extraEnv')
+    fixture_tree = ast.parse((ROOT / "tests/conftest.py").read_text())
+    mode_key = "TOKENPLACE_API_V1_COMPUTE_PROVIDER"
+    profile_key = "TOKENPLACE_API_V1_DESTINATION_PROFILE"
+    fallback_key = "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"
+
+    def env_assignments(nodes):
+        found = []
+        for node in nodes:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "test_env"
+                        and isinstance(target.slice, ast.Constant)):
+                    found.append((target.slice.value, node.value, node.lineno))
+        return found
+
+    branch = next(node for node in ast.walk(fixture_tree)
+                  if isinstance(node, ast.If)
+                  and isinstance(node.test, ast.Name)
+                  and node.test.id == "run_real_bridge_e2e"
+                  and any(key == mode_key for key, _, _ in env_assignments(node.body)))
+    real_values = {key: value.value for key, value, _ in env_assignments(branch.body)
+                   if isinstance(value, ast.Constant)}
+    mock_values = {key: value.value for key, value, _ in env_assignments(branch.orelse)
+                   if isinstance(value, ast.Constant)}
+    assert real_values[mode_key] == "distributed"
+    assert real_values[profile_key] == "bridge"
+    assert real_values[fallback_key] == "0"
+    assert mock_values[mode_key] == "local"
+    assert not any(key in {mode_key, profile_key, fallback_key} and line > branch.end_lineno
+                   for key, _, line in env_assignments(ast.walk(fixture_tree)))
     integration = (ROOT / "tests/integration/test_api_v1_desktop_bridge_e2ee.py").read_text()
     assert '"get_api_v1_compute_provider_for_mode"' not in integration
     assert 'setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")' in integration

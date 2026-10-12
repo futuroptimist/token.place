@@ -3,6 +3,10 @@
 This is a breaking routing change. API v1 now resolves the operator's provider
 mode before reading any distributed destination configuration. This source
 change is not a deployment or a qualification of a running installation.
+For this revision, this note supersedes the routing-precedence section in the
+[earlier onboarding guide](relay_sugarkube_onboarding.md), which still describes
+the removed request-origin/implicit routing compatibility behavior. That guide
+was designated read-only in the approved K046 scope; use this note when migrating.
 
 ## Mode and request behavior
 
@@ -15,6 +19,11 @@ change is not a deployment or a qualification of a running installation.
 | `distributed` | Resolve the configured destination and fallback policy. |
 | Other nonempty value | Safe configuration error, before reading destinations. |
 
+The existing operator guardrail flag `TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED=1`
+sets an unset mode to `distributed` at relay bootstrap, before request routing.
+It preserves an explicit `local` mode. Intended bridge launchers should still
+supply their mode, strict profile and concrete target explicitly.
+
 Both metadata markers (`inference_target=desktop_bridge_api_v1_e2ee` and
 `relay_path=api_v1_e2ee`) declare bridge intent. They cannot grant distributed
 permission. Full bridge intent requires a valid encrypted request and, after
@@ -26,6 +35,8 @@ supply a destination. Loopback self-dispatch requires an operator-selected URL.
 A recorded immutable routing decision is used for provider selection; error
 formatting does not re-resolve configuration. Distributed provider caches include
 mode, target, source, profile and fallback policy. Local requests bypass them.
+The existing distributed timeout setting is read when a provider is constructed;
+restart the process when changing it to avoid retaining a cached timeout.
 
 ## Destination profiles and precedence
 
@@ -56,6 +67,9 @@ it cannot retract a payload already dispatched.
 
 `bridge` and `trusted_lan` force fallback off, including when the generic fallback
 switch is `1`. Neither permits a production-default destination or local retry.
+Bridge strictness concerns destination selection and fallback. The `general` and
+`bridge` profiles retain existing redirect, ambient proxy and netrc behavior;
+only `trusted_lan` disables those HTTP behaviors as described below.
 
 For `trusted_lan`, set `TOKENPLACE_API_V1_TRUSTED_LAN_TARGETS` to a JSON array of
 exact approved HTTP(S) base URLs. The selected destination must be enumerated

@@ -166,16 +166,29 @@ def main():
     args = parser.parse_args()
     if not 0 < args.timeout <= 120:
         parser.error("timeout must be greater than zero and at most 120 seconds")
-    report = {
-        "schema": 1, "python": platform.python_version(), "machine": platform.machine(),
-        "libc": platform.libc_ver(), "cpu": cpu_details(Path("/proc/cpuinfo").read_text()),
-        "installed": installed_fingerprints(), "cached_wheels": cached_fingerprints(args.pip_cache),
-        "model_sha256": sha256(args.model),
-    }
-    if report["model_sha256"] != MODEL_SHA256:
+    report = {"schema": 1, "python": platform.python_version(),
+              "machine": platform.machine(), "errors": {}}
+
+    def collect(name, callback):
+        try:
+            report[name] = callback()
+        except Exception:
+            # Exception messages can contain private paths or configuration.
+            # Keep other evidence and use only a fixed, non-secret status.
+            report[name] = None
+            report["errors"][name] = "collection_failed"
+
+    collect("libc", platform.libc_ver)
+    collect("cpu", lambda: cpu_details(Path("/proc/cpuinfo").read_text()))
+    collect("installed", installed_fingerprints)
+    collect("cached_wheels", lambda: cached_fingerprints(args.pip_cache))
+    collect("model_sha256", lambda: sha256(args.model))
+    if report["model_sha256"] is None:
+        report["probe"] = {"status": "not_run_model_checksum_unavailable"}
+    elif report["model_sha256"] != MODEL_SHA256:
         report["probe"] = {"status": "not_run_model_checksum_mismatch"}
     else:
-        report["probe"] = run_probe(args.model.resolve(), args.timeout)
+        collect("probe", lambda: run_probe(args.model.resolve(), args.timeout))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True))

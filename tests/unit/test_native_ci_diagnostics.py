@@ -64,16 +64,21 @@ os.kill(os.getpid(), signal.SIGILL)
 
 
 def test_probe_timeout_reaps_process(tmp_path, monkeypatch):
-    pidfile = tmp_path / "pid"
-    monkeypatch.setattr(diagnostics, "PROBE_CODE", f'''
-import os, pathlib, time
-pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))
-time.sleep(30)
-''')
+    children = []
+    original_popen = diagnostics.subprocess.Popen
+
+    def capture_child(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", capture_child)
+    monkeypatch.setattr(diagnostics, "PROBE_CODE", "import time; time.sleep(30)")
     result = diagnostics.run_probe(tmp_path / "unused.gguf", 0.5)
     assert result["timed_out"] and result["signal"] == "SIGKILL"
+    assert len(children) == 1 and children[0].returncode == -signal.SIGKILL
     with pytest.raises(ProcessLookupError):
-        os.kill(int(pidfile.read_text()), 0)
+        os.kill(children[0].pid, 0)
 
 
 def test_cached_fingerprints_hash_bytes_without_origin_urls(tmp_path):
@@ -168,3 +173,52 @@ for frame in [None, {"stage": ["private"]}, {"stage": "private"},
     assert result["stages"] == ["import_ok", "load_ok"]
     assert result["compiled_features"] == {}
     assert "private" not in json.dumps(result)
+
+
+def test_corrupt_cache_keeps_other_evidence_and_runs_verified_probe(tmp_path, monkeypatch):
+    model = tmp_path / "fixture.gguf"
+    model.write_bytes(b"fixture-model")
+    cache = tmp_path / "wheels" / "ab"
+    cache.mkdir(parents=True)
+    (cache / "llama_cpp_python-unused.whl").write_bytes(b"corrupt-private-bytes")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--model", str(model),
+                                      "--pip-cache", str(tmp_path), "--output", str(output)])
+    monkeypatch.setattr(diagnostics, "MODEL_SHA256", diagnostics.sha256(model))
+    monkeypatch.setattr(diagnostics, "installed_fingerprints", lambda: {"version": "fixture"})
+    calls = []
+
+    def probe(path, timeout):
+        calls.append((path, timeout))
+        return {"loaded": True, "returncode": 0}
+
+    monkeypatch.setattr(diagnostics, "run_probe", probe)
+    diagnostics.main()
+    report = json.loads(output.read_text())
+    assert report["errors"] == {"cached_wheels": "collection_failed"}
+    assert report["cached_wheels"] is None
+    assert report["installed"] == {"version": "fixture"}
+    assert report["cpu"] and report["model_sha256"] == diagnostics.sha256(model)
+    assert report["probe"]["loaded"] and calls == [(model.resolve(), 90)]
+    assert "corrupt-private-bytes" not in output.read_text()
+
+
+def test_collection_errors_are_redacted_and_missing_checksum_blocks_probe(tmp_path, monkeypatch):
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--model", str(tmp_path / "missing.gguf"),
+                                      "--pip-cache", str(tmp_path), "--output", str(output)])
+
+    def broken_fingerprint():
+        raise RuntimeError("private-credential-and-path")
+
+    def unexpected_probe(*args):
+        pytest.fail("a missing model checksum must prevent loading")
+
+    monkeypatch.setattr(diagnostics, "installed_fingerprints", broken_fingerprint)
+    monkeypatch.setattr(diagnostics, "run_probe", unexpected_probe)
+    diagnostics.main()
+    report = json.loads(output.read_text())
+    assert report["errors"] == {"installed": "collection_failed", "model_sha256": "collection_failed"}
+    assert report["installed"] is None and report["cpu"] and report["cached_wheels"] == []
+    assert report["probe"] == {"status": "not_run_model_checksum_unavailable"}
+    assert "private-credential-and-path" not in output.read_text()

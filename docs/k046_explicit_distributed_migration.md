@@ -168,10 +168,12 @@ Offline verification on 2026-10-12 UTC:
   'n01 or relay_only_public_chat or compute_error_does_not_resolve or
   route_level_generate_response'`: 26 passed, 174 deselected; three deprecation
   warnings. This includes 22 N01 cases already counted above.
-- `python tests/unit/k046/run.py tests/test_api.py -k
-  'api_v1_distributed_provider or desktop_bridge_explicit_route or
-  desktop_bridge_production_prefers or desktop_bridge_request_origin'`:
-  19 passed, 248 deselected.
+- `python tests/unit/k046/run.py tests/test_api.py -p pytest_base_url.plugin
+  --base-url='' -k 'api_v1_distributed_provider or desktop_bridge_explicit_route or
+  desktop_bridge_production_prefers or desktop_bridge_request_origin or
+  offline_guard_is_mandatory'`: 20 passed, 247 deselected. This includes the
+  mandatory guard case already counted in the matrix and explicitly enables the
+  existing plugin that exposed the CI fixture-name collision.
 - `python tests/unit/k046/run.py tests/unit/test_api_v1_routes_additional.py -k
   'model_error_preserves_status_and_type or echoes_request_metadata or
   sets_provider_path_and_stream_mode_headers or
@@ -184,6 +186,9 @@ Offline verification on 2026-10-12 UTC:
 
 Earlier diagnostic runs exposed fixture issues (constructor mocking, real-crypto
 assumptions and inherited config) that were corrected before these final results.
+The first remote CI run exposed eight API setup errors because the test parameter
+`base_url` shadowed pytest-base-url's session fixture. It is now named
+`request_origin`; the plugin-enabled guarded run above verifies the correction.
 No live HTTP/DNS, real model, GPU/device, process-based integration, E2E, Helm
 rendering or operational rollout is part of the offline evidence. Full existing
 API/launch suites remain unrun; the selected tests above are the exact evidence.

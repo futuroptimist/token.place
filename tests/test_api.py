@@ -1732,14 +1732,14 @@ def test_desktop_bridge_metadata_cannot_enable_distributed(monkeypatch, client, 
     assert response.get_json()["error"]["code"] == code
 
 
-@pytest.mark.parametrize("base_url,peer", [
+@pytest.mark.parametrize("request_origin,peer", [
     ("http://127.0.0.1:5010", "127.0.0.1"),
     ("http://127.0.0.1:5010", "203.0.113.10"),
     ("http://[::1]:5010", "::1"),
     ("https://untrusted.example", "203.0.113.10"),
 ])
 @pytest.mark.parametrize("target", ["", "https://relay.example/api/v1/"])
-def test_desktop_bridge_request_origin_cannot_select_target(monkeypatch, base_url, peer, target):
+def test_desktop_bridge_request_origin_cannot_select_target(monkeypatch, request_origin, peer, target):
     import api.v1.compute_provider as compute_provider
 
     _clear_distributed_target_env(monkeypatch)
@@ -1747,7 +1747,7 @@ def test_desktop_bridge_request_origin_cannot_select_target(monkeypatch, base_ur
     monkeypatch.setenv("TOKEN_PLACE_ENV", "production")
     monkeypatch.setattr(compute_provider, "_config_value", lambda _key: "")
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", target)
-    with app.test_request_context("/api/v1/chat/completions", base_url=base_url,
+    with app.test_request_context("/api/v1/chat/completions", base_url=request_origin,
                                  environ_base={"REMOTE_ADDR": peer},
                                  headers={"X-Forwarded-Host": "attacker.example"}):
         if target:

@@ -1,10 +1,29 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { App, normalizeDesktopConfig } from './App';
+import { App, normalizeDesktopConfig, normalizeDesktopPythonError } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
 const eventHandlers = new Map<string, (evt: { payload: Record<string, unknown> }) => void>();
+
+describe('packaged installation repair guidance', () => {
+  it('explains temporary candidate launches without exposing local paths', () => {
+    const result = normalizeDesktopPythonError('desktop_python_runtime_invalid category=bundled_runtime_temporary_installation C:\\Users\\private\\Temp\\candidate-install');
+    expect(result.message).toContain('persistent location');
+    expect(result.message).toContain('installed app from its shortcut');
+    expect(result.message).toContain('Keep your existing GGUF');
+    expect(result.message).not.toContain('private');
+    expect(result.disablesPythonBridge).toBe(true);
+  });
+
+  it('keeps model files separate from missing Python standard-library repair', () => {
+    const result = normalizeDesktopPythonError('desktop_python_runtime_invalid category=bundled_runtime_incomplete');
+    expect(result.message).toContain('official installer');
+    expect(result.message).toContain('Keep your existing GGUF model files');
+    expect(result.message).toContain('do not need to install Python');
+    expect(result.disablesPythonBridge).toBe(true);
+  });
+});
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -286,6 +305,35 @@ describe('desktop app start failure handling', () => {
     );
   });
 
+
+  it.each(['Error', 'string'])(
+    'renders temporary-install guidance for a startup inspection rejection (%s)',
+    async (shape) => {
+      const defaultInvoke = invokeMock.getMockImplementation()!;
+      const diagnostic = 'desktop_python_runtime_invalid category=bundled_runtime_temporary_installation C:\\Users\\private\\AppData\\Local\\Temp\\candidate-install';
+      invokeMock.mockImplementation((command: string, ...args: unknown[]) => {
+        if (command === 'inspect_model_artifact') {
+          return Promise.reject(shape === 'Error' ? new Error(diagnostic) : diagnostic);
+        }
+        return defaultInvoke(command, ...args);
+      });
+
+      render(<App />);
+
+      await screen.findByText(/This copy of token\.place is running from a temporary installation/);
+      const body = document.body.textContent ?? '';
+      expect(body).toContain('persistent location');
+      expect(body).toContain('installed app from its shortcut');
+      expect(body).toContain('Keep your existing GGUF model files');
+      expect(body).toContain('Diagnostic code: desktop_python_runtime_invalid');
+      expect(body).not.toContain('missing or damaged');
+      expect(body).not.toContain('candidate-install');
+      expect(body).not.toContain('private');
+      expect((screen.getByText('Start local inference') as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByText('Download') as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value).toBe('/tmp/model.gguf');
+    }
+  );
 
   it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
     'keeps operator setup ready after mount-time %s model inspection failure',

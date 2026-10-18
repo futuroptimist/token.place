@@ -143,6 +143,8 @@ def test_preparation_refuses_other_host_architectures(monkeypatch, tmp_path):
 
 
 def test_linux_release_and_pr_ci_share_runtime_and_validator():
+    config = json.loads((ROOT / "desktop-tauri/src-tauri/tauri.conf.json").read_text())
+    assert "libgomp1" in config["bundle"]["linux"]["deb"]["depends"]
     release = yaml.safe_load((ROOT / ".github/workflows/desktop-release.yml").read_text())
     matrix = release["jobs"]["build"]["strategy"]["matrix"]["include"]
     linux_entries = [entry for entry in matrix if entry["tauri_target"].endswith("linux-gnu")]

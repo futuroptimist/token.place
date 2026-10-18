@@ -113,6 +113,13 @@ fn default_sidecar_script_candidates(
 ) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
+    #[cfg(target_os = "linux")]
+    for resource in crate::python_runtime::resource_root_candidates(exe_path, manifest_dir, None) {
+        if resource.layout == crate::python_runtime::ResourceLayoutKind::LinuxDebResources {
+            candidates.push(resource.root.join("python/inference_sidecar.py"));
+        }
+    }
+
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(
@@ -682,6 +689,26 @@ mod tests {
         let resolved = first_existing_script(candidates).expect("resolved sidecar path");
 
         assert_eq!(Path::new(&resolved), sidecar);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn default_sidecar_uses_installed_deb_script_before_development_fallbacks() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let exe = temp.path().join("usr/bin/token-place-desktop-tauri");
+        let script = temp
+            .path()
+            .join("usr/lib/token-place-desktop-tauri/python/inference_sidecar.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# installed fixture").unwrap();
+        let manifest = temp.path().join("source-checkout");
+        let fallback = manifest.join("python/inference_sidecar.py");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(fallback, "# development fixture").unwrap();
+        let selected =
+            first_existing_script(default_sidecar_script_candidates(Some(&exe), &manifest))
+                .unwrap();
+        assert_eq!(std::path::PathBuf::from(selected), script);
     }
 
     #[test]

@@ -137,7 +137,7 @@ def prepare(cache_dir: Path) -> None:
         # Build a portable CPU backend; do not auto-detect the builder's ISA/GPU.
         run_python(
             py,
-            ["-m", "pip", "install", "--no-cache-dir", *packages],
+            ["-m", "pip", "install", "--no-cache-dir", "--no-binary=llama-cpp-python", *packages],
             env={
                 "CMAKE_ARGS": (
                     "-DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF "

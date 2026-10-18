@@ -51,7 +51,12 @@ jobs:
         run: |
           npm ci
           npm run build
-          cargo test --manifest-path src-tauri/Cargo.toml
+          # Rust sidecar tests invoke python3; use the same dependency-complete
+          # private interpreter, not setup-python's empty builder environment.
+          # Keep the hashed runtime tree immutable while testing it.
+          env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+            PATH="$PWD/src-tauri/python-runtime/bin:$PATH" \
+            cargo test --manifest-path src-tauri/Cargo.toml
           npm run tauri build -- --target x86_64-unknown-linux-gnu --bundles deb
       - name: Verify extracted package and installed resource selection
         run: |

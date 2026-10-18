@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
@@ -1083,8 +1083,14 @@ export function App() {
   const [status, setStatus] = useState<UiState>('idle');
   const [artifact, setArtifact] = useState<ModelArtifactInfo | null>(null);
   const [isDownloadingModel, setIsDownloadingModel] = useState(false);
-  const [error, setError] = useState('');
-  const normalizedError = normalizeDesktopPythonError(error);
+  const [normalizedError, setNormalizedError] = useState<NormalizedDesktopError>(
+    () => normalizeDesktopPythonError('')
+  );
+  // Normalize once at the state boundary; formatting and re-parsing loses categories.
+  const setError = useCallback(
+    (error: unknown) => setNormalizedError(normalizeDesktopPythonError(error)),
+    []
+  );
   const pythonBridgeUnavailable = normalizedError.disablesPythonBridge;
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
@@ -1142,7 +1148,7 @@ export function App() {
     const initializeApplication = async () => {
       void invoke<ModelArtifactInfo>('inspect_model_artifact')
         .then((info) => setArtifact(info))
-        .catch((e) => setError(formatErrorMessage(e)));
+        .catch((e) => setError(e));
 
       try {
         const [detectedBackend, loadedConfig, loadedNodeStatus] = await Promise.all([
@@ -1156,13 +1162,13 @@ export function App() {
         setBackend(detectedBackend);
         setConfig(normalizedConfig);
         if (JSON.stringify(loadedConfig) !== JSON.stringify(normalizedConfig)) {
-          invoke('save_config', { config: normalizedConfig }).catch((e) => setError(formatErrorMessage(e)));
+          invoke('save_config', { config: normalizedConfig }).catch((e) => setError(e));
         }
         computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
         setApplicationInitializationLoaded(true);
       } catch (e) {
-        setError(formatErrorMessage(e));
+        setError(e);
         setApplicationInitialization('failed');
       }
     };
@@ -1325,7 +1331,7 @@ export function App() {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      invoke('save_config', { config: configForSave(next) }).catch((e) => setError(formatErrorMessage(e)));
+      invoke('save_config', { config: configForSave(next) }).catch((e) => setError(e));
       saveTimerRef.current = null;
     }, 300);
   };
@@ -1347,7 +1353,7 @@ export function App() {
         updateConfig({ ...config, model_path: path });
       }
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1363,7 +1369,7 @@ export function App() {
         return next;
       });
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     } finally {
       setIsDownloadingModel(false);
     }
@@ -1387,7 +1393,7 @@ export function App() {
       });
     } catch (e) {
       setStatus('failed');
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1538,7 +1544,7 @@ export function App() {
       };
       computeStatusRef.current = failedStatus;
       setComputeStatus(failedStatus);
-      setError(message);
+      setError(e);
     }
   };
 
@@ -1559,7 +1565,7 @@ export function App() {
       const failedStopStatus = { ...computeStatusRef.current, last_error: message };
       computeStatusRef.current = failedStopStatus;
       setComputeStatus(failedStopStatus);
-      setError(message);
+      setError(e);
     }
   };
 
@@ -1570,7 +1576,7 @@ export function App() {
       setOperatorLogText(logText);
       setIsDebugConsoleOpen(true);
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1578,7 +1584,7 @@ export function App() {
     try {
       await invoke('reveal_operator_log');
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1593,7 +1599,7 @@ export function App() {
       }
       await writeText.call(navigator.clipboard, logPath);
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1601,7 +1607,7 @@ export function App() {
     try {
       await invoke('open_operator_debug_terminal');
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     }
   };
 
@@ -1614,7 +1620,7 @@ export function App() {
         final_output: output,
       });
     } catch (e) {
-      setError(formatErrorMessage(e));
+      setError(e);
     } finally {
       setIsForwarding(false);
     }
@@ -1856,7 +1862,7 @@ export function App() {
                     return;
                   }
                   writeText.call(navigator.clipboard, operatorLogText).catch((err) =>
-                    setError(formatErrorMessage(err))
+                    setError(err)
                   );
                 }}
               >
@@ -1891,7 +1897,7 @@ export function App() {
         <p>Status: <strong>{status}</strong></p>
       </section>
 
-      {error && <p style={{ color: 'crimson' }}>Error: {normalizedError.code ? `${normalizedError.message} Diagnostic code: ${normalizedError.code}` : normalizedError.message}</p>}
+      {normalizedError.message && <p style={{ color: 'crimson' }}>Error: {normalizedError.code ? `${normalizedError.message} Diagnostic code: ${normalizedError.code}` : normalizedError.message}</p>}
       <pre style={{ whiteSpace: 'pre-wrap', padding: 12, border: '1px solid #ddd' }}>{output}</pre>
     </main>
   );

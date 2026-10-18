@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -98,8 +99,11 @@ assert not llama_cpp.llama_supports_gpu_offload(), 'CPU package unexpectedly sup
 print(json.dumps({d.metadata['Name']: d.version for d in metadata.distributions()}))
 """
     packages = json.loads(run_python(py, ["-c", code], timeout=90).stdout)
+    normalized_packages = {
+        re.sub(r"[-_.]+", "-", name).lower(): version for name, version in packages.items()
+    }
     for name, version in manifest["required_packages"].items():
-        if packages.get(name) != version:
+        if normalized_packages.get(re.sub(r"[-_.]+", "-", name).lower()) != version:
             raise shared.RuntimePrepError(f"wrong bundled package version: {name}")
     run_python(py, ["-m", "pip", "check"], timeout=90)
     return packages

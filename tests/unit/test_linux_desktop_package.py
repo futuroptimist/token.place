@@ -4,6 +4,7 @@ import importlib
 import json
 import sys
 import tarfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,28 @@ def make_runtime(root):
         path = root / "lib/python3.11" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# synthetic integrity fixture\n")
+
+
+@pytest.mark.parametrize("version,valid", [("0.3.32", True), ("0.3.31", False)])
+def test_distribution_names_are_normalized_but_versions_remain_exact(
+    tmp_path, monkeypatch, version, valid
+):
+    make_runtime(tmp_path)
+    manifest = linux.load_manifest()
+    packages = {
+        name.lower().replace("-", "_"): value
+        for name, value in manifest["required_packages"].items()
+    }
+    packages["llama_cpp_python"] = version
+    monkeypatch.setattr(linux, "prove_interpreter", lambda *args: None)
+    monkeypatch.setattr(
+        linux, "run_python", lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps(packages))
+    )
+    if valid:
+        assert linux.validate_runtime(tmp_path, manifest) == packages
+    else:
+        with pytest.raises(linux.shared.RuntimePrepError, match="wrong bundled package version"):
+            linux.validate_runtime(tmp_path, manifest)
 
 
 @pytest.mark.parametrize("missing", linux.STDLIB)

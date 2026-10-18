@@ -33,7 +33,7 @@ def validate_tree(root: Path, expected_version: str, expected_build_id: str) -> 
     binaries = list((root / "usr/bin").iterdir())
     if len(binaries) != 1:
         raise RuntimeError("expected exactly one desktop executable")
-    result = linux.shared.run([str(binaries[0]), "--build-identity-json"])
+    result = linux.shared.run([str(binaries[0]), "--build-identity-json"], timeout=30)
     identity = json.loads(result.stdout)
     for key, value in {
         "app_version": expected_version,

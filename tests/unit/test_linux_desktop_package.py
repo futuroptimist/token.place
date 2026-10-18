@@ -3,6 +3,7 @@
 import importlib
 import json
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,34 @@ SCRIPTS = ROOT / "desktop-tauri/scripts"
 sys.path.insert(0, str(SCRIPTS))
 linux = importlib.import_module("prepare_linux_embedded_python_runtime")
 validator = importlib.import_module("validate_linux_desktop_package")
+
+
+@pytest.mark.parametrize(
+    "target,accepted",
+    [("../x/xterm", True), ("../../../../outside", False), ("/tmp/outside", False)],
+)
+def test_linux_archive_parent_links_remain_inside_root(target, accepted):
+    member = tarfile.TarInfo("python/share/terminfo/1/1178")
+    member.type = tarfile.SYMTYPE
+    member.linkname = target
+    if accepted:
+        linux.shared.validate_tar_member(member, "python", allow_internal_parent_links=True)
+        with pytest.raises(linux.shared.RuntimePrepError):
+            linux.shared.validate_tar_member(member, "python")
+    else:
+        with pytest.raises(linux.shared.RuntimePrepError):
+            linux.shared.validate_tar_member(member, "python", allow_internal_parent_links=True)
+
+
+def test_linux_probe_overrides_host_libpython_and_uses_isolated_mode(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(linux.shared, "run", lambda args, **kwargs: calls.append((args, kwargs)))
+    py = tmp_path / "bin/python3"
+    linux.run_python(py, ["-c", "pass"])
+    args, kwargs = calls[0]
+    assert args == [str(py), "-I", "-B", "-c", "pass"]
+    assert kwargs["env"]["LD_LIBRARY_PATH"] == str(tmp_path / "lib")
+    assert kwargs["env"]["LD_PRELOAD"] == ""
 
 
 @pytest.mark.parametrize(

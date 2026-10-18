@@ -17,6 +17,27 @@ PROFILE = "linux-x86_64-cpu-portable-v1"
 STDLIB = ["encodings/__init__.py", "json/__init__.py", "os.py", "platform.py", "struct.py"]
 
 
+def run_python(py: Path, args: list[str], **kwargs):
+    # setup-python exports LD_LIBRARY_PATH. Never bind the bundled interpreter
+    # to the runner's different libpython when preparing or validating it.
+    env = kwargs.pop("env", {})
+    env.update(LD_LIBRARY_PATH=str(py.parent.parent / "lib"), LD_PRELOAD="")
+    return shared.run([str(py), "-I", "-B", *args], env=env, **kwargs)
+
+
+def prove_interpreter(py: Path, root: Path, manifest: dict) -> None:
+    code = (
+        "import json,platform,sys; print(json.dumps({'version':platform.python_version(),"
+        "'machine':platform.machine(),'executable':sys.executable,'prefix':sys.prefix}))"
+    )
+    data = json.loads(run_python(py, ["-c", code], timeout=30).stdout)
+    if data["version"] != manifest["cpython_version"] or data["machine"] != "x86_64":
+        raise shared.RuntimePrepError("bundled interpreter version/architecture mismatch")
+    for key in ("executable", "prefix"):
+        if not Path(data[key]).resolve().is_relative_to(root.resolve()):
+            raise shared.RuntimePrepError(f"{key} is outside generated runtime")
+
+
 def load_manifest(path: Path = MANIFEST) -> dict:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     # Reuse the existing pinned schema/package validation without changing macOS.
@@ -39,6 +60,12 @@ def load_manifest(path: Path = MANIFEST) -> dict:
     digest = manifest.get("sha256", "")
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise shared.RuntimePrepError("invalid Linux archive SHA-256")
+    expected_build = (
+        f"cpython-{manifest['cpython_version']}+{manifest['python_build_standalone_release']}"
+        "-x86_64-unknown-linux-gnu-install_only"
+    )
+    if manifest.get("python_build_standalone_build") != expected_build:
+        raise shared.RuntimePrepError("Linux archive build does not match target/version")
     expected_url = (
         "https://github.com/astral-sh/python-build-standalone/releases/download/"
         f"{manifest['python_build_standalone_release']}/"
@@ -56,11 +83,12 @@ def validate_runtime(runtime: Path, manifest: dict) -> dict:
         if not path.is_file() or not path.resolve().is_relative_to(root):
             raise shared.RuntimePrepError(f"missing or external standard library: {relative}")
     py = root / "bin/python3"
-    shared.prove_interpreter(py, root, manifest)
+    prove_interpreter(py, root, manifest)
     code = """
 import importlib, importlib.metadata as metadata, json, pathlib, platform, sys
 import encodings, os, struct
 root = pathlib.Path(sys.prefix).resolve()
+assert tuple(sys.version_info[:3]) == (3, 11, 13), 'unexpected CPython version'
 names = ['psutil', 'requests', 'dotenv', 'cryptography', 'jinja2', 'numpy', 'diskcache', 'llama_cpp']
 for name in names:
     module = importlib.import_module(name)
@@ -69,11 +97,11 @@ import llama_cpp
 assert not llama_cpp.llama_supports_gpu_offload(), 'CPU package unexpectedly supports GPU offload'
 print(json.dumps({d.metadata['Name']: d.version for d in metadata.distributions()}))
 """
-    packages = json.loads(shared.run([str(py), "-I", "-B", "-c", code]).stdout)
+    packages = json.loads(run_python(py, ["-c", code], timeout=90).stdout)
     for name, version in manifest["required_packages"].items():
         if packages.get(name) != version:
             raise shared.RuntimePrepError(f"wrong bundled package version: {name}")
-    shared.run([str(py), "-I", "-B", "-m", "pip", "check"])
+    run_python(py, ["-m", "pip", "check"], timeout=90)
     return packages
 
 
@@ -96,13 +124,16 @@ def prepare(cache_dir: Path) -> None:
         prefix="linux-runtime-", dir=shared.OUTPUT.parent
     ) as directory:
         temporary = Path(directory)
-        runtime = shared.extract_archive(archive, manifest, temporary)
+        runtime = shared.extract_archive(
+            archive, manifest, temporary, allow_internal_parent_links=True
+        )
         py = runtime / "bin/python3"
-        shared.prove_interpreter(py, runtime, manifest)
+        prove_interpreter(py, runtime, manifest)
         packages = [f"{name}=={version}" for name, version in manifest["required_packages"].items()]
         # Build a portable CPU backend; do not auto-detect the builder's ISA/GPU.
-        shared.run(
-            [str(py), "-I", "-m", "pip", "install", "--no-cache-dir", *packages],
+        run_python(
+            py,
+            ["-m", "pip", "install", "--no-cache-dir", *packages],
             env={
                 "CMAKE_ARGS": (
                     "-DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF "

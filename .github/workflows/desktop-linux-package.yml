@@ -68,10 +68,16 @@ jobs:
             --expected-build-id "$(git rev-parse --short=12 HEAD)"
           # Installation is confined to this disposable GitHub-hosted runner.
           sudo dpkg -i "${debs[0]}"
-          xvfb-run -a /usr/bin/token-place-desktop-tauri --operator-start-preflight-cpu-smoke 2> linux-preflight.stderr.log | tee linux-preflight.json
+          /usr/bin/token-place-desktop-tauri --operator-session-smoke > linux-headless.json
+          # The headless runner has no accessibility bus; keep GTK diagnostics
+          # from contaminating the strict machine-readable probe output.
+          NO_AT_BRIDGE=1 xvfb-run -a /usr/bin/token-place-desktop-tauri --operator-start-preflight-cpu-smoke 2> linux-preflight.stderr.log | tee linux-preflight.json
           python - <<'PY'
           import json
           from pathlib import Path
+          headless = json.loads(Path('linux-headless.json').read_text())
+          assert headless['launcher_source'] == 'bundled'
+          assert headless['layout'] == 'LinuxDebResources'
           data = json.loads(Path('linux-preflight.json').read_text())
           assert data['launcher_source'] == 'bundled'
           assert data['runtime_id'] == 'bundled-cpython-3.11-linux-x86_64-cpu'
@@ -92,6 +98,7 @@ jobs:
         with:
           name: linux-startup-diagnostics-${{ github.sha }}
           path: |
+            desktop-tauri/linux-headless.json
             desktop-tauri/linux-preflight.json
             desktop-tauri/linux-preflight.stderr.log
           if-no-files-found: ignore
@@ -103,6 +110,7 @@ jobs:
           path: |
             desktop-tauri/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
             desktop-tauri/SHA256SUMS-linux-x64.txt
+            desktop-tauri/linux-headless.json
             desktop-tauri/linux-preflight.json
           if-no-files-found: error
           retention-days: 7

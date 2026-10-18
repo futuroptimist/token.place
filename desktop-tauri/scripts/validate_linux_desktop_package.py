@@ -29,6 +29,7 @@ def validate_tree(root: Path, expected_version: str, expected_build_id: str) -> 
             raise RuntimeError(f"invalid Linux runtime provenance: {key}")
     if provenance.get("files") != linux.file_hashes(runtime):
         raise RuntimeError("Linux runtime file integrity mismatch")
+    linux.validate_runtime_notices(runtime, manifest)
     linux.validate_runtime(runtime, manifest)
     binaries = list((root / "usr/bin").iterdir())
     if len(binaries) != 1:
@@ -45,13 +46,17 @@ def validate_tree(root: Path, expected_version: str, expected_build_id: str) -> 
             raise RuntimeError(f"Linux desktop identity mismatch: {key}")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deb", type=Path, required=True)
     parser.add_argument("--expected-version", required=True)
     parser.add_argument("--expected-build-id", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     with tempfile.TemporaryDirectory(prefix="token-place-linux-package-") as directory:
         root = Path(directory)
         subprocess.run(["dpkg-deb", "--extract", str(args.deb.resolve()), str(root)], check=True)
         validate_tree(root, args.expected_version, args.expected_build_id)
+
+
+if __name__ == "__main__":
+    main()

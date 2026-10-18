@@ -49,6 +49,7 @@ def load_manifest(path: Path = MANIFEST) -> dict:
         "required_packages",
         "expected_archive_root",
         "expected_interpreter_path",
+        "runtime_notices",
     ):
         if manifest.get(key) != reference[key]:
             raise shared.RuntimePrepError(f"invalid Linux manifest field: {key}")
@@ -109,6 +110,28 @@ print(json.dumps({d.metadata['Name']: d.version for d in metadata.distributions(
     return packages
 
 
+def runtime_notices(manifest: dict) -> dict[str, str]:
+    return {
+        notice["path"]: (
+            f"{notice['name']} redistribution notice: {notice['license']}\n"
+            "See upstream distribution for complete license text.\n"
+        )
+        for notice in manifest["runtime_notices"]
+    }
+
+
+def write_runtime_notices(root: Path, manifest: dict) -> None:
+    for name, text in runtime_notices(manifest).items():
+        (root / name).write_text(text, encoding="utf-8")
+
+
+def validate_runtime_notices(root: Path, manifest: dict) -> None:
+    for name, text in runtime_notices(manifest).items():
+        path = root / name
+        if not path.is_file() or path.read_text(encoding="utf-8") != text:
+            raise shared.RuntimePrepError(f"missing or invalid runtime notice: {name}")
+
+
 def file_hashes(runtime: Path) -> dict[str, str]:
     result = {}
     for path in sorted(runtime.rglob("*")):
@@ -150,6 +173,8 @@ def prepare(cache_dir: Path) -> None:
         )
         installed = validate_runtime(runtime, manifest)
         shared.clean(runtime)
+        write_runtime_notices(runtime, manifest)
+        validate_runtime_notices(runtime, manifest)
         data = shared.provenance(manifest, installed)
         data.update(
             expected_backend="cpu",
@@ -161,7 +186,12 @@ def prepare(cache_dir: Path) -> None:
         backup = temporary / "old-runtime"
         if shared.OUTPUT.exists():
             shared.OUTPUT.rename(backup)
-        runtime.rename(shared.OUTPUT)
+        try:
+            runtime.rename(shared.OUTPUT)
+        except OSError:
+            if backup.exists():
+                backup.rename(shared.OUTPUT)
+            raise
         shutil.rmtree(backup, ignore_errors=True)
 
 

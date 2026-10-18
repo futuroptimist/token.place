@@ -176,3 +176,172 @@ def test_linux_cpu_policy_preserves_existing_gpu_platform_plans():
     assert (
         llama_cpp_install_plan(platform="darwin", requirements_path=requirements).backend == "metal"
     )
+
+
+def test_declared_notices_are_materialized_hashed_and_required(tmp_path):
+    manifest = linux.load_manifest()
+    linux.write_runtime_notices(tmp_path, manifest)
+    linux.validate_runtime_notices(tmp_path, manifest)
+    inventory = linux.file_hashes(tmp_path)
+    for notice in manifest["runtime_notices"]:
+        assert notice["path"] in inventory
+        path = tmp_path / notice["path"]
+        original = path.read_text()
+        path.unlink()
+        with pytest.raises(linux.shared.RuntimePrepError, match="runtime notice"):
+            linux.validate_runtime_notices(tmp_path, manifest)
+        path.write_text(original)
+    first = tmp_path / manifest["runtime_notices"][0]["path"]
+    first.write_text("incomplete")
+    with pytest.raises(linux.shared.RuntimePrepError, match="runtime notice"):
+        linux.validate_runtime_notices(tmp_path, manifest)
+
+
+@pytest.mark.parametrize("failure", [None, "validation", "swap"])
+def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch, failure):
+    output = tmp_path / "python-runtime"
+    output.mkdir()
+    (output / "previous").write_text("healthy")
+    monkeypatch.setattr(linux.shared, "OUTPUT", output)
+    monkeypatch.setattr(linux.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(linux.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(linux.shared, "download_verified", lambda *a: tmp_path / "archive")
+
+    def extract(archive, manifest, temporary, **kwargs):
+        root = temporary / "python"
+        make_runtime(root)
+        return root
+
+    monkeypatch.setattr(linux.shared, "extract_archive", extract)
+    monkeypatch.setattr(linux, "prove_interpreter", lambda *a: None)
+    calls = []
+    monkeypatch.setattr(linux, "run_python", lambda *a, **kw: calls.append((a, kw)))
+
+    def validate(root, manifest):
+        if failure == "validation":
+            raise linux.shared.RuntimePrepError("invalid prepared runtime")
+        return manifest["required_packages"]
+
+    monkeypatch.setattr(linux, "validate_runtime", validate)
+    rename = Path.rename
+
+    def checked_rename(source, target):
+        if failure == "swap" and source.name == "python" and target == output:
+            raise OSError("simulated swap failure")
+        return rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", checked_rename)
+    if failure:
+        with pytest.raises((OSError, linux.shared.RuntimePrepError)):
+            linux.prepare(tmp_path)
+        assert (output / "previous").read_text() == "healthy"
+    else:
+        linux.prepare(tmp_path)
+        assert not (output / "previous").exists()
+        data = json.loads((output / linux.shared.PROVENANCE).read_text())
+        assert data["files"] == linux.file_hashes(output)
+        linux.validate_runtime_notices(output, linux.load_manifest())
+        args, kwargs = calls[0]
+        assert "--no-binary=llama-cpp-python" in args[1]
+        assert "-DGGML_NATIVE=OFF" in kwargs["env"]["CMAKE_ARGS"]
+    assert not list(tmp_path.glob("linux-runtime-*"))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (None, None),
+        ("version", "3.12.0"),
+        ("machine", "arm64"),
+        ("prefix", "outside"),
+        ("executable", "outside"),
+    ],
+)
+def test_interpreter_identity_and_containment(tmp_path, monkeypatch, field, value):
+    root = tmp_path / "runtime"
+    data = dict(
+        version="3.11.13", machine="x86_64", prefix=str(root), executable=str(root / "bin/python3")
+    )
+    if field:
+        data[field] = str(tmp_path / "outside") if value == "outside" else value
+    monkeypatch.setattr(
+        linux, "run_python", lambda *a, **kw: SimpleNamespace(stdout=json.dumps(data))
+    )
+    if field:
+        with pytest.raises(linux.shared.RuntimePrepError):
+            linux.prove_interpreter(root / "bin/python3", root, linux.load_manifest())
+    else:
+        linux.prove_interpreter(root / "bin/python3", root, linux.load_manifest())
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "provenance", "identity", "binary_count", "runtime_count", "notice"]
+)
+def test_package_requires_complete_matching_identity(tmp_path, monkeypatch, invalid):
+    runtime = tmp_path / "usr/lib/token-place-desktop-tauri/python-runtime"
+    make_runtime(runtime)
+    manifest = linux.load_manifest()
+    linux.write_runtime_notices(runtime, manifest)
+    if invalid == "notice":
+        (runtime / manifest["runtime_notices"][0]["path"]).unlink()
+    data = dict(
+        runtime_id=linux.RUNTIME_ID,
+        expected_backend="cpu",
+        build_profile=linux.PROFILE,
+        source_archive_sha256=manifest["sha256"],
+        target_triple=manifest["target_triple"],
+        files=linux.file_hashes(runtime),
+    )
+    if invalid == "provenance":
+        data["expected_backend"] = "cuda"
+    (runtime / linux.shared.PROVENANCE).write_text(json.dumps(data))
+    binary = tmp_path / "usr/bin/desktop"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("synthetic")
+    if invalid == "binary_count":
+        (binary.parent / "unexpected").write_text("extra")
+    if invalid == "runtime_count":
+        (tmp_path / "usr/lib/other/python-runtime").mkdir(parents=True)
+    identity = dict(
+        app_version="0.1.25",
+        build_id="123456789abc",
+        target_triple=manifest["target_triple"],
+        bundled_runtime_id=linux.RUNTIME_ID,
+    )
+    if invalid == "identity":
+        identity["app_version"] = "0.1.24"
+    monkeypatch.setattr(linux, "validate_runtime", lambda *a: None)
+    monkeypatch.setattr(
+        linux.shared, "run", lambda *a, **kw: SimpleNamespace(stdout=json.dumps(identity))
+    )
+    if invalid:
+        with pytest.raises((RuntimeError, linux.shared.RuntimePrepError)):
+            validator.validate_tree(tmp_path, "0.1.25", "123456789abc")
+    else:
+        validator.validate_tree(tmp_path, "0.1.25", "123456789abc")
+
+
+def test_package_cli_extracts_without_installing(tmp_path, monkeypatch):
+    package = tmp_path / "candidate.deb"
+    package.write_text("synthetic archive")
+    extracted = []
+    validated = []
+    monkeypatch.setattr(
+        validator.subprocess, "run", lambda args, **kw: extracted.append((args, kw))
+    )
+    monkeypatch.setattr(validator, "validate_tree", lambda *args: validated.append(args))
+    validator.main(
+        [
+            "--deb",
+            str(package),
+            "--expected-version",
+            "0.1.25",
+            "--expected-build-id",
+            "123456789abc",
+        ]
+    )
+    args, kwargs = extracted[0]
+    assert args[:3] == ["dpkg-deb", "--extract", str(package.resolve())]
+    assert kwargs == {"check": True}
+    assert validated == [(Path(args[3]), "0.1.25", "123456789abc")]
+    assert not Path(args[3]).exists()

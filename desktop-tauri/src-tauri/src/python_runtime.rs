@@ -1155,10 +1155,22 @@ pub fn resource_root_candidates(
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
             // Debian packages install the binary in usr/bin and resources in
-            // usr/lib/<binary-name>. Sidecars/headless commands do not have a
+            // usr/lib/<product-name>. Sidecars/headless commands do not have a
             // Tauri AppHandle, so they need the same installed resource root.
             #[cfg(target_os = "linux")]
             if exe_dir.file_name().is_some_and(|name| name == "bin") {
+                if let Some(prefix) = exe_dir.parent() {
+                    let config: serde_json::Value =
+                        serde_json::from_str(include_str!("../tauri.conf.json"))
+                            .expect("valid embedded Tauri configuration");
+                    if let Some(product_name) = config.get("productName").and_then(|v| v.as_str()) {
+                        push_unique_resource_root(
+                            &mut candidates,
+                            prefix.join("lib").join(product_name),
+                            ResourceLayoutKind::LinuxDebResources,
+                        );
+                    }
+                }
                 if let (Some(prefix), Some(name)) = (exe_dir.parent(), exe_path.file_name()) {
                     push_unique_resource_root(
                         &mut candidates,
@@ -2415,7 +2427,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = TempDir::new().unwrap();
         let exe = temp.path().join("usr/bin/token-place-desktop-tauri");
-        let resources = temp.path().join("usr/lib/token-place-desktop-tauri");
+        let resources = temp.path().join("usr/lib/token.place desktop");
         let runtime = resources.join("python-runtime");
         let py = runtime.join("bin/python3");
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();

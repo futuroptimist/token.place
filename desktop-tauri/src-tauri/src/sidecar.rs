@@ -698,7 +698,7 @@ mod tests {
         let exe = temp.path().join("usr/bin/token-place-desktop-tauri");
         let script = temp
             .path()
-            .join("usr/lib/token-place-desktop-tauri/python/inference_sidecar.py");
+            .join("usr/lib/token.place desktop/python/inference_sidecar.py");
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, "# installed fixture").unwrap();
         let manifest = temp.path().join("source-checkout");

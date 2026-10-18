@@ -738,6 +738,7 @@ fn bundled_runtime_layout_is_eligible(layout: &ResourceLayoutKind, packaged: boo
     *layout == ResourceLayoutKind::MacOsAppResources
         || *layout == ResourceLayoutKind::WindowsResources
         || *layout == ResourceLayoutKind::TauriResourceDir
+        || *layout == ResourceLayoutKind::LinuxDebResources
         || (*layout == ResourceLayoutKind::DevSourceTree && !packaged)
 }
 
@@ -1105,6 +1106,7 @@ pub enum ResourceLayoutKind {
     TauriResourceDir,
     WindowsResources,
     LinuxResources,
+    LinuxDebResources,
     MacOsAppResources,
     ExecutablePythonSibling,
     DevSourceTree,
@@ -1152,6 +1154,19 @@ pub fn resource_root_candidates(
 
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
+            // Debian packages install the binary in usr/bin and resources in
+            // usr/lib/<binary-name>. Sidecars/headless commands do not have a
+            // Tauri AppHandle, so they need the same installed resource root.
+            #[cfg(target_os = "linux")]
+            if exe_dir.file_name().is_some_and(|name| name == "bin") {
+                if let (Some(prefix), Some(name)) = (exe_dir.parent(), exe_path.file_name()) {
+                    push_unique_resource_root(
+                        &mut candidates,
+                        prefix.join("lib").join(name),
+                        ResourceLayoutKind::LinuxDebResources,
+                    );
+                }
+            }
             push_unique_resource_root(
                 &mut candidates,
                 exe_dir.join("resources"),
@@ -2392,6 +2407,53 @@ mod tests {
         assert!(exe_roots.iter().any(|candidate| {
             candidate.layout == expected_layout && candidate.root.ends_with("App/resources")
         }));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_deb_sidecar_resolves_private_python_without_app_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let exe = temp.path().join("usr/bin/token-place-desktop-tauri");
+        let resources = temp.path().join("usr/lib/token-place-desktop-tauri");
+        let runtime = resources.join("python-runtime");
+        let py = runtime.join("bin/python3");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        let payload = serde_json::json!({
+            "version": [3,11,13], "machine": "x86_64", "pointer_bits": 64,
+            "executable": py, "prefix": runtime,
+        });
+        std::fs::write(&py, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload)).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for relative in [
+            "encodings/__init__.py",
+            "json/__init__.py",
+            "os.py",
+            "platform.py",
+            "struct.py",
+        ] {
+            let path = runtime.join("lib/python3.11").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "# fixture").unwrap();
+        }
+        let script = resources.join("python/inference_sidecar.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# fixture").unwrap();
+        let manifest = temp.path().join("absent-source-checkout");
+        let selected =
+            resolve_bridge_script_path("inference_sidecar.py", Some(&exe), &manifest, None, None)
+                .unwrap();
+        assert_eq!(selected, script);
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: None,
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: true,
+        })
+        .unwrap();
+        assert_eq!(Path::new(&launcher.program), py);
+        assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
     }
 
     #[test]

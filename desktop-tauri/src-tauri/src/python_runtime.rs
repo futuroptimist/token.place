@@ -204,6 +204,8 @@ fn runtime_architecture_decision(
             expected_machine: "arm64",
             windows_attestation: None,
         })
+    } else if target_os == "linux" && target_arch != "x86_64" {
+        Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture)
     } else if target_arch == "x86_64" {
         Ok(RuntimeArchitectureDecision {
             expected_machine: "x86_64",
@@ -837,6 +839,19 @@ fn validate_bundled_runtime_candidate(
     candidate: PythonLauncher,
     packaged: bool,
 ) -> Result<PythonLauncher, PythonLauncherError> {
+    if cfg!(target_os = "linux") && packaged {
+        let valid = bundled_runtime_root_from_candidate(&candidate)
+            .is_some_and(|root| runtime_integrity::validate_linux(&root).is_ok());
+        if !valid {
+            return Err(launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                PythonLauncherCategory::BundledRuntimeIncomplete,
+                Some(&candidate),
+                packaged,
+                None,
+            ));
+        }
+    }
     // Check installation location and essential files without starting Python.
     // Failure remains fatal: never repair from, or fall back to, a host runtime.
     if cfg!(target_os = "windows") && packaged {
@@ -2921,6 +2936,19 @@ mod tests {
         let py = resources.join("python-runtime/bin/python3");
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
+        if cfg!(target_os = "linux") {
+            for relative in [
+                "encodings/__init__.py",
+                "json/__init__.py",
+                "os.py",
+                "platform.py",
+                "struct.py",
+            ] {
+                let file = runtime_root.join("lib/python3.11").join(relative);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, "# fixture").unwrap();
+            }
+        }
         let probe = format!(
             r#"{{"version":[3,11,13],"machine":"{}","pointer_bits":64,"executable":"{}","prefix":"{}"}}"#,
             expected_runtime_arch(),

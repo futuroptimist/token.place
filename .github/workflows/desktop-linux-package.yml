@@ -1,0 +1,93 @@
+name: Desktop Linux package
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-linux-package.yml'
+      - '.github/workflows/desktop-release.yml'
+      - 'desktop-tauri/**'
+      - 'tests/unit/test_linux_desktop_package.py'
+      - 'utils/**'
+      - 'config.py'
+      - 'encrypt.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-linux-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: desktop-tauri
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> target
+          cache-bin: 'false'
+      - name: Install hosted Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb
+      - name: Prepare pinned app-private CPU runtime
+        run: python scripts/prepare_linux_embedded_python_runtime.py
+      - name: Build Linux deb
+        run: |
+          npm ci
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml
+          npm run tauri build -- --target x86_64-unknown-linux-gnu --bundles deb
+      - name: Verify extracted package and installed resource selection
+        run: |
+          set -euo pipefail
+          debs=(src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb)
+          [ "${#debs[@]}" -eq 1 ] && [ -f "${debs[0]}" ]
+          python scripts/validate_linux_desktop_package.py --deb "${debs[0]}" \
+            --expected-version "$(node -p 'require("./package.json").version')" \
+            --expected-build-id "$(git rev-parse --short=12 HEAD)"
+          # Installation is confined to this disposable GitHub-hosted runner.
+          sudo dpkg -i "${debs[0]}"
+          xvfb-run -a /usr/bin/token-place-desktop-tauri --operator-start-preflight-cpu-smoke > linux-preflight.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('linux-preflight.json').read_text())
+          assert data['launcher_source'] == 'bundled'
+          assert data['runtime_id'] == 'bundled-cpython-3.11-linux-x86_64-cpu'
+          assert data['operator_start_preflight'] == 'cpu_smoke_ok'
+          assert data['bridge_preflight'] == 'ok'
+          assert data['model_artifact_inspect'] == 'ok'
+          assert data['bridge_child_spawned'] is True
+          assert data['bridge_event_received'] is True
+          assert data['selected_backend'] == 'cpu'
+          for key in ('pip_actions', 'compiler_actions', 'network_actions', 'download_actions'):
+              assert data[key] == 0, (key, data[key])
+          print(json.dumps(data, indent=2))
+          PY
+          sha256sum "${debs[0]}" > SHA256SUMS-linux-x64.txt
+      - name: Retain candidate package and validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-candidate-${{ github.sha }}
+          path: |
+            desktop-tauri/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            desktop-tauri/SHA256SUMS-linux-x64.txt
+            desktop-tauri/linux-preflight.json
+          if-no-files-found: error
+          retention-days: 7

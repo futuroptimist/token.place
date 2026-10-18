@@ -12,6 +12,8 @@ pub const BUNDLED_RUNTIME_ID: &str = if cfg!(target_os = "windows") {
     "bundled-cpython-3.11-win-x86_64-cu124"
 } else if cfg!(target_os = "macos") {
     "bundled-cpython-3.11-macos-arm64"
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    "bundled-cpython-3.11-linux-x86_64-cpu"
 } else {
     "bundled-cpython-3.11-unknown"
 };

@@ -1255,13 +1255,11 @@ print(json.dumps(result, sort_keys=True))
         'supported': True,
     }
 
-def test_release_workflow_does_not_rebuild_llama_cpp_on_release_matrix() -> None:
+def test_release_workflow_prepares_app_private_linux_runtime() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
-    install_step = text.split('- name: Install desktop llama-cpp runtime with platform GPU backend', 1)[1]
-    install_step = install_step.split('- name: Cache embedded macOS Python archive and wheels', 1)[0]
-    assert "if: runner.os == 'Linux'" in install_step
-    assert "macOS prepares and validates its bundled interpreter" in install_step
-    assert 'llama_cpp_install_plan_fallbacks(platform=sys.platform' in install_step
+    assert 'python scripts/prepare_linux_embedded_python_runtime.py' in text
+    assert 'Install desktop llama-cpp runtime with platform GPU backend' not in text
+    assert 'python scripts/prepare_embedded_python_runtime.py' in text
 
 
 def test_release_workflow_uses_explicit_arm64_macos_runner_for_embedded_runtime() -> None:
@@ -4074,7 +4072,7 @@ def test_publish_upload_url_encodes_notice_asset_names() -> None:
     assert '"${upload_url}?name=${asset_name}"' not in script
 
 
-def test_publish_manifest_provenance_requires_exact_two_target_manifests_in_source() -> None:
+def test_publish_manifest_provenance_requires_exact_three_target_manifests_in_source() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert "'release-assets/macos/token.place-desktop-aarch64-apple-darwin-build-manifest.json': {" in text
     assert "'release-assets/windows/token.place-desktop-x86_64-pc-windows-msvc-build-manifest.json': {" in text
@@ -4108,6 +4106,18 @@ def _write_manifest_and_asset(directory, manifest_filename, asset_filename, *, t
     (directory / manifest_filename).write_text(json.dumps(manifest), encoding='utf-8')
 
 
+def _write_linux_release_fixture(tmp_path, tag, commit):
+    directory = tmp_path / 'release-assets' / 'linux'
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_manifest_and_asset(
+        directory,
+        'token.place-desktop-x86_64-unknown-linux-gnu-build-manifest.json',
+        'token.place-desktop-0.1.3-amd64.deb',
+        tag=tag, commit=commit,
+        target_triple='x86_64-unknown-linux-gnu', runtime_id='bundled-cpython-3.11-linux-x86_64-cpu',
+    )
+
+
 def _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag='desktop-v0.1.3', commit='a' * 40):
     source = _load_publish_manifest_provenance_source()
     monkeypatch.chdir(tmp_path)
@@ -4130,7 +4140,8 @@ def test_publish_manifest_provenance_rejects_additional_target_manifest(tmp_path
     commit = 'a' * 40
     macos_dir = tmp_path / 'release-assets' / 'macos'
     windows_dir = tmp_path / 'release-assets' / 'windows'
-    linux_dir = tmp_path / 'release-assets' / 'linux'
+    linux_dir = tmp_path / 'release-assets' / 'linux-arm64'
+    _write_linux_release_fixture(tmp_path, tag, commit)
     macos_dir.mkdir(parents=True)
     windows_dir.mkdir(parents=True)
     linux_dir.mkdir(parents=True)
@@ -4151,7 +4162,7 @@ def test_publish_manifest_provenance_rejects_additional_target_manifest(tmp_path
     )
     _write_manifest_and_asset(
         linux_dir,
-        'token.place-desktop-x86_64-unknown-linux-gnu-build-manifest.json',
+        'token.place-desktop-aarch64-unknown-linux-gnu-build-manifest.json',
         'token.place-desktop-0.1.3-x86_64.AppImage',
         tag=tag, commit=commit,
         target_triple='x86_64-unknown-linux-gnu', runtime_id='bundled-cpython-3.11-linux-x86_64',
@@ -4166,6 +4177,7 @@ def test_publish_manifest_provenance_rejects_wrong_target_triple_mapping(tmp_pat
     commit = 'b' * 40
     macos_dir = tmp_path / 'release-assets' / 'macos'
     windows_dir = tmp_path / 'release-assets' / 'windows'
+    _write_linux_release_fixture(tmp_path, tag, commit)
     macos_dir.mkdir(parents=True)
     windows_dir.mkdir(parents=True)
 
@@ -4194,6 +4206,7 @@ def test_publish_manifest_provenance_rejects_wrong_bundled_runtime_id(tmp_path, 
     commit = 'c' * 40
     macos_dir = tmp_path / 'release-assets' / 'macos'
     windows_dir = tmp_path / 'release-assets' / 'windows'
+    _write_linux_release_fixture(tmp_path, tag, commit)
     macos_dir.mkdir(parents=True)
     windows_dir.mkdir(parents=True)
 
@@ -4217,11 +4230,12 @@ def test_publish_manifest_provenance_rejects_wrong_bundled_runtime_id(tmp_path, 
         _run_publish_manifest_provenance_checker(tmp_path, monkeypatch, tag=tag, commit=commit)
 
 
-def test_publish_manifest_provenance_accepts_exact_expected_manifest_pair(tmp_path, monkeypatch) -> None:
+def test_publish_manifest_provenance_accepts_exact_expected_manifest_set(tmp_path, monkeypatch) -> None:
     tag = 'desktop-v0.1.3'
     commit = 'd' * 40
     macos_dir = tmp_path / 'release-assets' / 'macos'
     windows_dir = tmp_path / 'release-assets' / 'windows'
+    _write_linux_release_fixture(tmp_path, tag, commit)
     macos_dir.mkdir(parents=True)
     windows_dir.mkdir(parents=True)
 

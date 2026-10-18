@@ -15,6 +15,32 @@ pub enum IntegrityFailure {
     MissingStandardLibrary,
 }
 
+/// Linux .deb resources are installed under /usr/lib/<application>. Use
+/// case-sensitive canonical containment; Windows path normalization is not valid here.
+pub fn validate_linux(root: &Path) -> Result<(), IntegrityFailure> {
+    let resolved = root
+        .canonicalize()
+        .map_err(|_| IntegrityFailure::MissingStandardLibrary)?;
+    for relative in [
+        "encodings/__init__.py",
+        "json/__init__.py",
+        "os.py",
+        "platform.py",
+        "struct.py",
+    ] {
+        let path = root.join("lib/python3.11").join(relative);
+        if !path.is_file()
+            || !path
+                .canonicalize()
+                .map(|p| p.starts_with(&resolved))
+                .unwrap_or(false)
+        {
+            return Err(IntegrityFailure::MissingStandardLibrary);
+        }
+    }
+    Ok(())
+}
+
 fn normalized(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -73,6 +99,36 @@ pub fn validate(root: &Path, temp_roots: &[PathBuf]) -> Result<(), IntegrityFail
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_layout_requires_every_core_module() {
+        let root =
+            std::env::temp_dir().join(format!("tokenplace-linux-integrity-{}", std::process::id()));
+        assert!(!root.exists());
+        let names = [
+            "encodings/__init__.py",
+            "json/__init__.py",
+            "os.py",
+            "platform.py",
+            "struct.py",
+        ];
+        for relative in names {
+            let path = root.join("lib/python3.11").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "# fixture").unwrap();
+        }
+        assert_eq!(validate_linux(&root), Ok(()));
+        for relative in names {
+            let path = root.join("lib/python3.11").join(relative);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                validate_linux(&root),
+                Err(IntegrityFailure::MissingStandardLibrary)
+            );
+            std::fs::write(path, "# fixture").unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn windows_temporary_candidates_are_not_durable_installations() {

@@ -68,7 +68,7 @@ jobs:
             --expected-build-id "$(git rev-parse --short=12 HEAD)"
           # Installation is confined to this disposable GitHub-hosted runner.
           sudo dpkg -i "${debs[0]}"
-          xvfb-run -a /usr/bin/token-place-desktop-tauri --operator-start-preflight-cpu-smoke > linux-preflight.json
+          xvfb-run -a /usr/bin/token-place-desktop-tauri --operator-start-preflight-cpu-smoke 2> linux-preflight.stderr.log | tee linux-preflight.json
           python - <<'PY'
           import json
           from pathlib import Path
@@ -86,6 +86,16 @@ jobs:
           print(json.dumps(data, indent=2))
           PY
           sha256sum "${debs[0]}" > SHA256SUMS-linux-x64.txt
+      - name: Retain startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-startup-diagnostics-${{ github.sha }}
+          path: |
+            desktop-tauri/linux-preflight.json
+            desktop-tauri/linux-preflight.stderr.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Retain candidate package and validation evidence
         uses: actions/upload-artifact@v4
         with:

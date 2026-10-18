@@ -304,7 +304,7 @@ function authoritativeNativeStartupValue(
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
 
-const PACKAGED_RUNTIME_MESSAGE = 'The bundled token.place runtime is missing or damaged. Reinstall token.place desktop. You do not need to install Python or Xcode Command Line Tools.';
+const PACKAGED_RUNTIME_MESSAGE = 'The bundled token.place runtime is missing or damaged. Reinstall token.place desktop using the official installer, then open the installed app from its shortcut. Keep your existing GGUF model files; you can reselect them after repair. You do not need to install Python or Xcode Command Line Tools.';
 const PYTHON_RUNTIME_ERROR_CODES = [
   'desktop_python_runtime_missing',
   'desktop_python_runtime_invalid',
@@ -315,6 +315,9 @@ const PYTHON_RUNTIME_ERROR_CODES = [
 export function normalizeDesktopPythonError(error: unknown): NormalizedDesktopError {
   const raw = error instanceof Error ? error.message : String(error ?? '');
   const code = PYTHON_RUNTIME_ERROR_CODES.find((candidate) => raw.includes(candidate)) ?? null;
+  if (raw.includes('bundled_runtime_temporary_installation')) {
+    return { message: 'This copy of token.place is running from a temporary installation. Run the official installer into a persistent location, then open the installed app from its shortcut. Keep your existing GGUF model files; they do not need to be downloaded again.', code: code ?? 'desktop_python_runtime_invalid', disablesPythonBridge: true };
+  }
   const looksLikeRawLauncherFailure =
     /xcode-select|No developer tools were found|CommandLineTools|attempted launcher|stdout=|stderr=|TOKEN_PLACE_(SIDECAR_)?PYTHON|\/usr\/bin\/python3|\/Users\//i.test(raw);
   if (code === 'desktop_python_runtime_missing' || code === 'desktop_python_runtime_invalid' || looksLikeRawLauncherFailure) {

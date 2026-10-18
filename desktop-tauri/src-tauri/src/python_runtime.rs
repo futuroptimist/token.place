@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::ComputeMode;
 
+#[path = "runtime_integrity.rs"]
+mod runtime_integrity;
+
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
 #[cfg(test)]
@@ -127,6 +130,8 @@ pub enum PythonLauncherCategory {
     BundledRuntimeNotPython3,
     BundledRuntimeWrongArchitecture,
     BundledRuntimeProbeFailed,
+    BundledRuntimeTemporaryInstallation,
+    BundledRuntimeIncomplete,
     BundledRuntimeProvenanceInvalid,
     BundledRuntimeAmbiguous,
     OverrideMissing,
@@ -144,6 +149,8 @@ impl PythonLauncherCategory {
             Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
             Self::BundledRuntimeWrongArchitecture => "bundled_runtime_wrong_architecture",
             Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::BundledRuntimeTemporaryInstallation => "bundled_runtime_temporary_installation",
+            Self::BundledRuntimeIncomplete => "bundled_runtime_incomplete",
             Self::BundledRuntimeProvenanceInvalid => "bundled_runtime_provenance_invalid",
             Self::BundledRuntimeAmbiguous => "bundled_runtime_ambiguous",
             Self::OverrideMissing => "override_missing",
@@ -830,6 +837,31 @@ fn validate_bundled_runtime_candidate(
     candidate: PythonLauncher,
     packaged: bool,
 ) -> Result<PythonLauncher, PythonLauncherError> {
+    // Check installation location and essential files without starting Python.
+    // Failure remains fatal: never repair from, or fall back to, a host runtime.
+    if cfg!(target_os = "windows") && packaged {
+        if let Some(root) = bundled_runtime_root_from_candidate(&candidate) {
+            runtime_integrity::validate(&root, &runtime_integrity::temporary_roots()).map_err(
+                |failure| {
+                    let category = match failure {
+                        runtime_integrity::IntegrityFailure::TemporaryInstallation => {
+                            PythonLauncherCategory::BundledRuntimeTemporaryInstallation
+                        }
+                        runtime_integrity::IntegrityFailure::MissingStandardLibrary => {
+                            PythonLauncherCategory::BundledRuntimeIncomplete
+                        }
+                    };
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        category,
+                        Some(&candidate),
+                        packaged,
+                        None,
+                    )
+                },
+            )?;
+        }
+    }
     let architecture = runtime_architecture_decision(std::env::consts::OS, std::env::consts::ARCH)
         .map_err(|category| {
             launcher_error(
@@ -870,6 +902,15 @@ fn validate_bundled_runtime_candidate(
         .output()
     {
         Ok(output) => {
+            if !output.status.success() {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::BundledRuntimeProbeFailed,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
@@ -2101,6 +2142,26 @@ mod tests {
             .expect("create runtime dir");
         std::fs::write(&runtime, b"python").expect("write runtime");
         runtime
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn temporary_packaged_runtime_fails_before_interpreter_spawn() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp
+            .path()
+            .join("tokenplace-step05-attempt63-test/candidate-install");
+        // No interpreter exists: installation validation must precede spawning it.
+        let error = resolve_bundled_python_launcher_at_root(&root, true).unwrap_err();
+        assert_eq!(
+            error.category,
+            PythonLauncherCategory::BundledRuntimeTemporaryInstallation
+        );
+        assert_eq!(error.public_code, DESKTOP_PYTHON_RUNTIME_INVALID);
+        assert_eq!(error.exit_status, None);
+        assert!(!error
+            .to_string()
+            .contains(&temp.path().display().to_string()));
     }
 
     #[test]

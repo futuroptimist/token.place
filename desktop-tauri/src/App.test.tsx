@@ -1,10 +1,29 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { App, normalizeDesktopConfig } from './App';
+import { App, normalizeDesktopConfig, normalizeDesktopPythonError } from './App';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
 const eventHandlers = new Map<string, (evt: { payload: Record<string, unknown> }) => void>();
+
+describe('packaged installation repair guidance', () => {
+  it('explains temporary candidate launches without exposing local paths', () => {
+    const result = normalizeDesktopPythonError('desktop_python_runtime_invalid category=bundled_runtime_temporary_installation C:\\Users\\private\\Temp\\candidate-install');
+    expect(result.message).toContain('persistent location');
+    expect(result.message).toContain('installed app from its shortcut');
+    expect(result.message).toContain('Keep your existing GGUF');
+    expect(result.message).not.toContain('private');
+    expect(result.disablesPythonBridge).toBe(true);
+  });
+
+  it('keeps model files separate from missing Python standard-library repair', () => {
+    const result = normalizeDesktopPythonError('desktop_python_runtime_invalid category=bundled_runtime_incomplete');
+    expect(result.message).toContain('official installer');
+    expect(result.message).toContain('Keep your existing GGUF model files');
+    expect(result.message).toContain('do not need to install Python');
+    expect(result.disablesPythonBridge).toBe(true);
+  });
+});
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),

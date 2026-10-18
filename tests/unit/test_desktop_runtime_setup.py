@@ -4311,8 +4311,9 @@ def _common_packaged_mocks(monkeypatch, tmp_path, before_probe):
     (json.dumps({'runtime_id': 'bundled-cpython-3.11-win-x86_64-cu124'}), 'missing_triple'),
     (json.dumps({'target_triple': 'x86_64-pc-windows-msvc'}), 'missing_runtime_id'),
 ])
+@pytest.mark.parametrize('requested_mode', ['auto', 'gpu', 'hybrid'])
 def test_cuda_probe_success_bypassed_by_invalid_provenance_fails_closed(
-    monkeypatch, tmp_path, provenance_content, label
+    monkeypatch, tmp_path, provenance_content, label, requested_mode
 ):
     """CUDA probe success must not bypass an invalid provenance on a Windows packaged layout."""
     runtime_dir, _ = _setup_windows_packaged_layout(monkeypatch, tmp_path)
@@ -4331,7 +4332,7 @@ def test_cuda_probe_success_bypassed_by_invalid_provenance_fails_closed(
     )
 
     result = desktop_runtime_setup.ensure_desktop_llama_runtime(
-        'auto', repo_root=tmp_path, context_tier='64k-full'
+        requested_mode, repo_root=tmp_path, context_tier='64k-full'
     )
 
     assert result['runtime_action'] == 'bundled_runtime_probe_failed', (

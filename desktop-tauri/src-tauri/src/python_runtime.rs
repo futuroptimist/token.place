@@ -2675,6 +2675,21 @@ mod tests {
         let runtime_bin = resource_root.join("python-runtime").join("bin");
         std::fs::create_dir_all(&python_dir).expect("create python dir");
         std::fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        if cfg!(target_os = "linux") {
+            for relative in [
+                "encodings/__init__.py",
+                "json/__init__.py",
+                "os.py",
+                "platform.py",
+                "struct.py",
+            ] {
+                let path = resource_root
+                    .join("python-runtime/lib/python3.11")
+                    .join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "# fixture").unwrap();
+            }
+        }
         let model_script = python_dir.join("model_bridge.py");
         let compute_script = python_dir.join("compute_node_bridge.py");
         std::fs::write(&model_script, "# model bridge\n").expect("write model bridge");

@@ -55,3 +55,42 @@ asset and SHA-256, run `desktop-tauri/scripts/prepare_embedded_python_runtime.py
 on an Apple Silicon macOS runner, verify Metal probing and release artifact
 validation, then commit only the manifest/script/docs changes. Do not commit the
 downloaded archive or generated `python-runtime` directory.
+
+## Linux x86_64 CPU packages (0.1.25 release train)
+
+Linux packaging builds a `.deb` on Ubuntu 22.04 for `x86_64-unknown-linux-gnu`.
+It bundles pinned CPython 3.11.13 and the pinned desktop dependencies under the
+application's `/usr/lib/<application>/python-runtime` resource directory. It does
+not create a user venv or use system Python. ARM Linux, musl distributions, and
+AppImage packaging are not part of this initial target.
+
+The Linux backend is **CPU-only**. Its runtime identity is
+`bundled-cpython-3.11-linux-x86_64-cpu`; GPU visibility in WSL or a VM does not make
+this package CUDA-capable. Windows CUDA and Apple Silicon Metal packaging retain
+their existing policies and fail-closed checks.
+
+`prepare_linux_embedded_python_runtime.py` reuses the verified archive downloader,
+safe extractor, cleanup, and provenance machinery. The Linux manifest pins the
+upstream archive URL and SHA-256, architecture, and package versions. Package
+preparation validates symlink containment, then materializes file links because
+Tauri's Debian writer dereferences them. Directory links are rejected before
+packaging; the pinned distribution must provide real directories. The inventory
+records any remaining link targets and rejects broken, cyclic, or external links.
+Package validation checks every runtime file against the build inventory before running
+the isolated interpreter, then checks imports, package versions, CPU backend,
+and executable build identity. Startup checks the Linux standard-library layout
+before launching Python and rejects missing or external core modules. A missing
+runtime must be repaired by reinstalling the matching package; keep existing
+GGUF model files and selections. Package integrity inventories detect accidental
+damage; they are not a substitute for authenticating the downloaded package.
+
+The Linux PR workflow retains the candidate `.deb`, checksum, and installed
+structural preflight evidence for seven days. All installation in that workflow
+occurs on a disposable hosted runner. Structural preflight is not real model
+inference or human GUI acceptance. K370 separately gates Windows, macOS, and Linux
+packaged acceptance before publication; WSL2 or VM results must identify their
+environment and cannot be described as native Linux CUDA evidence.
+
+This K372 packaging PR is explicitly assigned to the same unreleased desktop
+0.1.25 train as K369. It does not authorize tagging, publishing, deployment, or
+installation on an operator's computer.

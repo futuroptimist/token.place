@@ -9118,6 +9118,19 @@ mod tests {
         let runtime = root.join(crate::python_runtime::BUNDLED_RUNTIME_RELATIVE_PYTHON);
         std::fs::create_dir_all(&python_dir).expect("create bridge directory");
         std::fs::create_dir_all(runtime.parent().unwrap()).expect("create runtime directory");
+        if cfg!(target_os = "linux") {
+            for relative in [
+                "encodings/__init__.py",
+                "json/__init__.py",
+                "os.py",
+                "platform.py",
+                "struct.py",
+            ] {
+                let path = root.join("python-runtime/lib/python3.11").join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "# fixture").unwrap();
+            }
+        }
         std::fs::write(python_dir.join("compute_node_bridge.py"), "# bridge\n")
             .expect("write bridge");
         std::fs::write(python_dir.join("model_bridge.py"), "# model bridge\n")

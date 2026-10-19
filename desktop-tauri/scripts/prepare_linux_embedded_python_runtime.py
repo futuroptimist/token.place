@@ -132,13 +132,23 @@ def validate_runtime_notices(root: Path, manifest: dict) -> None:
             raise shared.RuntimePrepError(f"missing or invalid runtime notice: {name}")
 
 
-def file_hashes(runtime: Path) -> dict[str, str]:
+def file_hashes(runtime: Path) -> dict[str, str | dict[str, str]]:
     result = {}
+    root = runtime.resolve()
     for path in sorted(runtime.rglob("*")):
-        if path.is_file() and path.name != shared.PROVENANCE:
-            if not path.resolve().is_relative_to(runtime.resolve()):
+        relative = path.relative_to(runtime).as_posix()
+        if path.is_symlink():
+            try:
+                target = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise shared.RuntimePrepError(f"broken or cyclic runtime link: {path}") from exc
+            if not target.is_relative_to(root):
+                raise shared.RuntimePrepError(f"runtime link escapes package: {path}")
+            result[relative] = {"symlink": str(path.readlink())}
+        elif path.is_file() and relative != shared.PROVENANCE:
+            if not path.resolve().is_relative_to(root):
                 raise shared.RuntimePrepError(f"runtime file escapes package: {path}")
-            result[path.relative_to(runtime).as_posix()] = shared.sha256(path)
+            result[relative] = shared.sha256(path)
     return result
 
 
@@ -183,16 +193,33 @@ def prepare(cache_dir: Path) -> None:
             files=file_hashes(runtime),
         )
         (runtime / shared.PROVENANCE).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-        backup = temporary / "old-runtime"
+        # Recovery must survive staging cleanup even if both rename operations fail.
+        backup_dir = None
         if shared.OUTPUT.exists():
-            shared.OUTPUT.rename(backup)
+            backup_dir = Path(
+                tempfile.mkdtemp(prefix="linux-runtime-backup-", dir=shared.OUTPUT.parent)
+            )
+            backup = backup_dir / "old-runtime"
+            try:
+                shared.OUTPUT.rename(backup)
+            except OSError:
+                backup_dir.rmdir()
+                raise
         try:
             runtime.rename(shared.OUTPUT)
         except OSError:
-            if backup.exists():
-                backup.rename(shared.OUTPUT)
+            if backup_dir is not None:
+                try:
+                    backup.rename(shared.OUTPUT)
+                except OSError as exc:
+                    raise shared.RuntimePrepError(
+                        f"Runtime swap and restore failed; previous runtime preserved at {backup}. "
+                        "Resolve the output-path conflict before restoring it; do not delete this backup."
+                    ) from exc
+                backup_dir.rmdir()
             raise
-        shutil.rmtree(backup, ignore_errors=True)
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,8 @@ asset and SHA-256, run `desktop-tauri/scripts/prepare_embedded_python_runtime.py
 on an Apple Silicon macOS runner, verify Metal probing and release artifact
 validation, then commit only the manifest/script/docs changes. Do not commit the
 downloaded archive or generated `python-runtime` directory.
-# Linux x86_64 CPU packages (0.1.25 release train)
+
+## Linux x86_64 CPU packages (0.1.25 release train)
 
 Linux packaging builds a `.deb` on Ubuntu 22.04 for `x86_64-unknown-linux-gnu`.
 It bundles pinned CPython 3.11.13 and the pinned desktop dependencies under the

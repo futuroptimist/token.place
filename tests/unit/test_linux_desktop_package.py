@@ -197,7 +197,7 @@ def test_declared_notices_are_materialized_hashed_and_required(tmp_path):
         linux.validate_runtime_notices(tmp_path, manifest)
 
 
-@pytest.mark.parametrize("failure", [None, "validation", "swap"])
+@pytest.mark.parametrize("failure", [None, "validation", "swap", "double"])
 def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch, failure):
     output = tmp_path / "python-runtime"
     output.mkdir()
@@ -226,15 +226,23 @@ def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch
     rename = Path.rename
 
     def checked_rename(source, target):
-        if failure == "swap" and source.name == "python" and target == output:
+        if failure in ("swap", "double") and source.name == "python" and target == output:
             raise OSError("simulated swap failure")
+        if failure == "double" and source.name == "old-runtime":
+            raise OSError("simulated restore failure")
         return rename(source, target)
 
     monkeypatch.setattr(Path, "rename", checked_rename)
     if failure:
-        with pytest.raises((OSError, linux.shared.RuntimePrepError)):
+        with pytest.raises((OSError, linux.shared.RuntimePrepError)) as error:
             linux.prepare(tmp_path)
-        assert (output / "previous").read_text() == "healthy"
+        if failure == "double":
+            backups = list(tmp_path.glob("linux-runtime-backup-*/old-runtime/previous"))
+            assert len(backups) == 1
+            assert backups[0].read_text() == "healthy"
+            assert str(backups[0].parent) in str(error.value)
+        else:
+            assert (output / "previous").read_text() == "healthy"
     else:
         linux.prepare(tmp_path)
         assert not (output / "previous").exists()
@@ -244,7 +252,13 @@ def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch
         args, kwargs = calls[0]
         assert "--no-binary=llama-cpp-python" in args[1]
         assert "-DGGML_NATIVE=OFF" in kwargs["env"]["CMAKE_ARGS"]
-    assert not list(tmp_path.glob("linux-runtime-*"))
+    assert not [
+        p
+        for p in tmp_path.glob("linux-runtime-*")
+        if not p.name.startswith("linux-runtime-backup-")
+    ]
+    if failure != "double":
+        assert not list(tmp_path.glob("linux-runtime-backup-*"))
 
 
 @pytest.mark.parametrize(
@@ -345,3 +359,41 @@ def test_package_cli_extracts_without_installing(tmp_path, monkeypatch):
     assert kwargs == {"check": True}
     assert validated == [(Path(args[3]), "0.1.25", "123456789abc")]
     assert not Path(args[3]).exists()
+
+
+@pytest.mark.parametrize(
+    "kind", ["file", "directory", "broken", "external", "external-broken", "cycle"]
+)
+def test_symlink_inventory_detects_targets_and_rejects_invalid_links(tmp_path, kind):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    (root / "a/file").write_text("same bytes")
+    (root / "b/file").write_text("same bytes")
+    link = root / "link"
+    targets = {
+        "file": "a/file",
+        "directory": "a",
+        "broken": "missing",
+        "external": str(tmp_path),
+        "external-broken": str(tmp_path / "missing"),
+        "cycle": "link",
+    }
+    try:
+        link.symlink_to(targets[kind], target_is_directory=kind in ("directory", "external"))
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows host does not grant symlink creation; exercised on Linux CI")
+        raise
+    if kind in ("file", "directory"):
+        before = linux.file_hashes(root)
+        assert before["link"] == {"symlink": targets[kind]}
+        link.unlink()
+        link.symlink_to(
+            "b/file" if kind == "file" else "b", target_is_directory=kind == "directory"
+        )
+        assert linux.file_hashes(root) != before
+    else:
+        with pytest.raises(linux.shared.RuntimePrepError, match="runtime link"):
+            linux.file_hashes(root)

@@ -152,6 +152,22 @@ def file_hashes(runtime: Path) -> dict[str, str | dict[str, str]]:
     return result
 
 
+def materialize_runtime_file_links(runtime: Path) -> None:
+    # Tauri's Debian writer dereferences file links. Make that transformation
+    # explicit before inventory generation, never weaken extracted validation.
+    file_hashes(runtime)  # Reject every external/broken/cyclic link first.
+    links = [(path, path.resolve(strict=True)) for path in runtime.rglob("*") if path.is_symlink()]
+    for path, target in links:
+        if not target.is_file():
+            raise shared.RuntimePrepError(
+                f"Debian bundler cannot preserve directory runtime link: {path}; "
+                "use a runtime distribution with real directories"
+            )
+    for path, target in links:
+        path.unlink()
+        shutil.copy2(target, path)
+
+
 def prepare(cache_dir: Path) -> None:
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise shared.RuntimePrepError("build requires a Linux x86_64 host")
@@ -183,6 +199,7 @@ def prepare(cache_dir: Path) -> None:
         )
         installed = validate_runtime(runtime, manifest)
         shared.clean(runtime)
+        materialize_runtime_file_links(runtime)
         write_runtime_notices(runtime, manifest)
         validate_runtime_notices(runtime, manifest)
         data = shared.provenance(manifest, installed)

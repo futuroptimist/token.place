@@ -197,7 +197,7 @@ def test_declared_notices_are_materialized_hashed_and_required(tmp_path):
         linux.validate_runtime_notices(tmp_path, manifest)
 
 
-@pytest.mark.parametrize("failure", [None, "validation", "swap", "double"])
+@pytest.mark.parametrize("failure", [None, "validation", "swap", "double", "backup"])
 def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch, failure):
     output = tmp_path / "python-runtime"
     output.mkdir()
@@ -228,6 +228,8 @@ def test_preparation_preserves_previous_runtime_on_failure(tmp_path, monkeypatch
     def checked_rename(source, target):
         if failure in ("swap", "double") and source.name == "python" and target == output:
             raise OSError("simulated swap failure")
+        if failure == "backup" and source == output:
+            raise OSError("simulated backup rename failure")
         if failure == "double" and source.name == "old-runtime":
             raise OSError("simulated restore failure")
         return rename(source, target)
@@ -340,6 +342,8 @@ def test_package_cli_extracts_without_installing(tmp_path, monkeypatch):
     package.write_text("synthetic archive")
     extracted = []
     validated = []
+    checked = []
+    monkeypatch.setattr(validator, "validate_dependencies", lambda path: checked.append(path))
     monkeypatch.setattr(
         validator.subprocess, "run", lambda args, **kw: extracted.append((args, kw))
     )
@@ -354,6 +358,7 @@ def test_package_cli_extracts_without_installing(tmp_path, monkeypatch):
             "123456789abc",
         ]
     )
+    assert checked == [package]
     args, kwargs = extracted[0]
     assert args[:3] == ["dpkg-deb", "--extract", str(package.resolve())]
     assert kwargs == {"check": True}
@@ -394,6 +399,37 @@ def test_symlink_inventory_detects_targets_and_rejects_invalid_links(tmp_path, k
             "b/file" if kind == "file" else "b", target_is_directory=kind == "directory"
         )
         assert linux.file_hashes(root) != before
+        if kind == "file":
+            linux.materialize_runtime_file_links(root)
+            assert not link.is_symlink()
+            assert link.read_text() == "same bytes"
+            assert linux.file_hashes(root)["link"] == linux.file_hashes(root)["b/file"]
+        else:
+            with pytest.raises(linux.shared.RuntimePrepError, match="directory runtime link"):
+                linux.materialize_runtime_file_links(root)
+            assert link.is_symlink()
     else:
         with pytest.raises(linux.shared.RuntimePrepError, match="runtime link"):
             linux.file_hashes(root)
+
+
+@pytest.mark.parametrize("missing", [None, "libgomp1", "libgtk-3-0", "libwebkit2gtk-4.1-0"])
+def test_debian_control_requires_all_runtime_libraries(tmp_path, monkeypatch, missing):
+    names = validator.REQUIRED_DEB_DEPENDENCIES - ({missing} if missing else set())
+    fields = [f"{name} (>= 1.0)" for name in sorted(names)]
+    if missing:
+        fields.append(f"{missing} | unrelated-alternative")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout=", ".join(fields))
+
+    monkeypatch.setattr(validator.subprocess, "run", run)
+    deb = tmp_path / "candidate.deb"
+    if missing:
+        with pytest.raises(RuntimeError, match=missing):
+            validator.validate_dependencies(deb)
+    else:
+        validator.validate_dependencies(deb)
+    assert calls == [["dpkg-deb", "--field", str(deb.resolve()), "Depends"]]

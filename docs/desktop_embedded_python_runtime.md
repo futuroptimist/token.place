@@ -72,7 +72,11 @@ their existing policies and fail-closed checks.
 `prepare_linux_embedded_python_runtime.py` reuses the verified archive downloader,
 safe extractor, cleanup, and provenance machinery. The Linux manifest pins the
 upstream archive URL and SHA-256, architecture, and package versions. Package
-validation checks every runtime file against the build inventory before running
+preparation validates symlink containment, then materializes file links because
+Tauri's Debian writer dereferences them. Directory links are rejected before
+packaging; the pinned distribution must provide real directories. The inventory
+records any remaining link targets and rejects broken, cyclic, or external links.
+Package validation checks every runtime file against the build inventory before running
 the isolated interpreter, then checks imports, package versions, CPU backend,
 and executable build identity. Startup checks the Linux standard-library layout
 before launching Python and rejects missing or external core modules. A missing

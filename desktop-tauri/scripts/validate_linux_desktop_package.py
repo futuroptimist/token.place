@@ -4,11 +4,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
 
 import prepare_linux_embedded_python_runtime as linux
+
+
+REQUIRED_DEB_DEPENDENCIES = {"libwebkit2gtk-4.1-0", "libgtk-3-0", "libgomp1"}
+
+
+def validate_dependencies(deb: Path) -> None:
+    result = subprocess.run(
+        ["dpkg-deb", "--field", str(deb.resolve()), "Depends"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    dependencies = set()
+    for clause in result.stdout.split(","):
+        match = re.fullmatch(r"([a-z0-9+.-]+)(?:\s+\([^()]+\))?", clause.strip())
+        if match:
+            dependencies.add(match.group(1))
+    missing = REQUIRED_DEB_DEPENDENCIES - dependencies
+    if missing:
+        raise RuntimeError(f"missing required Debian dependencies: {', '.join(sorted(missing))}")
 
 
 def validate_tree(root: Path, expected_version: str, expected_build_id: str) -> None:
@@ -52,6 +74,7 @@ def main(argv=None):
     parser.add_argument("--expected-version", required=True)
     parser.add_argument("--expected-build-id", required=True)
     args = parser.parse_args(argv)
+    validate_dependencies(args.deb)
     with tempfile.TemporaryDirectory(prefix="token-place-linux-package-") as directory:
         root = Path(directory)
         subprocess.run(["dpkg-deb", "--extract", str(args.deb.resolve()), str(root)], check=True)

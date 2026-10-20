@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -580,10 +581,46 @@ def verify_config_preserved(config_path: Path, expected: dict[str, object]) -> N
             raise InstallerIdentityError(f"configuration value {key!r} was not preserved across upgrade")
 
 
-def install(installer: Installer, log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
+def durable_install_parent() -> Path:
+    """Keep test installs outside every cleanup root rejected by the runtime."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    if not local or not Path(local).is_absolute():
+        raise InstallerIdentityError("LOCALAPPDATA must identify an absolute durable test location")
+    parent = Path(local) / "Programs" / "token-place-installer-tests"
+    temporary = [Path(tempfile.gettempdir())]
+    temporary.extend(Path(os.environ[key]) for key in ("TEMP", "TMP") if os.environ.get(key))
+    temporary.append(Path(local) / "Temp")
+    if os.environ.get("SystemRoot"):
+        temporary.append(Path(os.environ["SystemRoot"]) / "Temp")
+    for root in temporary:
+        if parent.resolve().is_relative_to(root.resolve()):
+            raise InstallerIdentityError("test installation destination is inside a temporary directory")
+    return parent.resolve()
+
+
+def create_install_directory() -> Path:
+    parent = durable_install_parent()
+    parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="scenario-", dir=parent))
+
+
+def cleanup_install_directory(root: Path) -> None:
+    # Only remove the newly allocated scenario directory after uninstall has
+    # converged. Never follow a replaced root into another installation.
+    if root.parent != durable_install_parent() or not root.name.startswith("scenario-"):
+        raise InstallerIdentityError("refusing cleanup outside the test installation parent")
+    if root.resolve() != root:
+        raise InstallerIdentityError("refusing cleanup of a redirected test installation directory")
+    if root.exists():
+        shutil.rmtree(root)
+
+
+def install(installer: Installer, log_path: Path | None = None, *, install_root: Path) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
         return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart"], timeout=300, check=False, log_path=log_path)
-    return _run([str(installer.path), "/S"], timeout=300, check=False, log_path=log_path)
+    # NSIS remembers /D even after uninstall. Static payload validation uses a
+    # temporary extraction directory, so never inherit its remembered path.
+    return _run([str(installer.path), "/S", f"/D={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
 
 
 def split_uninstall_command(command: str) -> tuple[str, str]:
@@ -1402,15 +1439,17 @@ def run_scenario(
         root = Path(tmp)
         sentinel_log = root / "sentinel.log"
         env = _safe_env(_sentinel_dir(root), sentinel_log)
+        install_root = create_install_directory()
         try:
+            print(f"{scenario.name}: test installation directory {install_root}", flush=True)
             if scenario.previous is not None:
-                previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None)
+                previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None, install_root=install_root)
                 if previous.returncode != 0:
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
                 config_path = seed_config(seeded)
             is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
             authority_before = capture_authority_snapshot() if is_cross_kind else None
-            current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None)
+            current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None, install_root=install_root)
             if current.returncode != 0:
                 if is_cross_kind and is_actionable_competing_installer_rejection(current):
                     authority_after = capture_authority_snapshot()
@@ -1454,6 +1493,7 @@ def run_scenario(
         finally:
             _terminate_processes()
             uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall") if artifact_dir else None)
+            cleanup_install_directory(install_root)
             if config_path:
                 try:
                     config_path.unlink(missing_ok=True)

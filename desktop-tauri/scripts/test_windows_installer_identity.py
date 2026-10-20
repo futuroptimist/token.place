@@ -635,6 +635,74 @@ def cleanup_install_directory(root: Path) -> None:
         shutil.rmtree(root)
 
 
+def msi_location_searches(installer: Installer) -> list[dict]:
+    """Read the package's actual INSTALLDIR registry searches without installing it."""
+    package = str(installer.path.resolve()).replace("'", "''")
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$database = $installer.OpenDatabase('__PACKAGE__', 0)
+$query = @'
+SELECT `RegLocator`.`Root`, `RegLocator`.`Key`, `RegLocator`.`Name`, `RegLocator`.`Type` FROM `AppSearch`, `RegLocator` WHERE `AppSearch`.`Property` = 'INSTALLDIR' AND `AppSearch`.`Signature_` = `RegLocator`.`Signature_`
+'@
+$view = $database.OpenView($query)
+$view.Execute()
+$items = @()
+while ($record = $view.Fetch()) {
+  $items += [pscustomobject]@{ Root = $record.IntegerData(1); Key = $record.StringData(2); Name = $record.StringData(3); Type = $record.IntegerData(4) }
+}
+ConvertTo-Json -InputObject @($items) -Compress
+'''.replace("__PACKAGE__", package)
+    result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=60)
+    rows = json.loads(result.stdout)
+    if not isinstance(rows, list) or not rows:
+        raise InstallerIdentityError("MSI has no supported INSTALLDIR registry searches")
+    return rows
+
+
+def reset_msi_remembered_locations(installer: Installer, log_path: Path | None = None) -> None:
+    """Isolate fresh scenarios, never the previous/current halves of an upgrade.
+
+    Tauri's AppSearch can override a command-line INSTALLDIR with an NSIS path
+    retained after uninstall. Delete only the two location values searched by
+    this MSI, and only when they point into an owned harness scenario directory.
+    """
+    import winreg
+
+    pending = []
+    for row in msi_location_searches(installer):
+        key = str(row.get("Key", "")).replace("\\\\", "\\")
+        name = row.get("Name") or ""
+        locator_type = row.get("Type")
+        if (row.get("Root") != 1 or not key.casefold().startswith("software\\")
+                or not key.casefold().endswith("\\token.place desktop")
+                or name not in ("", "InstallDir") or locator_type not in (2, 18)):
+            raise InstallerIdentityError("refusing unsupported MSI remembered-location search")
+        view = winreg.KEY_WOW64_64KEY if locator_type & 16 else winreg.KEY_WOW64_32KEY
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_READ | view) as handle:
+                value, value_type = winreg.QueryValueEx(handle, name)
+        except FileNotFoundError:
+            continue
+        path = Path(value) if isinstance(value, str) else Path()
+        if (value_type != winreg.REG_SZ or not path.is_absolute()
+                or path.name.casefold() != "app"
+                or not path.parent.name.startswith("scenario-")
+                or path.parent.parent != durable_install_parent()
+                or path.resolve() != path):
+            raise InstallerIdentityError("refusing to clear a remembered MSI destination outside owned test scenarios")
+        pending.append({"key": key, "name": name, "view": view, "value": value})
+    # Preserve old values before any mutation. Validate every candidate first,
+    # so an unrelated destination cannot cause a partial reset.
+    if log_path:
+        log_path.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+    for item in pending:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, item["key"], 0, winreg.KEY_READ | winreg.KEY_SET_VALUE | item["view"]) as handle:
+            if winreg.QueryValueEx(handle, item["name"]) != (item["value"], winreg.REG_SZ):
+                raise InstallerIdentityError("remembered MSI destination changed during scenario reset")
+            winreg.DeleteValue(handle, item["name"])
+
+
 def install(installer: Installer, log_path: Path | None = None, *, install_root: Path) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
         return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart", f"INSTALLDIR={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
@@ -1462,6 +1530,9 @@ def run_scenario(
         install_root = create_install_directory()
         try:
             print(f"{scenario.name}: test installation directory {install_root}", flush=True)
+            msi = next((item for item in (scenario.previous, scenario.current) if item and item.kind == "msi"), None)
+            if msi:
+                reset_msi_remembered_locations(msi, artifact_dir.path(scenario.name, "remembered-msi-locations") if artifact_dir else None)
             if scenario.previous is not None:
                 previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None, install_root=install_root)
                 if previous.returncode != 0:

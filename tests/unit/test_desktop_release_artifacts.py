@@ -4645,7 +4645,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 ) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: guard.resolve_authoritative_shortcut())
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
     installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
@@ -4695,7 +4695,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 def test_windows_installer_identity_admission_success_skips_native_probe(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: guard.resolve_authoritative_shortcut())
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
     installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
@@ -4976,7 +4976,7 @@ def _empty_snapshot(guard):
 def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: None)
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     scenario = guard.Scenario('cross-nsis-to-msi', current, previous)
@@ -5005,7 +5005,7 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
 def test_windows_installer_identity_probes_scenario_current_version(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: guard.resolve_authoritative_shortcut())
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
     for path in (current.path, previous.path):
@@ -5051,7 +5051,7 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
 def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: None)
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     for path in (current.path, previous.path):
@@ -5074,7 +5074,7 @@ def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(m
 def test_windows_installer_identity_requires_postconditions_for_competing_rejection(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: None)
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     for path in (current.path, previous.path):
@@ -6315,7 +6315,7 @@ def test_windows_installer_identity_probe_identity_accepts_json_and_raw_fallback
 def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
-    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root: guard.resolve_authoritative_shortcut())
+    monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
     current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
     current.path.write_text('installer', encoding='utf-8')
     exe = tmp_path / 'token.place.exe'
@@ -7604,3 +7604,19 @@ def test_windows_installer_identity_scenario_rejects_bad_authority_before_launch
     with pytest.raises(guard.InstallerIdentityError, match=expected):
         guard.run_scenario(scenario, 'abcdef123456')
     assert phases == (['previous'] if bad_phase == 'previous' else ['previous', 'current'])
+
+
+
+def test_windows_installer_identity_rejects_redirected_app_directory(monkeypatch, tmp_path):
+    guard = _load_windows_installer_identity()
+    root = tmp_path / 'scenario-owned'
+    expected = root / 'app'
+    redirected = tmp_path / 'outside'
+    redirected.mkdir()
+    exe = redirected / 'token-place.exe'
+    exe.touch()
+    original_resolve = type(expected).resolve
+    monkeypatch.setattr(type(expected), 'resolve', lambda path, *args, **kwargs: redirected if path == expected else original_resolve(path, *args, **kwargs))
+    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda *args: guard.Shortcut(tmp_path / 'app.lnk', exe))
+    with pytest.raises(guard.InstallerIdentityError, match='escaped scenario destination'):
+        guard.verify_installed_authority(guard.Installer(tmp_path / 'fixture', 'nsis', '0.1.25'), root)

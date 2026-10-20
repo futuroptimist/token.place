@@ -548,11 +548,11 @@ def resolve_authoritative_shortcut(rejected_version: str | None = None) -> Short
     return next(shortcut for shortcut in inventory.shortcuts if str(shortcut.target).lower() == str(target).lower())
 
 
-def verify_installed_authority(installer: Installer, install_root: Path) -> Shortcut:
+def verify_installed_authority(installer: Installer, install_root: Path, rejected_version: str | None = None) -> Shortcut:
     """Reject remembered destinations and overlapping installer ownership."""
-    shortcut = resolve_authoritative_shortcut()
+    shortcut = resolve_authoritative_shortcut(rejected_version)
     expected = install_root / "app"
-    if _canonical_path(shortcut.target.resolve().parent) != _canonical_path(expected):
+    if expected.resolve() != expected or _canonical_path(shortcut.target.resolve().parent) != _canonical_path(expected):
         raise InstallerIdentityError(
             f"installed executable escaped scenario destination: expected {expected}, "
             f"found {shortcut.target.resolve()}"
@@ -1481,7 +1481,7 @@ def run_scenario(
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
-            shortcut = verify_installed_authority(scenario.current, install_root)
+            shortcut = verify_installed_authority(scenario.current, install_root, rejected_version=scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)
             probe_identity(shortcut.target, env, scenario.current.version, expected_build_id)
             record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))

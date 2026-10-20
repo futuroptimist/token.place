@@ -7564,6 +7564,7 @@ def test_windows_installer_identity_msi_after_nsis_remembered_destination(monkey
 
 def test_windows_installer_identity_hosted_ci_covers_both_cross_installer_directions():
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
+    assert workflow.count("'tests/unit/test_desktop_release_artifacts.py'") == 2
     assert '--bundles nsis,msi' in workflow
     assert "@('cross-nsis-to-msi', 'cross-msi-to-nsis')" in workflow
     assert '--scenario $scenario' in workflow

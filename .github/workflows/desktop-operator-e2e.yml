@@ -184,7 +184,7 @@ jobs:
 
   desktop-operator-packaged-e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -260,9 +260,9 @@ jobs:
         working-directory: desktop-tauri
         run: npm run build
 
-      - name: Build current-head Windows NSIS release package
+      - name: Build current-head Windows NSIS and MSI release packages
         working-directory: desktop-tauri
-        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis,msi
 
       # Hosted Windows is driverless, so the cu124 runtime cannot import without
       # nvcuda.dll. Issue #1555 reserves native GPU proof for a GPU runner.
@@ -285,6 +285,47 @@ jobs:
             --expected-build-id $buildId `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate cross-installer transitions independently
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content 'desktop-tauri/package.json' -Raw | ConvertFrom-Json).version
+          $buildId = (git rev-parse --short=12 HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $releases = gh release list --repo futuroptimist/token.place --limit 100 --json tagName,isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $previous = @($releases | Where-Object {
+            -not $_.isDraft -and -not $_.isPrerelease -and
+            $_.tagName -match '^desktop-v[0-9]+\.[0-9]+\.[0-9]+$' -and
+            [version]($_.tagName -replace '^desktop-v', '') -lt [version]$version
+          } | Sort-Object { [version]($_.tagName -replace '^desktop-v', '') } -Descending)[0]
+          if (-not $previous) { throw 'No stable predecessor desktop release found.' }
+          $previousVersion = $previous.tagName -replace '^desktop-v', ''
+          $previousDir = Join-Path $env:RUNNER_TEMP 'token-place-previous-installers'
+          New-Item -ItemType Directory -Path $previousDir | Out-Null
+          gh release download $previous.tagName --repo futuroptimist/token.place --dir $previousDir --pattern "*$previousVersion*.msi" --pattern "*$previousVersion*-setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bundle = 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $nsis = @(Get-ChildItem "$bundle/nsis" -Filter '*-setup.exe' -File)
+          $msi = @(Get-ChildItem "$bundle/msi" -Filter '*.msi' -File)
+          $oldNsis = @(Get-ChildItem $previousDir -Filter '*-setup.exe' -File)
+          $oldMsi = @(Get-ChildItem $previousDir -Filter '*.msi' -File)
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1 -or $oldNsis.Count -ne 1 -or $oldMsi.Count -ne 1) { throw 'Expected exactly one installer of each kind/version.' }
+          $failed = @()
+          # Each invocation checks initial cleanup convergence before installing.
+          # Preserve both directions' evidence even when the first fails closed.
+          foreach ($scenario in @('cross-nsis-to-msi', 'cross-msi-to-nsis')) {
+            python desktop-tauri/scripts/test_windows_installer_identity.py `
+              --windows-nsis $nsis[0].FullName --windows-msi $msi[0].FullName `
+              --previous-windows-nsis $oldNsis[0].FullName --previous-windows-msi $oldMsi[0].FullName `
+              --previous-version $previousVersion --expected-version $version `
+              --expected-build-id $buildId --scenario $scenario `
+              --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
+            if ($LASTEXITCODE -ne 0) { $failed += $scenario }
+          }
+          if ($failed.Count) { throw "Installer transition checks failed: $($failed -join ', ')" }
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py

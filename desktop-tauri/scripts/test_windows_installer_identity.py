@@ -548,6 +548,26 @@ def resolve_authoritative_shortcut(rejected_version: str | None = None) -> Short
     return next(shortcut for shortcut in inventory.shortcuts if str(shortcut.target).lower() == str(target).lower())
 
 
+def verify_installed_authority(installer: Installer, install_root: Path) -> Shortcut:
+    """Reject remembered destinations and overlapping installer ownership."""
+    shortcut = resolve_authoritative_shortcut()
+    expected = install_root / "app"
+    if _canonical_path(shortcut.target.resolve().parent) != _canonical_path(expected):
+        raise InstallerIdentityError(
+            f"installed executable escaped scenario destination: expected {expected}, "
+            f"found {shortcut.target.resolve()}"
+        )
+    entries = inventory_registry_entries()
+    if len(entries) != 1:
+        raise InstallerIdentityError(
+            f"expected one authoritative installer registration, found {len(entries)}; "
+            "coincident executable paths do not establish exclusive installer ownership"
+        )
+    if entries[0].windows_installer != (installer.kind == "msi"):
+        raise InstallerIdentityError("authoritative installer registration has the wrong installer kind")
+    return shortcut
+
+
 def app_config_dir() -> Path:
     return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / TAURI_IDENTIFIER
 
@@ -617,7 +637,7 @@ def cleanup_install_directory(root: Path) -> None:
 
 def install(installer: Installer, log_path: Path | None = None, *, install_root: Path) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
-        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart"], timeout=300, check=False, log_path=log_path)
+        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart", f"INSTALLDIR={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
     # NSIS remembers /D even after uninstall. Static payload validation uses a
     # temporary extraction directory, so never inherit its remembered path.
     return _run([str(installer.path), "/S", f"/D={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
@@ -1446,6 +1466,7 @@ def run_scenario(
                 previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None, install_root=install_root)
                 if previous.returncode != 0:
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
+                verify_installed_authority(scenario.previous, install_root)
                 config_path = seed_config(seeded)
             is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
             authority_before = capture_authority_snapshot() if is_cross_kind else None
@@ -1460,7 +1481,7 @@ def run_scenario(
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
             _terminate_processes()
-            shortcut = resolve_authoritative_shortcut(scenario.previous.version if scenario.previous else None)
+            shortcut = verify_installed_authority(scenario.current, install_root)
             _assert_runtime(shortcut.target)
             probe_identity(shortcut.target, env, scenario.current.version, expected_build_id)
             record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
@@ -1523,6 +1544,7 @@ def main() -> int:
         default=None,
         help="Run the hosted-Windows PR gate against exactly one current-head NSIS package.",
     )
+    parser.add_argument("--scenario", choices=("upgrade-nsis-to-nsis", "upgrade-msi-to-msi", "cross-nsis-to-msi", "cross-msi-to-nsis"), help="Run one upgrade scenario independently, retaining its failure diagnostics.")
     parser.add_argument("--windows-nsis", type=Path)
     parser.add_argument("--windows-msi", type=Path)
     parser.add_argument("--previous-windows-nsis", type=Path)
@@ -1545,7 +1567,7 @@ def main() -> int:
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
     if args.pr_current_windows_nsis is not None:
-        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
+        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version, args.scenario)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
         if args.tokenizer_boundary_model is not None and not args.tokenizer_boundary_model.is_file():
             raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
@@ -1572,6 +1594,8 @@ def main() -> int:
     previous_version = args.previous_version or immediate_prior_version(args.expected_version)
     validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
     scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)
+    if args.scenario:
+        scenarios = [scenario for scenario in scenarios if scenario.name == args.scenario]
     if sys.platform != "win32":
         print("validated Windows installer scenario contract; real installs run only on hosted Windows")
         return 0

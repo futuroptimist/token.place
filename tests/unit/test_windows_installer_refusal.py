@@ -25,6 +25,58 @@ def load_guard():
     return module
 
 
+def test_nsis_ui_notifications_wait_for_maintenance_and_owned_uninstaller():
+    spec = importlib.util.spec_from_file_location("coexistence_guard", ROOT / "desktop-tauri/scripts/windows_installer_ui.py")
+    ui = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ui)
+
+    def control(identifier, text, kind="Button", **extra):
+        return {"id": identifier, "hwnd": identifier, "text": text, "class": kind, "visible": True, "enabled": True, **extra}
+
+    sent = set()
+    options = dict(uninstaller=False, fresh=False, directory_selected=False, owner_observed=False, selected_uninstall=False, sent=sent)
+    next_button = control(1, "&Next >")
+    welcome = [control(1201, "Welcome to token.place desktop Setup", "Static"), next_button]
+    action = ui.nsis_ui_action(welcome, **options)
+    assert action[0] == "welcome:Next >"
+    sent.add(action[0])
+    assert ui.nsis_ui_action(welcome, **options) is None
+    maintenance = [control(1201, "nested control with colliding ID"), control(1037, "Already Installed", "Static"), next_button]
+    assert ui.nsis_ui_action(maintenance, **options) is None
+    radios = [control(10, "Reinstall", style=9, checked=1), control(11, "Uninstall", style=9, checked=0)]
+    maintenance += radios
+    action = ui.nsis_ui_action(maintenance, **options)
+    assert action[0] == "select-uninstall" and action[1] is radios[1]
+    sent.add(action[0])
+    assert ui.nsis_ui_action(maintenance, **options) is None
+    radios[0]["checked"], radios[1]["checked"] = 0, 1
+    action = ui.nsis_ui_action(maintenance, **options)
+    assert action[0] == "maintenance:Next >"
+    sent.add(action[0])
+    assert ui.nsis_ui_action(maintenance, **options) is None
+    finish = [control(1201, "Completing Setup", "Static"), control(1, "&Finish")]
+    assert ui.nsis_ui_action(finish, **options) is None
+    options["selected_uninstall"] = True
+    assert ui.nsis_ui_action(finish, **options) is None
+    options["owner_observed"] = True
+    action = ui.nsis_ui_action(finish, **options)
+    assert action[0] == "Completing Setup:Finish"
+    sent.add(action[0])
+    assert ui.nsis_ui_action(finish, **options) is None
+    options.update(fresh=True, owner_observed=False, selected_uninstall=False, sent=set())
+    assert ui.nsis_ui_action(finish, **options) is None
+    options["directory_selected"] = True
+    assert ui.nsis_ui_action(finish, **options)[0] == "Completing Setup:Finish"
+    finish[1]["enabled"] = False
+    assert ui.nsis_ui_action(finish, **options) is None
+    options.update(uninstaller=True, sent=set())
+    uninstall = control(1, "&Uninstall")
+    assert ui.nsis_ui_action([uninstall], **options)[0] == "uninstaller:Uninstall"
+    options["sent"].add("uninstaller:Uninstall")
+    assert ui.nsis_ui_action([uninstall], **options) is None
+    assert ui.nsis_ui_action([control(1, "Close")], **options)[0] == "uninstaller:Close"
+
+
 def test_static_extraction_waits_for_real_nsis_uninstaller(monkeypatch, tmp_path):
     from scripts import validate_windows_desktop_release_artifacts as validator
     root = tmp_path / "extraction with spaces"
@@ -159,7 +211,41 @@ def test_msi_install_retains_native_failure_and_guidance(monkeypatch, tmp_path, 
         assert log.with_suffix(".msi.log").is_file()
 
 
-@pytest.mark.parametrize("changed", ["installed", "settings", "models", "added", "deleted"])
+@pytest.mark.parametrize("payload", [{"ownershipPreflight": True, "rows": []}, [], {}])
+def test_msi_location_searches_require_verified_guard_or_actual_searches(monkeypatch, tmp_path, payload):
+    guard = load_guard()
+    monkeypatch.setattr(guard, "_run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, json.dumps(payload)))
+    package = guard.Installer(tmp_path / "candidate.msi", "msi", "0.1.25")
+    if payload == {"ownershipPreflight": True, "rows": []}:
+        assert guard.msi_location_searches(package) == []
+    else:
+        with pytest.raises(guard.InstallerIdentityError, match="no supported INSTALLDIR registry searches"):
+            guard.msi_location_searches(package)
+
+
+@pytest.mark.parametrize("target_count", [0, 2])
+def test_refusal_preservation_rejects_ambiguous_authority(tmp_path, target_count):
+    guard = load_guard()
+    targets = [tmp_path / str(index) / "app.exe" for index in range(target_count)]
+    authority = guard.AuthoritySnapshot(guard.ShortcutInventory([], targets, []), [])
+    with pytest.raises(guard.InstallerIdentityError, match="ambiguous installation"):
+        guard.capture_rejection_preservation(authority, tmp_path / "config", tmp_path / "model")
+
+
+@pytest.mark.parametrize("missing", ["installed", "settings", "models"])
+def test_refusal_preservation_rejects_missing_root(tmp_path, missing):
+    guard = load_guard()
+    roots = {label: tmp_path / label for label in ("installed", "settings", "models")}
+    for label, root in roots.items():
+        if label != missing:
+            root.mkdir()
+    exe = roots["installed"] / "app.exe"
+    authority = guard.AuthoritySnapshot(guard.ShortcutInventory([], [exe], []), [])
+    with pytest.raises(guard.InstallerIdentityError, match=f"root is missing: {missing}"):
+        guard.capture_rejection_preservation(authority, roots["settings"] / "config", roots["models"] / "model")
+
+
+@pytest.mark.parametrize("changed", ["installed", "settings", "models", "added", "deleted", "directory"])
 def test_refusal_preservation_detects_content_mutation_even_with_same_size_and_time(tmp_path, changed):
     guard = load_guard()
     roots = {label: tmp_path / label for label in ("installed", "settings", "models")}
@@ -169,6 +255,7 @@ def test_refusal_preservation_detects_content_mutation_even_with_same_size_and_t
         files[label] = root / "preserve.bin"
         files[label].write_bytes(b"original")
     exe = files["installed"]
+    (roots["settings"] / "empty-folder").mkdir()
     authority = guard.AuthoritySnapshot(guard.ShortcutInventory([guard.Shortcut(tmp_path / "app.lnk", exe)], [exe], []), [])
     before = guard.capture_rejection_preservation(authority, files["settings"], files["models"])
     assert before == guard.capture_rejection_preservation(authority, files["settings"], files["models"])
@@ -176,6 +263,8 @@ def test_refusal_preservation_detects_content_mutation_even_with_same_size_and_t
         (roots["installed"] / "new.bin").touch()
     elif changed == "deleted":
         files["models"].unlink()
+    elif changed == "directory":
+        (roots["settings"] / "empty-folder").rmdir()
     else:
         path = files[changed]
         stat = path.stat()

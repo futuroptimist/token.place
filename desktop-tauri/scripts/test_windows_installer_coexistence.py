@@ -10,10 +10,11 @@ import subprocess
 import time
 
 import test_windows_installer_identity as h
+from windows_installer_ui import nsis_ui_action
 
 
 def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_target: Path | None = None) -> dict:
-    """Exercise the actual reinstall page/uninstaller transition on hosted CI."""
+    """Exercise actual dialog notification handlers on CI, not physical input."""
     import ctypes as c
     from ctypes import wintypes as w
     user = c.WinDLL("user32", use_last_error=True)
@@ -26,6 +27,8 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
     user.SendMessageTimeoutW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM, w.UINT, w.UINT, c.POINTER(c.c_size_t)]
     user.SendMessageTimeoutW.restype = w.LPARAM
     user.GetDlgCtrlID.argtypes = [w.HWND]
+    user.GetParent.argtypes = [w.HWND]
+    user.GetParent.restype = w.HWND
     user.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
     user.IsWindowVisible.argtypes = [w.HWND]
     user.IsWindowEnabled.argtypes = [w.HWND]
@@ -45,6 +48,7 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
     owned_children = set()
     selected_uninstall = False
     selected_directory = False
+    sent = set()
     command = [str(package)] + (["/P"] if passive else []) + [f"/D={target}"]
     # GetWindowTextW cannot read another process's edit controls. WM_GETTEXT
     # supports cross-process control text; bound every call so diagnostics
@@ -104,7 +108,6 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                     user.EnumWindows(collect, 0)
                     state = []
                     for window, is_uninstaller in windows:
-                        buttons = []
                         controls = []
                         @callback_type
                         def children(hwnd, _):
@@ -114,6 +117,7 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                             label = control_text(hwnd)
                             controls.append({"hwnd": hwnd, "id": user.GetDlgCtrlID(hwnd), "class": name.value, "text": label, "visible": bool(user.IsWindowVisible(hwnd)), "enabled": bool(user.IsWindowEnabled(hwnd))})
                             if name.value == "Button":
+                                controls[-1]["style"] = user.GetWindowLongW(hwnd, -16) & 15
                                 checked = c.c_size_t()
                                 ok = user.SendMessageTimeoutW(hwnd, 0xF0, 0, 0, 0x22, 250, c.byref(checked))
                                 controls[-1]["checked"] = checked.value if ok else None
@@ -123,28 +127,34 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                                 ok = user.SendMessageTimeoutW(hwnd, 0xC, 0, c.addressof(replacement), 0x22, 250, c.byref(changed))
                                 selected_directory = bool(ok and changed.value and control_text(hwnd) == str(choose_target))
                                 record("directory-selection", hwnd=hwnd, confirmed=selected_directory)
-                            if name.value == "Button" and user.IsWindowVisible(hwnd) and user.IsWindowEnabled(hwnd):
-                                buttons.append((hwnd, label.replace("&", "").strip(), user.GetWindowLongW(hwnd, -16) & 15))
                             return True
                         user.EnumChildWindows(window, children, 0)
                         state.append({"window": window, "uninstaller": is_uninstaller, "text": control_text(window), "controls": controls})
-                        radios = [hwnd for hwnd, _, style in buttons if style in (4, 9)]
-                        if not is_uninstaller and len(radios) == 2 and not selected_uninstall and choose_target is None:
-                            c.set_last_error(0)
-                            posted = user.PostMessageW(radios[1], 0xF5, 0, 0)  # Same-version Uninstall, then reinstall.
-                            record("select-uninstall", hwnd=radios[1], posted=bool(posted), error=c.get_last_error())
-                            selected_uninstall = True
-                        for hwnd, _, style in buttons:
-                            if style in (2, 3):
+                        for control in controls:
+                            if control["id"] == 1203 and control["class"] == "Button" and control["visible"]:
                                 ignored = c.c_size_t()
-                                user.SendMessageTimeoutW(hwnd, 0xF1, 0, 0, 0x22, 250, c.byref(ignored))  # Do not auto-launch on Finish.
-                        for hwnd, label, _ in buttons:
-                            allowed = ("Uninstall", "Close") if is_uninstaller else ("Next >", "Next", "Install", "Finish", "Close")
-                            if label in allowed:
-                                c.set_last_error(0)
-                                posted = user.PostMessageW(hwnd, 0xF5, 0, 0)
-                                record("click", hwnd=hwnd, label=label, posted=bool(posted), error=c.get_last_error())
-                                break
+                                ok = user.SendMessageTimeoutW(control["hwnd"], 0xF1, 0, 0, 0x22, 250, c.byref(ignored))
+                                checked = c.c_size_t()
+                                read = user.SendMessageTimeoutW(control["hwnd"], 0xF0, 0, 0, 0x22, 250, c.byref(checked))
+                                assert ok and read and checked.value == 0, "could not disable app auto-launch"
+                        action = nsis_ui_action(controls, uninstaller=is_uninstaller, fresh=choose_target is not None, directory_selected=selected_directory, owner_observed=observed_uninstaller, selected_uninstall=selected_uninstall, sent=sent)
+                        if action:
+                            token, button, radios = action
+                            if radios:
+                                for radio in radios:
+                                    ignored = c.c_size_t()
+                                    ok = user.SendMessageTimeoutW(radio["hwnd"], 0xF1, int(radio is button), 0, 0x22, 250, c.byref(ignored))
+                                    assert ok, "could not set maintenance choice"
+                            if token.startswith("maintenance:"):
+                                selected_uninstall = True  # Planner verified both radio states.
+                            # BN_CLICKED/WM_COMMAND is the normal button notification.
+                            # Send once to the immediate parent; BM_CLICK can fail on
+                            # inactive dialogs and repeated queued clicks skip pages.
+                            c.set_last_error(0)
+                            posted = user.PostMessageW(user.GetParent(button["hwnd"]), 0x111, button["id"], button["hwnd"])
+                            record("notify-button", token=token, hwnd=button["hwnd"], posted=bool(posted), error=c.get_last_error())
+                            assert posted, "could not notify installer control"
+                            sent.add(token)
                     if state != previous_state:
                         record("windows", state=state)
                         previous_state = state

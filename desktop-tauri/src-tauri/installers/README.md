@@ -45,6 +45,12 @@ Windows state. Single-owner harness assertions remain strict; mixed-owner tests
 separately snapshot the competing owner and shared data and test survivor config
 readback. Synthetic policy tests compile without registry discovery code.
 
+The hosted interactive harness exercises dialog notification handlers, not physical
+mouse input. It waits for maintenance controls and checked-state readback before
+advancing, observes the verified owner's uninstaller, and sends each enabled
+button's documented `WM_COMMAND`/`BN_CLICKED` notification once. Bounded control
+text reads and flushed UI traces retain evidence when a page does not progress.
+
 Mixed-owner upgrade fixtures use ordinary ASCII installation paths to establish
 healthy legacy owners. In retained hosted run 39552571152, the v0.1.24 NSIS seed
 created invalid shortcut targets for a non-ACP path before any candidate upgrade;

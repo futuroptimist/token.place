@@ -1,5 +1,5 @@
 <!-- Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
-     MIT license: LICENSE_MIT. Preserve upstream behavior outside the marked guard block. -->
+     MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch. -->
 <?if $(sys.BUILDARCH)="x86"?>
     <?define Win64 = "no" ?>
     <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
@@ -31,20 +31,19 @@
                  SummaryCodepage="!(loc.TauriCodepage)"/>
 
         <!-- TOKEN_PLACE_GUARD_BEGIN -->
-        <!-- AppSearch and LaunchConditions run before InstallInitialize in both UI and silent execution. -->
-        <Property Id="TOKEN_PLACE_NSIS_HKCU_32" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_32" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
-        </Property>
-        <Property Id="TOKEN_PLACE_NSIS_HKCU_64" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_64" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
-        </Property>
-        <Property Id="TOKEN_PLACE_NSIS_HKLM_32" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_32" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
-        </Property>
-        <Property Id="TOKEN_PLACE_NSIS_HKLM_64" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_64" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
-        </Property>
-        <Condition Message="TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop is already installed using NSIS. Uninstall the existing version first, then run this MSI installer. Your existing app, settings and models have not been changed."><![CDATA[REMOVE~="ALL" OR (NOT TOKEN_PLACE_NSIS_HKCU_32 AND NOT TOKEN_PLACE_NSIS_HKCU_64 AND NOT TOKEN_PLACE_NSIS_HKLM_32 AND NOT TOKEN_PLACE_NSIS_HKLM_64)]]></Condition>
+        <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
+        <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
+        <Property Id="INSTALLDIR" Secure="yes" />
+        <CustomAction Id="TokenPlaceResolve" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceResolve" Execute="immediate" Return="check" />
+        <CustomAction Id="TokenPlaceVerify" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceVerify" Execute="immediate" Return="check" />
+        <InstallUISequence>
+            <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
+        </InstallUISequence>
+        <InstallExecuteSequence>
+            <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
+            <!-- Final resolved target, before MajorUpgrade removes any product. -->
+            <Custom Action="TokenPlaceVerify" Before="InstallInitialize">NOT REMOVE~="ALL"</Custom>
+        </InstallExecuteSequence>
         <!-- TOKEN_PLACE_GUARD_END -->
 
         <!-- https://docs.microsoft.com/en-us/windows/win32/msi/reinstallmode -->
@@ -89,17 +88,7 @@
         <Property Id="ARPURLUPDATEINFO" Value="{{homepage}}"/>
         {{/if}}
 
-        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
-             RegistrySearch elements are listed under a single Property, the LAST successful
-             match wins. We list the NSIS default-key search first and the MSI InstallDir
-             search second so that the MSI-specific path takes priority when both keys exist. -->
-        <Property Id="INSTALLDIR">
-          <!-- First attempt: Search for the default key value (this is how the nsis installer stores the path) -->
-          <RegistrySearch Id="PrevInstallDirNoName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Type="raw" />
-
-          <!-- Second attempt: Search for "InstallDir" which takes priority if found (this is how the msi installer stores the path) -->
-          <RegistrySearch Id="PrevInstallDirWithName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="InstallDir" Type="raw" />
-        </Property>
+        <!-- INSTALLDIR is recovered only from the registered related MSI product. -->
 
         <!-- launch app checkbox -->
         <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchApp)" />

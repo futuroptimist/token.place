@@ -1,5 +1,5 @@
 ; Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
-; MIT license: LICENSE_MIT. Preserve upstream behavior outside marked guard blocks.
+; MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch.
 Unicode true
 ManifestDPIAware true
 ; Add in `dpiAwareness` `PerMonitorV2` to manifest for Windows 10 1607+ (note this should not affect lower versions since they should be able to ignore this and pick up `dpiAware` `true` set by `ManifestDPIAware true`)
@@ -67,7 +67,10 @@ ${StrLoc}
 Var PassiveMode
 Var UpdateMode
 Var NoShortcutMode
-Var WixMode
+Var TokenPlaceOwnedTarget
+Var TokenPlaceOldRemoved
+Var TokenPlaceResult
+Var TokenPlaceRetained
 Var OldMainBinaryName
 
 Name "${PRODUCTNAME}"
@@ -164,34 +167,8 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 Var ReinstallPageCheck
 Page custom PageReinstall PageLeaveReinstall
 Function PageReinstall
-  ; Uninstall previous WiX installation if exists.
-  ;
-  ; A WiX installer stores the installation info in registry
-  ; using a UUID and so we have to loop through all keys under
-  ; `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
-  ; and check if `DisplayName` and `Publisher` keys match ${PRODUCTNAME} and ${MANUFACTURER}
-  ;
-  ; This has a potential issue that there maybe another installation that matches
-  ; our ${PRODUCTNAME} and ${MANUFACTURER} but wasn't installed by our WiX installer,
-  ; however, this should be fine since the user will have to confirm the uninstallation
-  ; and they can chose to abort it if doesn't make sense.
-  StrCpy $0 0
-  wix_loop:
-    EnumRegKey $1 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" $0
-    StrCmp $1 "" wix_loop_done ; Exit loop if there is no more keys to loop on
-    IntOp $0 $0 + 1
-    ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "DisplayName"
-    ReadRegStr $R1 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "Publisher"
-    StrCmp "$R0$R1" "${PRODUCTNAME}${MANUFACTURER}" 0 wix_loop
-    ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1" "UninstallString"
-    ${StrCase} $R1 $R0 "L"
-    ${StrLoc} $R0 $R1 "msiexec" ">"
-    StrCmp $R0 0 0 wix_loop_done
-    StrCpy $WixMode 1
-    StrCpy $R6 "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1"
-    Goto compare_version
-  wix_loop_done:
-
+  ; Only the verified NSIS owner is eligible for this reinstall page.
+  Call TokenPlaceVerifyOwnership
   ; Check if there is an existing installation, if not, abort the reinstall page
   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
@@ -199,13 +176,8 @@ Function PageReinstall
 
   ; Compare this installar version with the existing installation
   ; and modify the messages presented to the user accordingly
-  compare_version:
   StrCpy $R4 "$(older)"
-  ${If} $WixMode = 1
-    ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
-  ${Else}
-    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
-  ${EndIf}
+  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
   ${IfThen} $R0 == "" ${|} StrCpy $R4 "$(unknown)" ${|}
 
   nsis_tauri_utils::SemverCompare "${VERSION}" $R0
@@ -288,11 +260,6 @@ FunctionEnd
 Function PageLeaveReinstall
   ${NSD_GetState} $R2 $R1
 
-  ; If migrating from Wix, always uninstall
-  ${If} $WixMode = 1
-    Goto reinst_uninstall
-  ${EndIf}
-
   ; In update mode, always proceeds without uninstalling
   ${If} $UpdateMode = 1
     Goto reinst_done
@@ -326,16 +293,15 @@ Function PageLeaveReinstall
     HideWindow
     ClearErrors
 
-    ${If} $WixMode = 1
-      ReadRegStr $R1 HKLM "$R6" "UninstallString"
-      ExecWait '$R1' $0
-    ${Else}
-      ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
-      ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-      ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
-      ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
-      StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
-      ExecWait '$R1' $0
+    Call TokenPlaceVerifyOwnership
+    ; Never execute an arbitrary registry command or select the MSI owner.
+    ; /UPDATE preserves shared settings even with an older NSIS uninstaller.
+    StrCpy $R1 '"$INSTDIR\uninstall.exe" /UPDATE'
+    ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|}
+    StrCpy $R1 "$R1 _?=$INSTDIR"
+    ExecWait '$R1' $0
+    ${If} $0 = 0
+      StrCpy $TokenPlaceOldRemoved 1
     ${EndIf}
 
     BringToFront
@@ -344,12 +310,6 @@ Function PageLeaveReinstall
 
     ${If} $0 <> 0
     ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
-      ; User cancelled wix uninstaller? return to select un/reinstall page
-      ${If} $WixMode = 1
-      ${AndIf} $0 = 1602
-        Abort
-      ${EndIf}
-
       ; User cancelled NSIS uninstaller? return to select un/reinstall page
       ${If} $0 = 1
         Abort
@@ -400,43 +360,7 @@ FunctionEnd
 
 ; Uninstaller Pages
 ; 1. Confirm uninstall page
-Var DeleteAppDataCheckbox
-Var DeleteAppDataCheckboxState
-!define /ifndef WS_EX_LAYOUTRTL         0x00400000
-!define MUI_PAGE_CUSTOMFUNCTION_SHOW un.ConfirmShow
-Function un.ConfirmShow ; Add add a `Delete app data` check box
-  ; $1 inner dialog HWND
-  ; $2 window DPI
-  ; $3 style
-  ; $4 x
-  ; $5 y
-  ; $6 width
-  ; $7 height
-  FindWindow $1 "#32770" "" $HWNDPARENT ; Find inner dialog
-  System::Call "user32::GetDpiForWindow(p r1) i .r2"
-  ${If} $(^RTL) = 1
-    StrCpy $3 "${__NSD_CheckBox_EXSTYLE} | ${WS_EX_LAYOUTRTL}"
-    IntOp $4 50 * $2
-  ${Else}
-    StrCpy $3 "${__NSD_CheckBox_EXSTYLE}"
-    IntOp $4 0 * $2
-  ${EndIf}
-  IntOp $5 100 * $2
-  IntOp $6 400 * $2
-  IntOp $7 25 * $2
-  IntOp $4 $4 / 96
-  IntOp $5 $5 / 96
-  IntOp $6 $6 / 96
-  IntOp $7 $7 / 96
-  System::Call 'user32::CreateWindowEx(i r3, w "${__NSD_CheckBox_CLASS}", w "$(deleteAppData)", i ${__NSD_CheckBox_STYLE}, i r4, i r5, i r6, i r7, p r1, i0, i0, i0) i .s'
-  Pop $DeleteAppDataCheckbox
-  SendMessage $HWNDPARENT ${WM_GETFONT} 0 0 $1
-  SendMessage $DeleteAppDataCheckbox ${WM_SETFONT} $1 1
-FunctionEnd
-!define MUI_PAGE_CUSTOMFUNCTION_LEAVE un.ConfirmLeave
-Function un.ConfirmLeave
-  SendMessage $DeleteAppDataCheckbox ${BM_GETCHECK} 0 0 $DeleteAppDataCheckboxState
-FunctionEnd
+; User settings and models can be shared by another installation. Preserve them.
 !define MUI_PAGE_CUSTOMFUNCTION_PRE un.SkipIfPassive
 !insertmacro MUI_UNPAGE_CONFIRM
 
@@ -453,33 +377,43 @@ FunctionEnd
 {{/each}}
 
 ; TOKEN_PLACE_GUARD_BEGIN
-; Refuse before Tauri's reinstall page can uninstall MSI, in every UI mode.
-!define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop is already installed using MSI. Uninstall the existing version first, then run this NSIS installer. Your existing app, settings and models have not been changed."
-
-!macro TokenPlaceFindMsi HIVE VIEW
-  SetRegView ${VIEW}
-  StrCpy $R0 0
-  tp_msi_loop_${HIVE}_${VIEW}:
-    EnumRegKey $R1 ${HIVE} "Software\Microsoft\Windows\CurrentVersion\Uninstall" $R0
-    StrCmp $R1 "" tp_msi_done_${HIVE}_${VIEW}
-    IntOp $R0 $R0 + 1
-    ReadRegStr $R2 ${HIVE} "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R1" "DisplayName"
-    StrCmp $R2 "${PRODUCTNAME}" 0 tp_msi_loop_${HIVE}_${VIEW}
-    ReadRegStr $R3 ${HIVE} "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R1" "Publisher"
-    StrCmp $R3 "${MANUFACTURER}" 0 tp_msi_loop_${HIVE}_${VIEW}
-    ClearErrors
-    ReadRegDWORD $R4 ${HIVE} "Software\Microsoft\Windows\CurrentVersion\Uninstall\$R1" "WindowsInstaller"
-    IfErrors tp_msi_loop_${HIVE}_${VIEW}
-    IntCmp $R4 1 tp_msi_found_${HIVE}_${VIEW} tp_msi_loop_${HIVE}_${VIEW} tp_msi_loop_${HIVE}_${VIEW}
-  tp_msi_found_${HIVE}_${VIEW}:
-    SetRegView lastused
+!define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed."
+Function TokenPlaceVerifyOwnership
+  Push $0
+  Push $1
+  StrCpy $TokenPlaceRetained ""
+  ${If} $TokenPlaceOldRemoved = 1
+    StrCpy $TokenPlaceRetained $TokenPlaceOwnedTarget
+  ${EndIf}
+  ClearErrors
+  ExecWait '"$PLUGINSDIR\ownership.exe" "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe" "$TokenPlaceRetained" "$PLUGINSDIR\ownership.ini"' $0
+  ${If} ${Errors}
     Call TokenPlaceAbortCrossFormat
-  tp_msi_done_${HIVE}_${VIEW}:
-    SetRegView lastused
-!macroend
+  ${EndIf}
+  ${If} $0 != 0
+  ${AndIf} $0 != 10
+    Call TokenPlaceAbortCrossFormat
+  ${EndIf}
+  ReadINIStr $1 "$PLUGINSDIR\ownership.ini" "ownership" "target"
+  ${If} $1 == ""
+    Call TokenPlaceAbortCrossFormat
+  ${EndIf}
+  ${If} $TokenPlaceOwnedTarget != ""
+  ${AndIf} $TokenPlaceOwnedTarget != $1
+    Call TokenPlaceAbortCrossFormat
+  ${EndIf}
+  ${If} $0 = 10
+    StrCpy $TokenPlaceOwnedTarget $1
+  ${EndIf}
+  Pop $1
+  Pop $0
+FunctionEnd
 
 Function TokenPlaceAbortCrossFormat
-  ; Piped stdout works without a console; attach only when no handle exists.
+  StrCpy $TokenPlaceResult "${TOKEN_PLACE_CROSS_FORMAT_MESSAGE}"
+  ${If} $TokenPlaceOldRemoved = 1
+    StrCpy $TokenPlaceResult "TOKEN_PLACE_INTERRUPTED_UPGRADE: ownership changed after the old NSIS app was removed. Settings and models were retained. Stop and repair the installation before retrying."
+  ${EndIf}
   System::Call 'kernel32::GetStdHandle(i -11)p.r0'
   ${If} $0 == 0
   ${OrIf} $0 == -1
@@ -488,44 +422,23 @@ Function TokenPlaceAbortCrossFormat
   ${EndIf}
   ${If} $0 != 0
   ${AndIf} $0 != -1
-    FileWrite $0 "${TOKEN_PLACE_CROSS_FORMAT_MESSAGE}$\r$\n"
+    FileWrite $0 "$TokenPlaceResult$\r$\n"
   ${EndIf}
   IfSilent tp_refusal_exit
   ClearErrors
   ${GetOptions} $CMDLINE "/P" $0
   ${If} ${Errors}
-    MessageBox MB_OK|MB_ICONSTOP "${TOKEN_PLACE_CROSS_FORMAT_MESSAGE}"
+    MessageBox MB_OK|MB_ICONSTOP "$TokenPlaceResult"
   ${EndIf}
   tp_refusal_exit:
   SetErrorLevel 1638
   Quit
 FunctionEnd
-
-Function TokenPlaceRefuseCompetingMsi
-  Push $R0
-  Push $R1
-  Push $R2
-  Push $R3
-  Push $R4
-  !insertmacro TokenPlaceFindMsi HKCU 32
-  !insertmacro TokenPlaceFindMsi HKLM 32
-  ${If} ${RunningX64}
-    !insertmacro TokenPlaceFindMsi HKCU 64
-    !insertmacro TokenPlaceFindMsi HKLM 64
-  ${EndIf}
-  Pop $R4
-  Pop $R3
-  Pop $R2
-  Pop $R1
-  Pop $R0
-  ClearErrors
-FunctionEnd
 ; TOKEN_PLACE_GUARD_END
 
 Function .onInit
-; TOKEN_PLACE_GUARD_CALL_BEGIN
-  Call TokenPlaceRefuseCompetingMsi
-; TOKEN_PLACE_GUARD_CALL_END
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -572,6 +485,7 @@ Function .onInit
   !if "${INSTALLMODE}" == "both"
     !insertmacro MULTIUSER_INIT
   !endif
+  Call TokenPlaceVerifyOwnership
 FunctionEnd
 
 
@@ -687,13 +601,14 @@ Section WebView2
 SectionEnd
 
 Section Install
+  Call TokenPlaceVerifyOwnership
   SetOutPath $INSTDIR
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -830,7 +745,7 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
@@ -913,26 +828,14 @@ Section Uninstall
   ; If it doesn't exist, it does nothing.
   ; We do this when not updating (to preserve the registry value on updates)
   ${If} $UpdateMode <> 1
-    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    ${If} $0 == '$INSTDIR\${MAINBINARYNAME}.exe'
+    ${OrIf} $0 == '"$INSTDIR\${MAINBINARYNAME}.exe"'
+      DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
+    ${EndIf}
   ${EndIf}
 
-  ; Delete app data if the checkbox is selected
-  ; and if not updating
-  ${If} $DeleteAppDataCheckboxState = 1
-  ${AndIf} $UpdateMode <> 1
-    ; Clear the install location $INSTDIR from registry
-    DeleteRegKey SHCTX "${MANUPRODUCTKEY}"
-    DeleteRegKey /ifempty SHCTX "${MANUKEY}"
-
-    ; Clear the install language from registry
-    DeleteRegValue HKCU "${MANUPRODUCTKEY}" "Installer Language"
-    DeleteRegKey /ifempty HKCU "${MANUPRODUCTKEY}"
-    DeleteRegKey /ifempty HKCU "${MANUKEY}"
-
-    SetShellVarContext current
-    RmDir /r "$APPDATA\${BUNDLEID}"
-    RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
-  ${EndIf}
+  ; Preserve per-user settings, models and shared MSI remembered metadata.
 
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
     !insertmacro NSIS_HOOK_POSTUNINSTALL
@@ -986,12 +889,9 @@ Function CreateOrUpdateStartMenuShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode
-  ; but always create if migrating from wix
-  ${If} $WixMode = 0
-    ${If} $UpdateMode = 1
-    ${OrIf} $NoShortcutMode = 1
-      Return
-    ${EndIf}
+  ${If} $UpdateMode = 1
+  ${OrIf} $NoShortcutMode = 1
+    Return
   ${EndIf}
 
   !if "${STARTMENUFOLDER}" != ""
@@ -1015,12 +915,9 @@ Function CreateOrUpdateDesktopShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode
-  ; but always create if migrating from wix
-  ${If} $WixMode = 0
-    ${If} $UpdateMode = 1
-    ${OrIf} $NoShortcutMode = 1
-      Return
-    ${EndIf}
+  ${If} $UpdateMode = 1
+  ${OrIf} $NoShortcutMode = 1
+    Return
   ${EndIf}
 
   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"

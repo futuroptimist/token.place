@@ -1,0 +1,54 @@
+# Windows installer ownership
+
+Both formats remain available in the unreleased desktop 0.1.25 train. NSIS keeps
+its current-user scope and MSI keeps its per-machine scope. No profile scanning,
+hive loading, privilege acquisition or automatic cross-format migration occurs.
+
+Fresh installs refuse a visible competing owner or a nonempty unowned target.
+Same-format upgrades require a verified existing registration and unchanged
+canonical target. Existing mixed installations may upgrade independently only
+when their targets are disjoint. Overlap, nesting, directory aliases, executable
+hard-link aliases, duplicate registrations and embedded reparse points fail
+closed. An inaccessible or stale matching registration is not treated as absent.
+
+Discovery is deliberately limited to HKCU and HKLM, in both registry views.
+Consequently a machine MSI install cannot establish absence of another user's
+private NSIS registration. A fresh NSIS install can see a machine MSI and refuses
+it. This is a bounded ownership policy, not a global single-installation or
+concurrent mixed-version compatibility guarantee.
+
+`ownership.cpp` compiles with the existing MSVC toolchain into an NSIS helper
+executable and an MSI custom-action DLL. The CRT is statically linked; no binary
+download or new runtime dependency is required. Cargo fails if compilation fails.
+The helper reads installation metadata and file identities only. NSIS stores its
+canonical result in its private temporary directory. The MSI action recovers the
+related product's registered directory before costing, then verifies the resolved
+target in the execute sequence before InstallInitialize/RemoveExistingProducts.
+Neither `Installed` nor `/UPDATE` grants upgrade authority.
+
+NSIS no longer selects or executes an MSI uninstaller. Before invoking an older
+NSIS uninstaller it validates the owner and passes `/UPDATE` to preserve data.
+It retains the verified canonical target across that uninstall, rechecks before
+copying, and reports an interrupted upgrade distinctly if the later check fails.
+New NSIS uninstallers always preserve per-user settings and models because the
+namespace can be used by another installation. They no longer offer the delete
+app-data checkbox. Existing path-scoped shortcut removal remains in place.
+
+These checks run immediately before mutation; they are not a system-wide lock
+against concurrent administrator changes. Test fixtures are disposable hosted
+Windows state. Single-owner harness assertions remain strict; mixed-owner tests
+separately snapshot the competing owner and shared data and test survivor config
+readback. Synthetic policy tests compile without registry discovery code.
+
+The template source and license are pinned in `upstream.json` and `LICENSE_MIT`.
+`template-changes.patch` records every change from that source; a regression
+reverses the patch in memory and verifies the pristine upstream hashes. Rebase
+the patch deliberately when changing Tauri CLI versions.
+
+Native API references:
+
+- [MsiEnumRelatedProducts](https://learn.microsoft.com/en-us/windows/win32/api/msi/nf-msi-msienumrelatedproductsw)
+- [MsiGetProductInfo](https://learn.microsoft.com/en-us/windows/win32/api/msi/nf-msi-msigetproductinfow)
+- [MsiGetTargetPath](https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msigettargetpathw)
+- [GetFinalPathNameByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+- [CostFinalize sequencing](https://learn.microsoft.com/en-us/windows/win32/msi/costfinalize-action)

@@ -642,6 +642,16 @@ def msi_location_searches(installer: Installer) -> list[dict]:
 $ErrorActionPreference = 'Stop'
 $installer = New-Object -ComObject WindowsInstaller.Installer
 $database = $installer.OpenDatabase('__PACKAGE__', 0)
+$guardView = $database.OpenView("SELECT ``Action``, ``Target`` FROM ``CustomAction``")
+$guardView.Execute()
+$guards = @{}
+while ($guard = $guardView.Fetch()) { $guards[$guard.StringData(1)] = $guard.StringData(2) }
+if ($guards['TokenPlaceResolve'] -eq 'TokenPlaceResolve' -and $guards['TokenPlaceVerify'] -eq 'TokenPlaceVerify') {
+  # The guarded package deliberately has no INSTALLDIR AppSearch. Do not erase
+  # another format's remembered metadata to make this package pass.
+  '{"ownershipPreflight":true,"rows":[]}'
+  exit 0
+}
 $query = @'
 SELECT `RegLocator`.`Root`, `RegLocator`.`Key`, `RegLocator`.`Name`, `RegLocator`.`Type` FROM `AppSearch`, `RegLocator` WHERE `AppSearch`.`Property` = 'INSTALLDIR' AND `AppSearch`.`Signature_` = `RegLocator`.`Signature_`
 '@
@@ -655,6 +665,8 @@ ConvertTo-Json -InputObject @($items) -Compress
 '''.replace("__PACKAGE__", package)
     result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=60)
     rows = json.loads(result.stdout)
+    if rows == {"ownershipPreflight": True, "rows": []}:
+        return []
     if not isinstance(rows, list) or not rows:
         raise InstallerIdentityError("MSI has no supported INSTALLDIR registry searches")
     return rows

@@ -61,11 +61,26 @@ def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
     assert lock["packages"]["node_modules/@tauri-apps/cli"]["version"] == metadata["tauriCliVersion"], "Rebase the custom installer templates when upgrading Tauri CLI"
     for name, digest in metadata["templates"].items():
         text = "".join((TEMPLATES / name).read_text(encoding="utf-8").splitlines(keepends=True)[2:])
-        if name.endswith(".nsi"):
-            text = re.sub(r"; TOKEN_PLACE_GUARD_BEGIN.*?; TOKEN_PLACE_GUARD_END\n\n", "", text, flags=re.S)
-            text = re.sub(r"; TOKEN_PLACE_GUARD_CALL_BEGIN.*?; TOKEN_PLACE_GUARD_CALL_END\n", "", text, flags=re.S)
-        else:
-            text = re.sub(r"        <!-- TOKEN_PLACE_GUARD_BEGIN -->.*?        <!-- TOKEN_PLACE_GUARD_END -->\n\n", "", text, flags=re.S)
+        # Reverse the reviewed patch in memory and verify the pinned upstream
+        # digest. Every local template change must have a corresponding hunk.
+        patch = (TEMPLATES / "template-changes.patch").read_text(encoding="utf-8")
+        section = patch.split(f"+++ b/{name}\n", 1)[1].split("--- a/", 1)[0]
+        lines = text.splitlines(keepends=True)
+        original, cursor = [], 0
+        for hunk in re.split(r"(?m)^@@ ", section)[1:]:
+            header, body = hunk.split("\n", 1)
+            match = re.match(r"-\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", header)
+            start = int(match.group(1)) - 1
+            original.extend(lines[cursor:start])
+            cursor = start
+            for line in body.splitlines(keepends=True):
+                if line.startswith((" ", "+")):
+                    assert lines[cursor] == line[1:], (name, cursor)
+                    cursor += 1
+                if line.startswith((" ", "-")):
+                    original.append(line[1:])
+        original.extend(lines[cursor:])
+        text = "".join(original)
         assert hashlib.sha256(text.encode()).hexdigest() == digest, name
     config = json.loads((ROOT / "desktop-tauri/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     assert config["version"] == "0.1.25"  # Explicitly approved unreleased release train.
@@ -73,46 +88,38 @@ def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
     assert config["bundle"]["windows"]["wix"]["template"] == "installers/windows.wxs"
 
 
-def test_nsis_refuses_before_pages_sections_and_preserves_same_format_path():
+def test_nsis_checks_ownership_before_reinstall_and_copy():
     text = (TEMPLATES / "windows.nsi").read_text(encoding="utf-8")
-    init = text.split("Function .onInit\n", 1)[1].split("FunctionEnd", 1)[0]
-    assert init.index("Call TokenPlaceRefuseCompetingMsi") < init.index("${GetOptions}")
-    block = text.split("; TOKEN_PLACE_GUARD_BEGIN", 1)[1].split("; TOKEN_PLACE_GUARD_END", 1)[0]
-    for hive in ("HKCU", "HKLM"):
-        for view in (32, 64):
-            assert f"!insertmacro TokenPlaceFindMsi {hive} {view}" in block
-    for discriminator in ('"DisplayName"', '"Publisher"', '"WindowsInstaller"'):
-        assert discriminator in block
-    assert 'IntCmp $R4 1 ' in block
-    assert 'IfSilent tp_refusal_exit' in block
-    assert 'MessageBox MB_OK|MB_ICONSTOP' in block
-    assert 'SetErrorLevel 1638\n  Quit' in block
-    assert 'Uninstall the existing version first' in block
-    for mutation in ('WriteReg', 'Delete ', 'SetOutPath', 'ExecWait', 'NSISdl::'):
-        assert mutation not in block
+    for section, end in (("Function .onInit", "FunctionEnd"), ("Function PageReinstall", "FunctionEnd"), ("Section Install", "SectionEnd")):
+        body = text.split(section + "\n", 1)[1].split(end, 1)[0]
+        assert "Call TokenPlaceVerifyOwnership" in body
+        if "SetOutPath" in body:
+            assert body.index("Call TokenPlaceVerifyOwnership") < body.index("SetOutPath")
+    assert "$WixMode" not in text
+    assert "msiexec" not in text
+    assert '''StrCpy $R1 '"$INSTDIR\\uninstall.exe" /UPDATE' '''.strip() in text
+    assert "TOKEN_PLACE_INTERRUPTED_UPGRADE" in text
+    assert "DeleteAppDataCheckbox" not in text
+    assert 'RmDir /r "$APPDATA' not in text
+    assert 'RmDir /r "$LOCALAPPDATA' not in text
 
 
-def test_msi_refusal_covers_scopes_views_and_allows_uninstall():
+def test_msi_verifies_final_target_before_major_upgrade():
     text = (TEMPLATES / "windows.wxs").read_text(encoding="utf-8")
     block = text.split("<!-- TOKEN_PLACE_GUARD_BEGIN -->", 1)[1].split("<!-- TOKEN_PLACE_GUARD_END -->", 1)[0]
     root = ET.fromstring("<Product>" + block + "</Product>")
-    properties = root.findall("Property")
-    assert len(properties) == 4
-    found = set()
-    for prop in properties:
-        assert prop.attrib["Secure"] == "yes"
-        search = prop.find("RegistrySearch")
-        found.add((search.attrib["Root"], search.attrib["Win64"]))
-        assert search.attrib["Name"] == "UninstallString"
-        # Handlebars consumes one backslash before a substitution. A single
-        # backslash escapes the expression and produces a literal product_name.
-        assert search.attrib["Key"].endswith(r"Uninstall\\{{product_name}}")
-        assert f"NOT {prop.attrib['Id']}" in root.find("Condition").text
-    assert found == {(hive, view) for hive in ("HKCU", "HKLM") for view in ("yes", "no")}
-    condition = root.find("Condition")
-    assert condition.text.startswith('REMOVE~="ALL" OR (')
-    assert 'Uninstall the existing version first' in condition.attrib["Message"]
-    assert text.index("TOKEN_PLACE_GUARD_BEGIN") < text.index("<MajorUpgrade")
+    sequence = root.find("InstallExecuteSequence")
+    assert sequence.find("Custom[@Action='TokenPlaceVerify']").attrib["Before"] == "InstallInitialize"
+    assert sequence.find("Custom[@Action='TokenPlaceResolve']").attrib["Before"] == "CostInitialize"
+    assert "PrevInstallDirNoName" not in text
+    assert "PrevInstallDirWithName" not in text
+    assert '<MajorUpgrade Schedule="afterInstallInitialize"' in text
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
+    assert "MsiGetTargetPathW" in source
+    assert "MsiEnumRelatedProductsW" in source
+    assert "GetFinalPathNameByHandleW" in source
+    assert "HKEY_USERS" not in source
+    assert "RegLoad" not in source
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-16-le"])

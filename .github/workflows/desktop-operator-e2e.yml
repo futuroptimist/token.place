@@ -22,6 +22,9 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'desktop-tauri/scripts/test_windows_installer_coexistence.py'
+      - 'desktop-tauri/src-tauri/build.rs'
+      - 'desktop-tauri/src-tauri/Cargo.toml'
       - 'tests/unit/test_desktop_release_artifacts.py'
       - 'tests/unit/test_windows_installer_refusal.py'
       - 'desktop-tauri/src-tauri/installers/**'
@@ -51,6 +54,9 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'desktop-tauri/scripts/test_windows_installer_coexistence.py'
+      - 'desktop-tauri/src-tauri/build.rs'
+      - 'desktop-tauri/src-tauri/Cargo.toml'
       - 'tests/unit/test_desktop_release_artifacts.py'
       - 'tests/unit/test_windows_installer_refusal.py'
       - 'desktop-tauri/src-tauri/installers/**'
@@ -273,6 +279,15 @@ jobs:
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis,msi
 
+      - name: Test native ownership policy with disposable paths
+        run: |
+          cmake -S desktop-tauri/src-tauri/installers -B "${{ runner.temp }}/ownership-tests" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "${{ runner.temp }}/ownership-tests" --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir "${{ runner.temp }}/ownership-tests" -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # Hosted Windows is driverless, so the cu124 runtime cannot import without
       # nvcuda.dll. Issue #1555 reserves native GPU proof for a GPU runner.
       - name: Validate installed structural CPU smoke and package identity
@@ -335,6 +350,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed += $scenario }
           }
           if ($failed.Count) { throw "Installer transition checks failed: $($failed -join ', ')" }
+          python desktop-tauri/scripts/test_windows_installer_coexistence.py `
+            --nsis $nsis[0].FullName --msi $msi[0].FullName `
+            --old-nsis $oldNsis[0].FullName --old-msi $oldMsi[0].FullName `
+            --old-version $previousVersion --version $version --build-id $buildId `
+            --artifacts "$env:RUNNER_TEMP/token-place-current-package-validation"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py

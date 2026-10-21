@@ -138,7 +138,9 @@ def authority(root: Path, msi: bool) -> tuple:
     entries = [entry for entry in snapshot.registry if entry.windows_installer == msi]
     assert len(entries) == 1, "mixed scenario requires exactly one owner of each format"
     shortcuts = [(str(s.path), str(s.target)) for s in snapshot.shortcuts.shortcuts if s.target.parent.resolve() == root.resolve()]
-    assert shortcuts and all(Path(target).is_file() for _, target in shortcuts)
+    assert shortcuts and all(Path(target).is_file() for _, target in shortcuts), (
+        f"owner at {root} lacks valid shortcuts: {snapshot.shortcuts.shortcuts!r}"
+    )
     return entries, sorted(shortcuts)
 
 
@@ -153,9 +155,10 @@ def main() -> None:
     output = Path(args.artifacts) / "mixed-ownership"
     output.mkdir(parents=True, exist_ok=True)
     roots = {kind: h.create_install_directory() for kind in ("nsis", "msi")}
-    unicode_root = roots["nsis"].with_name(roots["nsis"].name + "-\u96ea-\u03bb")
-    roots["nsis"].rename(unicode_root)
-    roots["nsis"] = unicode_root
+    # Establish healthy legacy owners. The shipped v0.1.24 NSIS seed produced
+    # invalid non-ACP shortcut targets in hosted CI before the candidate ran.
+    # Unicode transport/path tests remain separate; do not repair seed shortcuts
+    # or relax any authority/preservation assertions to manufacture a pass.
     packages = {kind: h.Installer(Path(getattr(args, kind)), kind, args.version) for kind in roots}
     previous = {kind: h.Installer(Path(getattr(args, "old_" + kind)), kind, args.old_version) for kind in roots}
     results = []
@@ -173,6 +176,8 @@ def main() -> None:
             result = h.install(previous[kind], output / f"seed-{kind}.log", install_root=roots[kind])
             assert result.returncode == 0, result.stdout[-1000:]
         assert len(h.inventory_registry_entries()) == 2
+        for kind in roots:
+            authority(roots[kind] / "app", kind == "msi")
         model = output / "preserved-model.gguf"
         model.write_bytes(b"GGUF preservation fixture; not used for inference")
         values = h.seeded_config_values()

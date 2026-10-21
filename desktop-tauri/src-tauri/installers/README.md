@@ -43,6 +43,13 @@ Windows state. Single-owner harness assertions remain strict; mixed-owner tests
 separately snapshot the competing owner and shared data and test survivor config
 readback. Synthetic policy tests compile without registry discovery code.
 
+Mixed-owner upgrade fixtures use ordinary ASCII installation paths to establish
+healthy legacy owners. In retained hosted run 39552571152, the v0.1.24 NSIS seed
+created invalid shortcut targets for a non-ACP path before any candidate upgrade;
+the cause is not attributed here and the fixture does not repair those shortcuts.
+Native Unicode path/ownership/INI tests and actual PowerShell Unicode serialization
+tests cover their respective boundaries, not end-to-end Unicode installer support.
+
 The template source and license are pinned in `upstream.json` and `LICENSE_MIT`.
 `template-changes.patch` records every change from that source; a regression
 reverses the patch in memory and verifies the pristine upstream hashes. Rebase

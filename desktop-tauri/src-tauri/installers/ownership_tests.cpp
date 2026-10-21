@@ -61,7 +61,13 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(!tp::empty_target(root.wstring()));
         ++cases;
         auto report = root / L"ownership.ini";
-        const tp::wstring unicode = original + L"\\\u96ea-\u03bb-\u0416";
+        auto unicode_path = root / L"\u96ea-\u03bb-\u0416";
+        tp::fs::create_directories(unicode_path);
+        const tp::wstring unicode = tp::canonical(unicode_path.wstring());
+        tp::require(tp::contains(tp::canonical(root.wstring()), unicode));
+        tp::require(unicode.find(L"\u96ea-\u03bb-\u0416") != tp::wstring::npos);
+        ++cases;
+        check(true, false, unicode, {{false, true, unicode, L"unicode-owner"}}, false);
         tp::write_result(report.c_str(), unicode);
         wchar_t result[32768];
         tp::require(GetPrivateProfileStringW(L"ownership", L"target", L"", result, 32768, report.c_str()) == unicode.size());

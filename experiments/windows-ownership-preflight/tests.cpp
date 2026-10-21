@@ -110,6 +110,15 @@ void tests() {
     f = Fixture{}; f.system.owners = {Format::unclassified};
     check(f, Format::msi, Decision::incomplete);
     check({}, Format::unclassified, Decision::incomplete);
+    check({}, static_cast<Format>(99), Decision::incomplete);
+    f = Fixture{}; f.system.owners = {static_cast<Format>(99)};
+    check(f, Format::msi, Decision::incomplete);
+    f = Fixture{}; f.first.profiles[1].storage = static_cast<Storage>(99); f.last = f.first;
+    check(f, Format::msi, Decision::incomplete);
+    f = Fixture{}; f.first.profiles[1].kind = static_cast<Kind>(99); f.last = f.first;
+    check(f, Format::msi, Decision::incomplete);
+    f = Fixture{}; f.system.owners = {Format::msi}; f.disk.at("bob").state = ReadState::denied;
+    check(f, Format::msi, Decision::incomplete); // Existing MSI does not bypass unknown evidence.
     f = Fixture{};
     require(inspect(Format::msi, f).decision == Decision::clear, "normal inspection failed");
     require(f.loaded_reads == 1 && f.offline_reads == 1, "wrong profile reader selected");

@@ -40,6 +40,16 @@ struct Result {
     unsigned conflicts = 0;
     unsigned unknowns = 0;
 };
+inline bool known_format(Format format) {
+    return format == Format::msi || format == Format::nsis;
+}
+inline bool known_kind(Kind kind) {
+    switch (kind) {
+    case Kind::local: case Kind::roaming: case Kind::mandatory:
+    case Kind::temporary: case Kind::service: return true;
+    default: return false;
+    }
+}
 inline bool same_inventory(const Inventory& a, const Inventory& b) {
     if (!a.complete || !b.complete || a.revision.empty() || a.revision != b.revision
         || a.profiles.size() != b.profiles.size()) return false;
@@ -54,11 +64,11 @@ inline bool same_inventory(const Inventory& a, const Inventory& b) {
 }
 inline Result inspect(Format requested, Reader& reader) noexcept {
     Result result;
-    if (requested == Format::unclassified) { result.unknowns = 1; return result; }
+    if (!known_format(requested)) { result.unknowns = 1; return result; }
     const auto consume = [&](const Observation& observation) {
         if (observation.state != ReadState::complete) ++result.unknowns;
         for (const auto owner : observation.owners) {
-            if (owner == Format::unclassified) ++result.unknowns;
+            if (!known_format(owner)) ++result.unknowns;
             else if (owner != requested) ++result.conflicts;
         }
     };
@@ -69,7 +79,7 @@ inline Result inspect(Format requested, Reader& reader) noexcept {
         std::set<std::string> seen;
         for (const auto& profile : before.profiles) {
             if (profile.identity.empty() || !seen.insert(profile.identity).second
-                || profile.kind == Kind::unclassified) {
+                || !known_kind(profile.kind)) {
                 ++result.unknowns;
                 continue;
             }
@@ -78,7 +88,7 @@ inline Result inspect(Format requested, Reader& reader) noexcept {
             switch (profile.storage) {
             case Storage::loaded: consume(reader.loaded(profile)); break;
             case Storage::offline: consume(reader.offline(profile)); break;
-            case Storage::unavailable: ++result.unknowns; break;
+            case Storage::unavailable: default: ++result.unknowns; break;
             }
         }
         if (!same_inventory(before, reader.inventory())) ++result.unknowns;

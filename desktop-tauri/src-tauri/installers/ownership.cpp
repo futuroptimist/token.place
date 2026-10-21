@@ -65,6 +65,12 @@ bool contains(const wstring& parent, const wstring& child) {
         child[parent.size()] == L'\\' && equal(parent, child.substr(0, parent.size())));
 }
 bool overlaps(const wstring& a, const wstring& b) { return contains(a, b) || contains(b, a); }
+void verify_requested_upgrade_target(const wstring& requested, const wstring& installed) {
+    // MSI maintenance costing can silently replace an explicit INSTALLDIR with
+    // component history. Reject a changed request before that evidence is lost.
+    if (!requested.empty() && !installed.empty())
+        require(canonical(requested) == canonical(installed));
+}
 bool empty_target(const wstring& path) {
     std::error_code error;
     bool exists = fs::exists(path, error);
@@ -271,7 +277,9 @@ tp::Owner related(MSIHANDLE session) {
 extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceResolve(MSIHANDLE session) {
     try {
         auto own = related(session);
-        if (!own.root.empty() && property(session, L"INSTALLDIR").empty())
+        auto requested = property(session, L"INSTALLDIR");
+        tp::verify_requested_upgrade_target(requested, own.root);
+        if (!own.root.empty() && requested.empty())
             tp::require(MsiSetPropertyW(session, L"INSTALLDIR", own.root.c_str()) == ERROR_SUCCESS);
         return ERROR_SUCCESS;
     } catch (...) { return refusal(session); }

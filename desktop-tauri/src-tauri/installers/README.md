@@ -25,7 +25,9 @@ executable and an MSI custom-action DLL. The CRT is statically linked; no binary
 download or new runtime dependency is required. Cargo fails if compilation fails.
 The helper reads installation metadata and file identities only. NSIS stores its
 canonical result in its private temporary directory. The MSI action recovers the
-related product's registered directory before costing, then verifies the resolved
+related product's registered directory before costing and rejects a conflicting
+explicit target before maintenance costing can replace it with component history.
+It then verifies the resolved
 target in the execute sequence before InstallInitialize/RemoveExistingProducts.
 Neither `Installed` nor `/UPDATE` grants upgrade authority.
 

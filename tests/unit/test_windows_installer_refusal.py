@@ -118,6 +118,8 @@ def test_msi_verifies_final_target_before_major_upgrade():
     source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
     assert "MsiGetTargetPathW" in source
     assert "MsiEnumRelatedProductsW" in source
+    resolve = source.split('UINT __stdcall TokenPlaceResolve', 1)[1].split('UINT __stdcall TokenPlaceVerify', 1)[0]
+    assert resolve.index('verify_requested_upgrade_target(requested, own.root)') < resolve.index('MsiSetPropertyW')
     assert "GetFinalPathNameByHandleW" in source
     assert "HKEY_USERS" not in source
     assert "RegLoad" not in source

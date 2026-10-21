@@ -49,6 +49,17 @@ int wmain(int argc, wchar_t** argv) {
         auto different_case = (root / L"EXISTS").wstring();
         tp::require(original == tp::canonical(different_case));
         ++cases;
+        tp::verify_requested_upgrade_target(different_case, (root / L"exists").wstring());
+        tp::verify_requested_upgrade_target(L"", (root / L"exists").wstring());
+        tp::verify_requested_upgrade_target((root / L"fresh").wstring(), L"");
+        cases += 3;
+        for (auto changed : {root / L"other", root / L"exists" / L"nested", root}) {
+            bool rejected = false;
+            try { tp::verify_requested_upgrade_target(changed.wstring(), (root / L"exists").wstring()); }
+            catch (const tp::Failure&) { rejected = true; }
+            tp::require(rejected);
+            ++cases;
+        }
         tp::require(tp::equal(original, tp::canonical((root / L"exists" / L".").wstring())));
         ++cases;
         auto future = tp::canonical((root / L"exists" / L"new" / L"child").wstring());

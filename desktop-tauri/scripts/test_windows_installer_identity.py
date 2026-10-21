@@ -705,7 +705,16 @@ def reset_msi_remembered_locations(installer: Installer, log_path: Path | None =
 
 def install(installer: Installer, log_path: Path | None = None, *, install_root: Path) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
-        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart", f"INSTALLDIR={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
+        with tempfile.TemporaryDirectory(prefix="token-place-msi-diagnostic-") as temporary:
+            native_log = log_path.with_suffix(".msi.log") if log_path else Path(temporary) / "installer.log"
+            result = _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart", f"INSTALLDIR={install_root / 'app'}", "/L*V", str(native_log)], timeout=300, check=False, log_path=log_path)
+            if result.returncode and native_log.is_file():
+                diagnostic = msi_rejection_diagnostic(native_log.read_bytes())
+                result.stdout += diagnostic
+                if log_path and diagnostic:
+                    with log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(diagnostic)
+            return result
     # NSIS remembers /D even after uninstall. Static payload validation uses a
     # temporary extraction directory, so never inherit its remembered path.
     return _run([str(installer.path), "/S", f"/D={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
@@ -1508,9 +1517,38 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 
+def msi_rejection_diagnostic(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16", errors="replace")
+    elif b"\x00" in data[:100]:
+        text = data.decode("utf-16-le", errors="replace")
+    else:
+        text = data.decode("utf-8", errors="replace")
+    lines = [line[:1024] for line in text.splitlines() if "TOKEN_PLACE_COMPETING_INSTALLER:" in line]
+    return "\n" + "\n".join(lines[-4:]) if lines else ""
+
+
+def capture_rejection_preservation(authority: AuthoritySnapshot, config_path: Path, model_path: Path) -> dict[str, str]:
+    if len(authority.canonical_targets) != 1:
+        raise InstallerIdentityError("cannot snapshot an ambiguous installation before cross-format refusal")
+    roots = {"installed": authority.canonical_targets[0].parent, "settings": config_path.parent, "models": model_path.parent}
+    snapshot = {}
+    for label, root in roots.items():
+        if not root.is_dir():
+            raise InstallerIdentityError(f"cross-format preservation root is missing: {label}")
+        for path in sorted(root.rglob("*")):
+            key = f"{label}/{path.relative_to(root).as_posix()}"
+            if path.is_file():
+                stat = path.stat()
+                snapshot[key] = f"{stat.st_size}:{stat.st_mtime_ns}:{_sha256_file(path)}"
+            elif path.is_dir():
+                snapshot[key] = "directory"
+    return snapshot
+
+
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
     text = result.stdout.lower()
-    return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
+    return result.returncode != 0 and "token_place_competing_installer:" in text and "uninstall the existing version first" in text and "token.place" in text
 
 
 def run_scenario(
@@ -1523,8 +1561,14 @@ def run_scenario(
     uninstall_best_effort()
     config_path: Path | None = None
     seeded = seeded_config_values()
+    is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
     with tempfile.TemporaryDirectory(prefix=f"token-place-{scenario.name}-") as tmp:
         root = Path(tmp)
+        model_path = root / "external-models" / "preserve.gguf"
+        if is_cross_kind:
+            model_path.parent.mkdir()
+            model_path.write_bytes(b"GGUF preservation fixture; never loaded for inference\n")
+            seeded["model_path"] = str(model_path)
         sentinel_log = root / "sentinel.log"
         env = _safe_env(_sentinel_dir(root), sentinel_log)
         install_root = create_install_directory()
@@ -1539,18 +1583,28 @@ def run_scenario(
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
                 verify_installed_authority(scenario.previous, install_root)
                 config_path = seed_config(seeded)
-            is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
             authority_before = capture_authority_snapshot() if is_cross_kind else None
+            preserved_before = capture_rejection_preservation(authority_before, config_path, model_path) if is_cross_kind else None
+            if is_cross_kind and artifact_dir:
+                artifact_dir.path(scenario.name, "preservation-before").with_suffix(".json").write_text(json.dumps(preserved_before, indent=2), encoding="utf-8")
             current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None, install_root=install_root)
             if current.returncode != 0:
                 if is_cross_kind and is_actionable_competing_installer_rejection(current):
                     authority_after = capture_authority_snapshot()
                     verify_authority_unchanged(authority_before, authority_after)
+                    preserved_after = capture_rejection_preservation(authority_after, config_path, model_path)
+                    if artifact_dir:
+                        artifact_dir.path(scenario.name, "preservation-after").with_suffix(".json").write_text(json.dumps(preserved_after, indent=2), encoding="utf-8")
+                    if preserved_before != preserved_after:
+                        raise InstallerIdentityError("cross-format refusal changed installed files, settings or models")
+                    verify_config_preserved(config_path, seeded)
                     _terminate_processes()
                     uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
                     verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
+            if is_cross_kind:
+                raise InstallerIdentityError("cross-format installer must refuse the existing competing installation")
             _terminate_processes()
             shortcut = verify_installed_authority(scenario.current, install_root, rejected_version=scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)

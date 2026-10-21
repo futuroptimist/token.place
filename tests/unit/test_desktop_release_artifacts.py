@@ -4644,6 +4644,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
     monkeypatch, tmp_path, probe_result, capsys,
 ) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
@@ -4695,6 +4696,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 
 def test_windows_installer_identity_admission_success_skips_native_probe(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
@@ -4977,6 +4979,7 @@ def _empty_snapshot(guard):
 
 def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
@@ -4989,7 +4992,7 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
 
     def fake_install(installer, log_path=None, *, install_root):
         installs.append(installer.kind)
-        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'remove the competing token.place installation first', '')
+        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop. Uninstall the existing version first', '')
 
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
@@ -5007,6 +5010,7 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
 
 def test_windows_installer_identity_probes_scenario_current_version(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
@@ -5054,6 +5058,7 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
 
 def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
@@ -5078,6 +5083,7 @@ def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(m
 
 def test_windows_installer_identity_requires_postconditions_for_competing_rejection(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: None)
@@ -5087,7 +5093,7 @@ def test_windows_installer_identity_requires_postconditions_for_competing_reject
         path.write_text('artifact', encoding='utf-8')
 
     def fake_install(installer, log_path=None, *, install_root):
-        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'remove the competing token.place installation first', '')
+        return subprocess.CompletedProcess([str(installer.path)], 1603 if installer.kind == 'msi' else 0, 'TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop. Uninstall the existing version first', '')
 
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
@@ -6320,6 +6326,7 @@ def test_windows_installer_identity_probe_identity_accepts_json_and_raw_fallback
 
 def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, "verify_installed_authority", lambda installer, root, **kwargs: guard.resolve_authoritative_shortcut())
@@ -6810,7 +6817,7 @@ def test_windows_installer_identity_install_and_run_log_failure_contract(monkeyp
     guard.install(msi, tmp_path / 'msi.log', install_root=tmp_path)
 
     assert calls[0][0] == [str(nsis.path), '/S', f'/D={tmp_path / "app"}']
-    assert calls[1][0] == [guard._msiexec(), '/i', str(msi.path), '/qn', '/norestart', f'INSTALLDIR={tmp_path / "app"}']
+    assert calls[1][0] == [guard._msiexec(), '/i', str(msi.path), '/qn', '/norestart', f'INSTALLDIR={tmp_path / "app"}', '/L*V', str(tmp_path / 'msi.msi.log')]
     assert (tmp_path / 'nsis.log').read_text(encoding='utf-8').endswith('ok')
 
     def failing_subprocess(cmd, **kwargs):
@@ -7471,6 +7478,7 @@ def test_windows_installer_identity_workflow_reproduces_static_then_installed_se
 @pytest.mark.parametrize('cleanup_fails', [False, True])
 def test_windows_installer_identity_failed_install_cleans_only_after_uninstall(monkeypatch, tmp_path, cleanup_fails):
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, 'durable_install_parent', lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
@@ -7574,7 +7582,7 @@ def test_windows_installer_identity_hosted_ci_covers_both_cross_installer_direct
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
     assert workflow.count("'tests/unit/test_desktop_release_artifacts.py'") == 2
     assert '--bundles nsis,msi' in workflow
-    assert "@('cross-nsis-to-msi', 'cross-msi-to-nsis')" in workflow
+    assert "@('upgrade-nsis-to-nsis', 'upgrade-msi-to-msi', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in workflow
     assert '--scenario $scenario' in workflow
     assert 'if ($failed.Count) { throw' in workflow
 
@@ -7583,6 +7591,7 @@ def test_windows_installer_identity_hosted_ci_covers_both_cross_installer_direct
 @pytest.mark.parametrize('defect', ['stale-path', 'duplicate-owner'])
 def test_windows_installer_identity_scenario_rejects_bad_authority_before_launch(monkeypatch, tmp_path, bad_phase, defect):
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, "reset_msi_remembered_locations", lambda *args: None)
     monkeypatch.setattr(guard, 'durable_install_parent', lambda: tmp_path.resolve())
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
@@ -7611,6 +7620,8 @@ def test_windows_installer_identity_scenario_rejects_bad_authority_before_launch
     monkeypatch.setattr(guard, 'probe_identity', lambda *args: pytest.fail('must reject before launching'))
     scenario = guard.Scenario('cross-msi-to-nsis', guard.Installer(tmp_path / 'new.exe', 'nsis', '0.1.25'), guard.Installer(tmp_path / 'old.msi', 'msi', '0.1.24'))
     expected = 'escaped scenario destination' if defect == 'stale-path' else 'one authoritative installer registration'
+    if bad_phase == 'current':
+        expected = 'cross-format installer must refuse'
     with pytest.raises(guard.InstallerIdentityError, match=expected):
         guard.run_scenario(scenario, 'abcdef123456')
     assert phases == (['previous'] if bad_phase == 'previous' else ['previous', 'current'])
@@ -7721,6 +7732,7 @@ def test_windows_installer_identity_msi_reader_uses_readonly_package_database(mo
 
 def test_windows_installer_identity_reset_only_before_transition(monkeypatch, tmp_path):
     guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: {})
     monkeypatch.setattr(guard, 'durable_install_parent', lambda: tmp_path.resolve())
     events = []
     monkeypatch.setattr(guard, '_terminate_processes', lambda: None)

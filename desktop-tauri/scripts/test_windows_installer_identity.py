@@ -192,10 +192,20 @@ def _run(
     log_path: Path | None = None,
     separate_stderr: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    # Windows PowerShell otherwise serializes redirected output using the OEM
+    # code page, replacing non-ACP paths with '?'. Preserve authority paths all
+    # the way from registry/shortcut JSON through cleanup command construction.
+    encoding = None
+    if cmd[0].replace("\\", "/").rsplit("/", 1)[-1].lower() in ("powershell.exe", "powershell", "pwsh.exe", "pwsh") and "-Command" in cmd:
+        cmd = list(cmd)
+        script_index = cmd.index("-Command") + 1
+        cmd[script_index] = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " + cmd[script_index]
+        encoding = "utf-8"
     result = subprocess.run(
         cmd,
         check=False,
         text=True,
+        encoding=encoding,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
         env=env,

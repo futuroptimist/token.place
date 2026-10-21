@@ -280,6 +280,7 @@ jobs:
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis,msi
 
       - name: Test native ownership policy with disposable paths
+        shell: pwsh
         run: |
           cmake -S desktop-tauri/src-tauri/installers -B "${{ runner.temp }}/ownership-tests" -A x64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

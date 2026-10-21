@@ -6829,6 +6829,20 @@ def test_windows_installer_identity_install_and_run_log_failure_contract(monkeyp
     assert 'exit=9' in (tmp_path / 'failed.log').read_text(encoding='utf-8')
 
 
+def test_windows_installer_identity_powershell_preserves_unicode_paths() -> None:
+    powershell = shutil.which('powershell') or shutil.which('pwsh')
+    if powershell is None:
+        pytest.skip('PowerShell is required for the Unicode output regression')
+    guard = _load_windows_installer_identity()
+    # Pure serialization only: no registry/profile reads or installer execution.
+    command = [powershell, '-NoProfile', '-NonInteractive', '-Command',
+               "[pscustomobject]@{Target=('C:\\fixture-' + [char]0x96ea + '-' + [char]0x03bb + '\\app.exe')} | ConvertTo-Json"]
+    original = list(command)
+    result = guard._run(command)
+    assert json.loads(result.stdout)['Target'] == 'C:\\fixture-\u96ea-\u03bb\\app.exe'
+    assert command == original
+
+
 def test_windows_installer_identity_platform_helpers_and_noop_paths(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     monkeypatch.setenv('SystemRoot', str(tmp_path / 'Windows'))

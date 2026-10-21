@@ -21,12 +21,11 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
     callback_type = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
     user.GetWindowLongW.argtypes = [w.HWND, c.c_int]
     user.GetWindowLongW.restype = w.LONG
-    user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
-    user.SendMessageW.restype = w.LPARAM
     user.PostMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
     user.GetWindowThreadProcessId.argtypes = [w.HWND, c.POINTER(w.DWORD)]
-    user.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
-    user.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
+    user.SendMessageTimeoutW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM, w.UINT, w.UINT, c.POINTER(c.c_size_t)]
+    user.SendMessageTimeoutW.restype = w.LPARAM
+    user.GetDlgCtrlID.argtypes = [w.HWND]
     user.GetClassNameW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
     user.IsWindowVisible.argtypes = [w.HWND]
     user.IsWindowEnabled.argtypes = [w.HWND]
@@ -47,12 +46,29 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
     selected_uninstall = False
     selected_directory = False
     command = [str(package)] + (["/P"] if passive else []) + [f"/D={target}"]
-    with log.open("w", encoding="utf-8") as output:
+    # GetWindowTextW cannot read another process's edit controls. WM_GETTEXT
+    # supports cross-process control text; bound every call so diagnostics
+    # cannot hang behind an installer waiting for its child uninstaller.
+    def control_text(hwnd):
+        buffer = c.create_unicode_buffer(2048)
+        result = c.c_size_t()
+        c.set_last_error(0)
+        ok = user.SendMessageTimeoutW(hwnd, 0xD, len(buffer), c.addressof(buffer), 0x22, 250, c.byref(result))
+        return buffer.value if ok else f"<text unavailable: {c.get_last_error()}>"
+
+    with log.open("w", encoding="utf-8") as output, log.with_suffix(".ui.jsonl").open("w", encoding="utf-8") as trace:
+        def record(event, **values):
+            trace.write(json.dumps({"event": event, **values}, ensure_ascii=False) + "\n")
+            trace.flush()
+
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        record("started", pid=process.pid, command=command)
+        previous_state = None
         deadline = time.monotonic() + 300
         try:
             while process.poll() is None:
                 if time.monotonic() >= deadline:
+                    record("timeout", observed_uninstaller=observed_uninstaller, selected_uninstall=selected_uninstall, selected_directory=selected_directory, owned_children=sorted(owned_children))
                     raise AssertionError("NSIS UI/reinstall transition timed out")
                 snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
                 if snapshot != c.c_void_p(-1).value:
@@ -68,6 +84,8 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                                         if kernel.QueryFullProcessImageNameW(handle, 0, buffer, c.byref(size)):
                                             assert Path(buffer.value).resolve() == (target / "uninstall.exe").resolve(), "selected another owner's uninstaller"
                                             observed_uninstaller = True
+                                            if entry.pid not in owned_children:
+                                                record("owned-uninstaller", pid=entry.pid, path=buffer.value)
                                             owned_children.add(entry.pid)
                                     finally:
                                         kernel.CloseHandle(handle)
@@ -84,31 +102,52 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                             windows.append((hwnd, pid.value != process.pid))
                         return True
                     user.EnumWindows(collect, 0)
+                    state = []
                     for window, is_uninstaller in windows:
                         buttons = []
+                        controls = []
                         @callback_type
                         def children(hwnd, _):
                             nonlocal selected_directory
-                            name = c.create_unicode_buffer(256); label = c.create_unicode_buffer(1024)
-                            user.GetClassNameW(hwnd, name, 256); user.GetWindowTextW(hwnd, label, 1024)
-                            if choose_target is not None and name.value == "Edit" and label.value.rstrip("\\") == str(target).rstrip("\\"):
-                                selected_directory = bool(user.SetWindowTextW(hwnd, str(choose_target)))
+                            name = c.create_unicode_buffer(256)
+                            user.GetClassNameW(hwnd, name, 256)
+                            label = control_text(hwnd)
+                            controls.append({"hwnd": hwnd, "id": user.GetDlgCtrlID(hwnd), "class": name.value, "text": label, "visible": bool(user.IsWindowVisible(hwnd)), "enabled": bool(user.IsWindowEnabled(hwnd))})
+                            if name.value == "Button":
+                                checked = c.c_size_t()
+                                ok = user.SendMessageTimeoutW(hwnd, 0xF0, 0, 0, 0x22, 250, c.byref(checked))
+                                controls[-1]["checked"] = checked.value if ok else None
+                            if choose_target is not None and name.value == "Edit" and label.rstrip("\\") == str(target).rstrip("\\"):
+                                replacement = c.create_unicode_buffer(str(choose_target))
+                                changed = c.c_size_t()
+                                ok = user.SendMessageTimeoutW(hwnd, 0xC, 0, c.addressof(replacement), 0x22, 250, c.byref(changed))
+                                selected_directory = bool(ok and changed.value and control_text(hwnd) == str(choose_target))
+                                record("directory-selection", hwnd=hwnd, confirmed=selected_directory)
                             if name.value == "Button" and user.IsWindowVisible(hwnd) and user.IsWindowEnabled(hwnd):
-                                buttons.append((hwnd, label.value.replace("&", "").strip(), user.GetWindowLongW(hwnd, -16) & 15))
+                                buttons.append((hwnd, label.replace("&", "").strip(), user.GetWindowLongW(hwnd, -16) & 15))
                             return True
                         user.EnumChildWindows(window, children, 0)
+                        state.append({"window": window, "uninstaller": is_uninstaller, "text": control_text(window), "controls": controls})
                         radios = [hwnd for hwnd, _, style in buttons if style in (4, 9)]
                         if not is_uninstaller and len(radios) == 2 and not selected_uninstall and choose_target is None:
-                            user.PostMessageW(radios[1], 0xF5, 0, 0)  # Same-version Uninstall, then reinstall.
+                            c.set_last_error(0)
+                            posted = user.PostMessageW(radios[1], 0xF5, 0, 0)  # Same-version Uninstall, then reinstall.
+                            record("select-uninstall", hwnd=radios[1], posted=bool(posted), error=c.get_last_error())
                             selected_uninstall = True
                         for hwnd, _, style in buttons:
                             if style in (2, 3):
-                                user.SendMessageW(hwnd, 0xF1, 0, 0)  # Do not auto-launch on Finish.
+                                ignored = c.c_size_t()
+                                user.SendMessageTimeoutW(hwnd, 0xF1, 0, 0, 0x22, 250, c.byref(ignored))  # Do not auto-launch on Finish.
                         for hwnd, label, _ in buttons:
                             allowed = ("Uninstall", "Close") if is_uninstaller else ("Next >", "Next", "Install", "Finish", "Close")
                             if label in allowed:
-                                user.PostMessageW(hwnd, 0xF5, 0, 0)
+                                c.set_last_error(0)
+                                posted = user.PostMessageW(hwnd, 0xF5, 0, 0)
+                                record("click", hwnd=hwnd, label=label, posted=bool(posted), error=c.get_last_error())
                                 break
+                    if state != previous_state:
+                        record("windows", state=state)
+                        previous_state = state
                 time.sleep(0.05)
             assert process.returncode == 0
             if choose_target is not None:

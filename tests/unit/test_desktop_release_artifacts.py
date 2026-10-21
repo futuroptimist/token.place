@@ -6829,6 +6829,32 @@ def test_windows_installer_identity_install_and_run_log_failure_contract(monkeyp
     assert 'exit=9' in (tmp_path / 'failed.log').read_text(encoding='utf-8')
 
 
+@pytest.mark.parametrize('executable', ['powershell.exe', r'C:\Windows\powershell.exe', '/usr/bin/pwsh'])
+def test_windows_installer_identity_powershell_encoding_contract(monkeypatch, tmp_path, executable) -> None:
+    guard = _load_windows_installer_identity()
+    calls = []
+    payload = json.dumps({'Target': 'C:\\fixture-\u96ea-\u03bb\\app.exe'}, ensure_ascii=False)
+
+    def capture(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, payload)
+
+    monkeypatch.setattr(guard.subprocess, 'run', capture)
+    command = [executable, '-NoProfile', '-Command', 'ConvertTo-Json $fixture']
+    original = list(command)
+    log = tmp_path / 'unicode.log'
+    result = guard._run(command, log_path=log)
+    assert command == original
+    assert calls[0][1]['encoding'] == 'utf-8'
+    assert '[Console]::OutputEncoding' in calls[0][0][-1]
+    assert calls[0][0][-1].endswith(original[-1])
+    assert json.loads(result.stdout) == json.loads(payload)
+    assert json.loads(log.read_text(encoding='utf-8').split('\n', 2)[2]) == json.loads(payload)
+    guard._run(['installer.exe', '/S'])
+    assert calls[1][0] == ['installer.exe', '/S']
+    assert calls[1][1]['encoding'] is None
+
+
 def test_windows_installer_identity_powershell_preserves_unicode_paths() -> None:
     powershell = shutil.which('powershell') or shutil.which('pwsh')
     if powershell is None:

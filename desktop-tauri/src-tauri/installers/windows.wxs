@@ -33,16 +33,16 @@
         <!-- TOKEN_PLACE_GUARD_BEGIN -->
         <!-- AppSearch and LaunchConditions run before InstallInitialize in both UI and silent execution. -->
         <Property Id="TOKEN_PLACE_NSIS_HKCU_32" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_32" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
+            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_32" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
         </Property>
         <Property Id="TOKEN_PLACE_NSIS_HKCU_64" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_64" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
+            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKCU_64" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
         </Property>
         <Property Id="TOKEN_PLACE_NSIS_HKLM_32" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_32" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
+            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_32" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="no" />
         </Property>
         <Property Id="TOKEN_PLACE_NSIS_HKLM_64" Secure="yes">
-            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_64" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
+            <RegistrySearch Id="SearchTOKEN_PLACE_NSIS_HKLM_64" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\\{{product_name}}" Name="UninstallString" Type="raw" Win64="yes" />
         </Property>
         <Condition Message="TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop is already installed using NSIS. Uninstall the existing version first, then run this MSI installer. Your existing app, settings and models have not been changed."><![CDATA[REMOVE~="ALL" OR (NOT TOKEN_PLACE_NSIS_HKCU_32 AND NOT TOKEN_PLACE_NSIS_HKCU_64 AND NOT TOKEN_PLACE_NSIS_HKLM_32 AND NOT TOKEN_PLACE_NSIS_HKLM_64)]]></Condition>
         <!-- TOKEN_PLACE_GUARD_END -->

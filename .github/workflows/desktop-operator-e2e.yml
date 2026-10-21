@@ -359,8 +359,8 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
-      - name: Upload current-package validation logs on failure
-        if: failure()
+      - name: Upload current-package validation and preservation evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: desktop-current-package-validation-windows

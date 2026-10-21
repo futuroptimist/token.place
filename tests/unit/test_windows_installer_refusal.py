@@ -104,7 +104,9 @@ def test_msi_refusal_covers_scopes_views_and_allows_uninstall():
         search = prop.find("RegistrySearch")
         found.add((search.attrib["Root"], search.attrib["Win64"]))
         assert search.attrib["Name"] == "UninstallString"
-        assert search.attrib["Key"].endswith(r"Uninstall\{{product_name}}")
+        # Handlebars consumes one backslash before a substitution. A single
+        # backslash escapes the expression and produces a literal product_name.
+        assert search.attrib["Key"].endswith(r"Uninstall\\{{product_name}}")
         assert f"NOT {prop.attrib['Id']}" in root.find("Condition").text
     assert found == {(hive, view) for hive in ("HKCU", "HKLM") for view in ("yes", "no")}
     condition = root.find("Condition")
@@ -176,6 +178,7 @@ def test_hosted_ci_checks_refusals_and_same_format_upgrades():
     assert text.count("'tests/unit/test_windows_installer_refusal.py'") == 2
     assert "python -m pytest -q -p no:cacheprovider tests/unit/test_windows_installer_refusal.py" in text
     assert "@('upgrade-nsis-to-nsis', 'upgrade-msi-to-msi', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in text
+    assert 'Upload current-package validation and preservation evidence\n        if: always()' in text
 
 
 

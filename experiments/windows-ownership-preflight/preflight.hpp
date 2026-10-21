@@ -84,11 +84,13 @@ inline Result inspect(Format requested, Reader& reader) noexcept {
         consume_safely([&] { return reader.machine(); });
         std::set<std::string> seen;
         for (const auto& profile : before.profiles) {
-            if (profile.identity.empty() || !seen.insert(profile.identity).second
-                || !known_kind(profile.kind)) {
+            if (profile.identity.empty() || !known_kind(profile.kind)) {
                 ++result.unknowns;
                 continue;
             }
+            if (!seen.insert(profile.identity).second) ++result.unknowns;
+            // Duplicate inventory entries remain uncertain, but must not hide
+            // readable ownership evidence (including alternate loaded/offline state).
             // No blanket exclusions for signed-out, roaming, temporary or service
             // profiles. An adapter must establish evidence or report incomplete.
             switch (profile.storage) {

@@ -104,6 +104,16 @@ void tests() {
     check(f, Format::msi, Decision::incomplete);
     f = Fixture{}; f.first.profiles.push_back(f.first.profiles.front()); f.last = f.first;
     check(f, Format::msi, Decision::incomplete);
+    f = Fixture{};
+    f.first.profiles.insert(f.first.profiles.begin(), {"bob", Storage::offline, Kind::unclassified});
+    f.last = f.first; f.disk.at("bob").owners = {Format::nsis};
+    require(check(f, Format::msi, Decision::conflict).unknowns > 0,
+            "malformed duplicate hid a later valid profile conflict");
+    f = Fixture{};
+    f.first.profiles.push_back({"alice", Storage::offline, Kind::local}); f.last = f.first;
+    f.disk["alice"] = {ReadState::complete, {Format::nsis}};
+    require(check(f, Format::msi, Decision::conflict).unknowns > 0,
+            "duplicate identity hid alternate storage conflict");
     f = Fixture{}; f.first.profiles[1].identity.clear(); f.last = f.first;
     check(f, Format::msi, Decision::incomplete);
     f = Fixture{}; f.first.profiles[1].storage = Storage::unavailable; f.last = f.first;

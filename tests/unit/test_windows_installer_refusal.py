@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import uuid
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -69,8 +70,8 @@ def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
         original, cursor = [], 0
         for hunk in re.split(r"(?m)^@@ ", section)[1:]:
             header, body = hunk.split("\n", 1)
-            match = re.match(r"-\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", header)
-            start = int(match.group(1)) - 1
+            match = re.match(r"-\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", header)
+            start = int(match.group(1)) - (0 if match.group(2) == "0" else 1)
             original.extend(lines[cursor:start])
             cursor = start
             for line in body.splitlines(keepends=True):
@@ -92,7 +93,7 @@ def test_nsis_checks_ownership_before_reinstall_and_copy():
     text = (TEMPLATES / "windows.nsi").read_text(encoding="utf-8")
     for section, end in (("Function .onInit", "FunctionEnd"), ("Function PageReinstall", "FunctionEnd"), ("Section Install", "SectionEnd")):
         body = text.split(section + "\n", 1)[1].split(end, 1)[0]
-        assert "Call TokenPlaceVerifyOwnership" in body
+        assert ("Call TokenPlaceVerifyOwnership" if section == "Section Install" else "Call TokenPlacePreviewOwnership") in body
         if "SetOutPath" in body:
             assert body.index("Call TokenPlaceVerifyOwnership") < body.index("SetOutPath")
     assert "$WixMode" not in text
@@ -120,6 +121,9 @@ def test_msi_verifies_final_target_before_major_upgrade():
     assert "GetFinalPathNameByHandleW" in source
     assert "HKEY_USERS" not in source
     assert "RegLoad" not in source
+    config = json.loads((ROOT / "desktop-tauri/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    expected = config["bundle"]["windows"]["wix"].get("upgradeCode") or str(uuid.uuid5(uuid.NAMESPACE_DNS, config["productName"] + ".exe.app.x64"))
+    assert "{" + expected.strip("{}").upper() + "}" in source
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-16-le"])

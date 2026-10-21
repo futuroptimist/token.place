@@ -5,13 +5,16 @@ its current-user scope and MSI keeps its per-machine scope. No profile scanning,
 hive loading, privilege acquisition or automatic cross-format migration occurs.
 
 Fresh installs refuse a visible competing owner or a nonempty unowned target.
+The initial NSIS GUI check defers only unowned-target emptiness so the directory
+page can select an empty folder; strict checks precede every installation section.
 Same-format upgrades require a verified existing registration and unchanged
 canonical target. Existing mixed installations may upgrade independently only
 when their targets are disjoint. Overlap, nesting, directory aliases, executable
 hard-link aliases, duplicate registrations and embedded reparse points fail
 closed. An inaccessible or stale matching registration is not treated as absent.
 
-Discovery is deliberately limited to HKCU and HKLM, in both registry views.
+Discovery is deliberately limited to HKCU and HKLM. HKLM uses both registry
+views; HKCU's shared Software tree is read once rather than counted twice.
 Consequently a machine MSI install cannot establish absence of another user's
 private NSIS registration. A fresh NSIS install can see a machine MSI and refuses
 it. This is a bounded ownership policy, not a global single-installation or

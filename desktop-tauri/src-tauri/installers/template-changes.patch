@@ -1,21 +1,13 @@
 --- a/windows.nsi
 +++ b/windows.nsi
-@@ -65,7 +65,10 @@
- Var PassiveMode
- Var UpdateMode
- Var NoShortcutMode
+@@ -68 +68,5 @@
 -Var WixMode
 +Var TokenPlaceOwnedTarget
 +Var TokenPlaceOldRemoved
 +Var TokenPlaceResult
 +Var TokenPlaceRetained
- Var OldMainBinaryName
- 
- Name "${PRODUCTNAME}"
-@@ -162,34 +165,8 @@
- Var ReinstallPageCheck
- Page custom PageReinstall PageLeaveReinstall
- Function PageReinstall
++Var TokenPlacePhase
+@@ -165,28 +169,2 @@
 -  ; Uninstall previous WiX installation if exists.
 -  ;
 -  ; A WiX installer stores the installation info in registry
@@ -45,41 +37,23 @@
 -  wix_loop_done:
 -
 +  ; Only the verified NSIS owner is eligible for this reinstall page.
-+  Call TokenPlaceVerifyOwnership
-   ; Check if there is an existing installation, if not, abort the reinstall page
-   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
-   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-@@ -197,13 +174,8 @@
- 
-   ; Compare this installar version with the existing installation
-   ; and modify the messages presented to the user accordingly
++  Call TokenPlacePreviewOwnership
+@@ -200 +177,0 @@
 -  compare_version:
-   StrCpy $R4 "$(older)"
+@@ -202,5 +179 @@
 -  ${If} $WixMode = 1
 -    ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
 -  ${Else}
 -    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
 -  ${EndIf}
 +  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
-   ${IfThen} $R0 == "" ${|} StrCpy $R4 "$(unknown)" ${|}
- 
-   nsis_tauri_utils::SemverCompare "${VERSION}" $R0
-@@ -286,11 +258,6 @@
- Function PageLeaveReinstall
-   ${NSD_GetState} $R2 $R1
- 
+@@ -289,5 +261,0 @@
 -  ; If migrating from Wix, always uninstall
 -  ${If} $WixMode = 1
 -    Goto reinst_uninstall
 -  ${EndIf}
 -
-   ; In update mode, always proceeds without uninstalling
-   ${If} $UpdateMode = 1
-     Goto reinst_done
-@@ -324,16 +291,15 @@
-     HideWindow
-     ClearErrors
- 
+@@ -327,10 +295,12 @@
 -    ${If} $WixMode = 1
 -      ReadRegStr $R1 HKLM "$R6" "UninstallString"
 -      ExecWait '$R1' $0
@@ -96,29 +70,29 @@
 +    StrCpy $R1 '"$INSTDIR\uninstall.exe" /UPDATE'
 +    ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|}
 +    StrCpy $R1 "$R1 _?=$INSTDIR"
++    ClearErrors
 +    ExecWait '$R1' $0
 +    ${If} $0 = 0
-+      StrCpy $TokenPlaceOldRemoved 1
-     ${EndIf}
- 
-     BringToFront
-@@ -342,12 +308,6 @@
- 
-     ${If} $0 <> 0
-     ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
++      ${IfNot} ${Errors}
++        StrCpy $TokenPlaceOldRemoved 1
++      ${EndIf}
+@@ -345,6 +314,0 @@
 -      ; User cancelled wix uninstaller? return to select un/reinstall page
 -      ${If} $WixMode = 1
 -      ${AndIf} $0 = 1602
 -        Abort
 -      ${EndIf}
 -
-       ; User cancelled NSIS uninstaller? return to select un/reinstall page
-       ${If} $0 = 1
-         Abort
-@@ -398,43 +358,7 @@
- 
- ; Uninstaller Pages
- ; 1. Confirm uninstall page
+@@ -364 +328 @@
+-!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
++!define MUI_PAGE_CUSTOMFUNCTION_PRE TokenPlaceDirectoryPage
+@@ -365,0 +330,5 @@
++Function TokenPlaceDirectoryPage
++  ; A verified upgrade keeps its existing target, including after uninstall.
++  ${IfThen} $TokenPlaceOwnedTarget != "" ${|} Abort ${|}
++  Call SkipIfPassive
++FunctionEnd
+@@ -401,37 +370 @@
 -Var DeleteAppDataCheckbox
 -Var DeleteAppDataCheckboxState
 -!define /ifndef WS_EX_LAYOUTRTL         0x00400000
@@ -157,15 +131,14 @@
 -  SendMessage $DeleteAppDataCheckbox ${BM_GETCHECK} 0 0 $DeleteAppDataCheckboxState
 -FunctionEnd
 +; User settings and models can be shared by another installation. Preserve them.
- !define MUI_PAGE_CUSTOMFUNCTION_PRE un.SkipIfPassive
- !insertmacro MUI_UNPAGE_CONFIRM
- 
-@@ -450,7 +374,69 @@
-   !include "{{this}}"
- {{/each}}
- 
+@@ -452,0 +386,65 @@
 +; TOKEN_PLACE_GUARD_BEGIN
 +!define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed."
++Function TokenPlacePreviewOwnership
++  StrCpy $TokenPlacePhase "preview"
++  Call TokenPlaceVerifyOwnership
++  StrCpy $TokenPlacePhase "verify"
++FunctionEnd
 +Function TokenPlaceVerifyOwnership
 +  Push $0
 +  Push $1
@@ -174,7 +147,7 @@
 +    StrCpy $TokenPlaceRetained $TokenPlaceOwnedTarget
 +  ${EndIf}
 +  ClearErrors
-+  ExecWait '"$PLUGINSDIR\ownership.exe" "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe" "$TokenPlaceRetained" "$PLUGINSDIR\ownership.ini"' $0
++  ExecWait '"$PLUGINSDIR\ownership.exe" "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe" "$TokenPlaceRetained" "$PLUGINSDIR\ownership.ini" "$TokenPlacePhase"' $0
 +  ${If} ${Errors}
 +    Call TokenPlaceAbortCrossFormat
 +  ${EndIf}
@@ -224,49 +197,22 @@
 +FunctionEnd
 +; TOKEN_PLACE_GUARD_END
 +
- Function .onInit
+@@ -453,0 +452,2 @@
 +  InitPluginsDir
 +  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
-   ${GetOptions} $CMDLINE "/P" $PassiveMode
-   ${IfNot} ${Errors}
-     StrCpy $PassiveMode 1
-@@ -497,6 +483,7 @@
-   !if "${INSTALLMODE}" == "both"
-     !insertmacro MULTIUSER_INIT
-   !endif
+@@ -499,0 +500 @@
++  Call TokenPlacePreviewOwnership
+@@ -503,0 +505 @@
 +  Call TokenPlaceVerifyOwnership
- FunctionEnd
- 
- 
-@@ -612,13 +599,14 @@
- SectionEnd
- 
- Section Install
+@@ -614,0 +617 @@
 +  Call TokenPlaceVerifyOwnership
-   SetOutPath $INSTDIR
- 
-   !ifmacrodef NSIS_HOOK_PREINSTALL
-     !insertmacro NSIS_HOOK_PREINSTALL
-   !endif
- 
+@@ -621 +624 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 +  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
- 
-   ; Copy main executable
-   File "${MAINBINARYSRCPATH}"
-@@ -755,7 +743,7 @@
-     !insertmacro NSIS_HOOK_PREUNINSTALL
-   !endif
- 
+@@ -758 +761 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 +  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
- 
-   ; Delete the app directory and its content from disk
-   ; Copy main executable
-@@ -838,26 +826,14 @@
-   ; If it doesn't exist, it does nothing.
-   ; We do this when not updating (to preserve the registry value on updates)
-   ${If} $UpdateMode <> 1
+@@ -841,20 +844,8 @@
 -    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
 -  ${EndIf}
 -
@@ -295,13 +241,7 @@
 +  ${EndIf}
 +
 +  ; Preserve per-user settings, models and shared MSI remembered metadata.
- 
-   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
-     !insertmacro NSIS_HOOK_POSTUNINSTALL
-@@ -911,12 +887,9 @@
-   ${EndIf}
- 
-   ; Skip creating shortcut if in update mode or no shortcut mode
+@@ -914,6 +905,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -311,13 +251,7 @@
 +  ${If} $UpdateMode = 1
 +  ${OrIf} $NoShortcutMode = 1
 +    Return
-   ${EndIf}
- 
-   !if "${STARTMENUFOLDER}" != ""
-@@ -940,12 +913,9 @@
-   ${EndIf}
- 
-   ; Skip creating shortcut if in update mode or no shortcut mode
+@@ -943,6 +931,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -327,15 +261,9 @@
 +  ${If} $UpdateMode = 1
 +  ${OrIf} $NoShortcutMode = 1
 +    Return
-   ${EndIf}
- 
-   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
 --- a/windows.wxs
 +++ b/windows.wxs
-@@ -28,6 +28,22 @@
-                  InstallScope="perMachine"
-                  SummaryCodepage="!(loc.TauriCodepage)"/>
- 
+@@ -30,0 +31,16 @@
 +        <!-- TOKEN_PLACE_GUARD_BEGIN -->
 +        <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
 +        <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
@@ -352,13 +280,7 @@
 +        </InstallExecuteSequence>
 +        <!-- TOKEN_PLACE_GUARD_END -->
 +
-         <!-- https://docs.microsoft.com/en-us/windows/win32/msi/reinstallmode -->
-         <!-- reinstall all files; rewrite all registry entries; reinstall all shortcuts -->
-         <Property Id="REINSTALLMODE" Value="amus" />
-@@ -70,17 +86,7 @@
-         <Property Id="ARPURLUPDATEINFO" Value="{{homepage}}"/>
-         {{/if}}
- 
+@@ -73,11 +89 @@
 -        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
 -             RegistrySearch elements are listed under a single Property, the LAST successful
 -             match wins. We list the NSIS default-key search first and the MSI InstallDir
@@ -371,6 +293,3 @@
 -          <RegistrySearch Id="PrevInstallDirWithName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="InstallDir" Type="raw" />
 -        </Property>
 +        <!-- INSTALLDIR is recovered only from the registered related MSI product. -->
- 
-         <!-- launch app checkbox -->
-         <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchApp)" />

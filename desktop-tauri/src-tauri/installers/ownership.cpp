@@ -17,6 +17,9 @@ namespace tp {
 using std::wstring;
 namespace fs = std::filesystem;
 constexpr auto message = L"TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed.";
+// Pinned Tauri 2.10.1: UUIDv5(DNS, product_name + ".exe.app.x64").
+// The metadata regression checks this against tauri.conf.json.
+constexpr auto upgrade_code = L"{61BCCD0F-B931-572E-902A-C30BB99AC600}";
 struct Failure : std::runtime_error { Failure() : runtime_error("ownership not verified") {} };
 void require(bool ok) { if (!ok) throw Failure(); }
 bool equal(const wstring& a, const wstring& b) {
@@ -79,6 +82,18 @@ void verify_owned_tree(const wstring& root) {
         require(attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT));
     }
 }
+void write_result(const wchar_t* path, const wstring& target) {
+    // Write the whole Unicode INI explicitly. WritePrivateProfileStringW creates
+    // ANSI files unless a UTF-16 BOM already exists, corrupting non-ACP paths.
+    require(target.find_first_of(L"\r\n") == wstring::npos);
+    wstring contents = L"\xfeff[ownership]\r\ntarget=" + target + L"\r\n";
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    require(file != INVALID_HANDLE_VALUE);
+    DWORD length = static_cast<DWORD>(contents.size() * sizeof(wchar_t)), written = 0;
+    bool ok = WriteFile(file, contents.data(), length, &written, nullptr) != 0;
+    CloseHandle(file);
+    require(ok && written == length);
+}
 struct Owner { bool msi; bool current_user; wstring root; wstring identity; wstring file_id = L""; };
 // Pure policy: "upgrade" is established by a verified owner, never /UPDATE or
 // Installed. A retained owner is used only within NSIS after its own uninstaller.
@@ -98,8 +113,8 @@ bool authorize(bool msi, const wstring& target, const std::vector<Owner>& owners
             require(!overlaps(target, owner.root));
         }
     }
-    if (own) { require(equal(target, own->root)); return true; }
-    if (!retained.empty()) { require(equal(target, retained)); return true; }
+    if (own) { require(target == own->root); return true; }
+    if (!retained.empty()) { require(target == retained); return true; }
     require(!competing && empty);
     return false;
 }
@@ -115,14 +130,14 @@ bool open(HKEY hive, const wstring& name, REGSAM view, Key& key) {
     require(result == ERROR_SUCCESS);
     return true;
 }
-wstring string(HKEY key, const wchar_t* name) {
+wstring string(HKEY key, const wchar_t* name, bool candidate = false) {
     DWORD type = 0, size = 0;
     auto result = RegQueryValueExW(key, name, nullptr, &type, nullptr, &size);
     if (result == ERROR_FILE_NOT_FOUND) return L"";
-    require(result == ERROR_SUCCESS && type == REG_SZ && size >= sizeof(wchar_t) && size < 65536);
+    require(result == ERROR_SUCCESS && (type == REG_SZ || (candidate && type == REG_EXPAND_SZ)) && size >= sizeof(wchar_t) && size < 65536);
     std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, 0);
     require(RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(buffer.data()), &size) == ERROR_SUCCESS);
-    require(type == REG_SZ && size >= sizeof(wchar_t) && size % sizeof(wchar_t) == 0);
+    require((type == REG_SZ || (candidate && type == REG_EXPAND_SZ)) && size >= sizeof(wchar_t) && size % sizeof(wchar_t) == 0);
     require(buffer[size / sizeof(wchar_t) - 1] == 0 && wcslen(buffer.data()) + 1 == size / sizeof(wchar_t));
     return buffer.data();
 }
@@ -132,9 +147,20 @@ wstring product_info(const wstring& product, const wchar_t* property) {
     require(size != 0);
     return buffer;
 }
+std::vector<wstring> related_products() {
+    std::vector<wstring> products;
+    for (DWORD index = 0;; ++index) {
+        wchar_t product[39];
+        auto result = MsiEnumRelatedProductsW(upgrade_code, 0, index, product);
+        if (result == ERROR_NO_MORE_ITEMS) return products;
+        require(result == ERROR_SUCCESS);
+        products.emplace_back(product);
+    }
+}
 std::vector<Owner> inventory(const wstring& name, const wstring& publisher,
                              const wstring& binary) {
     std::vector<Owner> owners;
+    auto related = related_products();
     SYSTEM_INFO system{};
     GetNativeSystemInfo(&system);
     std::vector<REGSAM> views{KEY_WOW64_32KEY};
@@ -153,9 +179,17 @@ std::vector<Owner> inventory(const wstring& name, const wstring& publisher,
                 if (result == ERROR_NO_MORE_ITEMS) break;
                 require(result == ERROR_SUCCESS);
                 Key key; require(open(uninstall.value, child, view, key));
-                auto display = string(key.value, L"DisplayName");
+                bool related_msi = std::any_of(related.begin(), related.end(), [&](const wstring& code) { return equal(code, child); });
+                wstring display;
+                try { display = string(key.value, L"DisplayName", true); }
+                catch (const Failure&) {
+                    // Malformed metadata of an unrelated application does not
+                    // establish token.place authority. Its exact NSIS key does.
+                    require(!equal(child, name) && !related_msi);
+                    continue;
+                }
                 // A stale named NSIS key is still authority evidence, not absence.
-                if (!equal(display, name) && !equal(child, name)) continue;
+                if (!equal(display, name) && !equal(child, name) && !related_msi) continue;
                 require(equal(display, name) && equal(string(key.value, L"Publisher"), publisher));
                 DWORD type = 0, flag = 0, size = sizeof(flag);
                 result = RegQueryValueExW(key.value, L"WindowsInstaller", nullptr, &type, reinterpret_cast<BYTE*>(&flag), &size);
@@ -191,6 +225,10 @@ std::vector<Owner> inventory(const wstring& name, const wstring& publisher,
             }
         }
     }
+    // A related installed product with missing/malformed ARP evidence is not an
+    // absent competitor. Never let a damaged display name bypass NSIS refusal.
+    for (const auto& product : related)
+        require(std::any_of(owners.begin(), owners.end(), [&](const Owner& owner) { return owner.msi && equal(owner.identity, product); }));
     return owners;
 }
 #endif
@@ -218,6 +256,7 @@ UINT refusal(MSIHANDLE session) {
 tp::Owner related(MSIHANDLE session) {
     wchar_t product[39]; tp::Owner own{true, false, L"", L""};
     auto upgrade = property(session, L"UpgradeCode");
+    tp::require(tp::equal(upgrade, tp::upgrade_code));
     for (DWORD index = 0;; ++index) {
         auto result = MsiEnumRelatedProductsW(upgrade.c_str(), 0, index, product);
         if (result == ERROR_NO_MORE_ITEMS) break;
@@ -253,14 +292,18 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE sessi
 #elif !defined(TOKEN_PLACE_POLICY_TEST)
 int wmain(int argc, wchar_t** argv) {
     try {
-        tp::require(argc == 7);
+        tp::require(argc == 8);
         auto owners = tp::inventory(argv[2], argv[3], argv[4]);
         auto target = tp::canonical(argv[1]);
+        // Preview permits a fresh GUI user to choose a different empty folder.
+        // Ownership conflicts still fail here; strict validation runs before
+        // old-owner removal and before any installation writes.
+        bool preview = tp::equal(argv[7], L"preview");
         bool upgrade = tp::authorize(false, target, owners,
-            tp::empty_target(argv[1]), argv[5]);
+            preview || tp::empty_target(argv[1]), argv[5]);
         if (upgrade && tp::fs::exists(argv[1])) tp::verify_owned_tree(argv[1]);
         // Only the installer's private temporary directory receives this result.
-        tp::require(WritePrivateProfileStringW(L"ownership", L"target", target.c_str(), argv[6]));
+        tp::write_result(argv[6], target);
         return upgrade ? 10 : 0;
     } catch (...) { return 1638; }
 }

@@ -46,6 +46,9 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(!tp::fs::exists(root));
         tp::fs::create_directories(root / L"exists");
         auto original = tp::canonical((root / L"exists").wstring());
+        auto different_case = (root / L"EXISTS").wstring();
+        tp::require(original == tp::canonical(different_case));
+        ++cases;
         tp::require(tp::equal(original, tp::canonical((root / L"exists" / L".").wstring())));
         ++cases;
         auto future = tp::canonical((root / L"exists" / L"new" / L"child").wstring());
@@ -56,6 +59,13 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(tp::empty_target((root / L"not-created").wstring()));
         ++cases;
         tp::require(!tp::empty_target(root.wstring()));
+        ++cases;
+        auto report = root / L"ownership.ini";
+        const tp::wstring unicode = original + L"\\\u96ea-\u03bb-\u0416";
+        tp::write_result(report.c_str(), unicode);
+        wchar_t result[32768];
+        tp::require(GetPrivateProfileStringW(L"ownership", L"target", L"", result, 32768, report.c_str()) == unicode.size());
+        tp::require(unicode == result);
         ++cases;
         tp::fs::remove_all(root);
         std::cout << cases << " ownership policy/path cases passed; registry discovery excluded\n";

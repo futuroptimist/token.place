@@ -71,6 +71,7 @@ Var TokenPlaceOwnedTarget
 Var TokenPlaceOldRemoved
 Var TokenPlaceResult
 Var TokenPlaceRetained
+Var TokenPlacePhase
 Var OldMainBinaryName
 
 Name "${PRODUCTNAME}"
@@ -168,7 +169,7 @@ Var ReinstallPageCheck
 Page custom PageReinstall PageLeaveReinstall
 Function PageReinstall
   ; Only the verified NSIS owner is eligible for this reinstall page.
-  Call TokenPlaceVerifyOwnership
+  Call TokenPlacePreviewOwnership
   ; Check if there is an existing installation, if not, abort the reinstall page
   ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
   ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
@@ -299,9 +300,12 @@ Function PageLeaveReinstall
     StrCpy $R1 '"$INSTDIR\uninstall.exe" /UPDATE'
     ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|}
     StrCpy $R1 "$R1 _?=$INSTDIR"
+    ClearErrors
     ExecWait '$R1' $0
     ${If} $0 = 0
-      StrCpy $TokenPlaceOldRemoved 1
+      ${IfNot} ${Errors}
+        StrCpy $TokenPlaceOldRemoved 1
+      ${EndIf}
     ${EndIf}
 
     BringToFront
@@ -323,8 +327,13 @@ Function PageLeaveReinstall
 FunctionEnd
 
 ; 5. Choose install directory page
-!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
+!define MUI_PAGE_CUSTOMFUNCTION_PRE TokenPlaceDirectoryPage
 !insertmacro MUI_PAGE_DIRECTORY
+Function TokenPlaceDirectoryPage
+  ; A verified upgrade keeps its existing target, including after uninstall.
+  ${IfThen} $TokenPlaceOwnedTarget != "" ${|} Abort ${|}
+  Call SkipIfPassive
+FunctionEnd
 
 ; 6. Start menu shortcut page
 Var AppStartMenuFolder
@@ -378,6 +387,11 @@ FunctionEnd
 
 ; TOKEN_PLACE_GUARD_BEGIN
 !define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed."
+Function TokenPlacePreviewOwnership
+  StrCpy $TokenPlacePhase "preview"
+  Call TokenPlaceVerifyOwnership
+  StrCpy $TokenPlacePhase "verify"
+FunctionEnd
 Function TokenPlaceVerifyOwnership
   Push $0
   Push $1
@@ -386,7 +400,7 @@ Function TokenPlaceVerifyOwnership
     StrCpy $TokenPlaceRetained $TokenPlaceOwnedTarget
   ${EndIf}
   ClearErrors
-  ExecWait '"$PLUGINSDIR\ownership.exe" "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe" "$TokenPlaceRetained" "$PLUGINSDIR\ownership.ini"' $0
+  ExecWait '"$PLUGINSDIR\ownership.exe" "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe" "$TokenPlaceRetained" "$PLUGINSDIR\ownership.ini" "$TokenPlacePhase"' $0
   ${If} ${Errors}
     Call TokenPlaceAbortCrossFormat
   ${EndIf}
@@ -485,11 +499,12 @@ Function .onInit
   !if "${INSTALLMODE}" == "both"
     !insertmacro MULTIUSER_INIT
   !endif
-  Call TokenPlaceVerifyOwnership
+  Call TokenPlacePreviewOwnership
 FunctionEnd
 
 
 Section EarlyChecks
+  Call TokenPlaceVerifyOwnership
   ; Abort silent installer if downgrades is disabled
   !if "${ALLOWDOWNGRADES}" == "false"
   ${If} ${Silent}

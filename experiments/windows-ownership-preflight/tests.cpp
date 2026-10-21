@@ -36,11 +36,14 @@ void require(bool condition, const char* message) {
 }
 Result check(Fixture fixture, Format requested, Decision expected) {
     const auto before = fixture.preserved;
+    const auto system = fixture.system;
     const auto online = fixture.online;
     const auto disk = fixture.disk;
     const auto result = inspect(requested, fixture);
     require(result.decision == expected, "unexpected ownership decision");
     require(fixture.preserved == before, "fixture app/settings/models changed");
+    require(fixture.system.state == system.state && fixture.system.owners == system.owners,
+            "machine ownership fixture changed");
     const auto unchanged = [](const auto& a, const auto& b) {
         if (a.size() != b.size()) return false;
         for (const auto& entry : a) {

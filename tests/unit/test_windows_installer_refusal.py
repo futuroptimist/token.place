@@ -24,6 +24,37 @@ def load_guard():
     return module
 
 
+def test_static_extraction_waits_for_real_nsis_uninstaller(monkeypatch, tmp_path):
+    from scripts import validate_windows_desktop_release_artifacts as validator
+    root = tmp_path / "extraction with spaces"
+    root.mkdir()
+    uninstaller = root / "uninstall.exe"
+    uninstaller.touch()
+    calls = []
+
+    def run(command, **kwargs):
+        assert root.is_dir()
+        assert command == subprocess.list2cmdline([str(uninstaller.resolve()), '/S']) + f' _?={root.resolve()}'
+        assert not kwargs.get('shell', False)
+        assert kwargs['check'] is True
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, '')
+
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    validator._cleanup_nsis_install(root)
+    assert len(calls) == 1
+    # Caller owns the temporary tree and removes it only after synchronous exit.
+    assert root.is_dir()
+
+    def fail(command, **kwargs):
+        raise subprocess.CalledProcessError(7, command, output='cleanup failed')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fail)
+    with pytest.raises(validator.ValidationError, match='failed to clean NSIS install'):
+        validator._cleanup_nsis_install(root)
+    assert root.is_dir()
+
+
 def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
     metadata = json.loads((TEMPLATES / "upstream.json").read_text(encoding="utf-8"))
     lock = json.loads((ROOT / "desktop-tauri/package-lock.json").read_text(encoding="utf-8"))

@@ -3483,7 +3483,7 @@ def test_windows_validator_native_materialization_contracts_and_cleanup(tmp_path
     (tmp_path / 'second-root').mkdir(exist_ok=True)
     (tmp_path / 'second-root' / 'uninstall.exe').write_bytes(b'uninstall')
     nsis_cleanup()
-    assert calls[-1][0] == [str((tmp_path / 'second-root' / 'uninstall.exe').resolve()), '/S']
+    assert calls[-1][0] == subprocess.list2cmdline([str((tmp_path / 'second-root' / 'uninstall.exe').resolve()), '/S']) + f' _?={(tmp_path / "second-root").resolve()}'
 
 
 def test_windows_validator_native_materialization_failures_are_fail_closed(tmp_path, monkeypatch):
@@ -7399,6 +7399,9 @@ def test_windows_installer_identity_overrides_static_nsis_destination(monkeypatc
     remembered = []
 
     def materialize(command, *args, **kwargs):
+        if isinstance(command, str):
+            assert command.endswith(f' _?={extracted.resolve()}')
+            return
         destinations = [arg[3:] for arg in command if arg.startswith('/D=')]
         if destinations:
             remembered[:] = destinations

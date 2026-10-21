@@ -72,10 +72,16 @@ inline Result inspect(Format requested, Reader& reader) noexcept {
             else if (owner != requested) ++result.conflicts;
         }
     };
+    const auto consume_safely = [&](const auto& read) {
+        try { consume(read()); }
+        catch (...) { ++result.unknowns; }
+    };
     try {
-        const auto before = reader.inventory();
+        Inventory before;
+        try { before = reader.inventory(); }
+        catch (...) { ++result.unknowns; }
         if (!before.complete || before.revision.empty()) ++result.unknowns;
-        consume(reader.machine());
+        consume_safely([&] { return reader.machine(); });
         std::set<std::string> seen;
         for (const auto& profile : before.profiles) {
             if (profile.identity.empty() || !seen.insert(profile.identity).second
@@ -86,8 +92,8 @@ inline Result inspect(Format requested, Reader& reader) noexcept {
             // No blanket exclusions for signed-out, roaming, temporary or service
             // profiles. An adapter must establish evidence or report incomplete.
             switch (profile.storage) {
-            case Storage::loaded: consume(reader.loaded(profile)); break;
-            case Storage::offline: consume(reader.offline(profile)); break;
+            case Storage::loaded: consume_safely([&] { return reader.loaded(profile); }); break;
+            case Storage::offline: consume_safely([&] { return reader.offline(profile); }); break;
             case Storage::unavailable: default: ++result.unknowns; break;
             }
         }

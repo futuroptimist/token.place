@@ -22,7 +22,11 @@ struct Fixture final : Reader {
     unsigned offline_reads = 0;
     unsigned loaded_reads = 0;
     bool throws = false;
-    Inventory inventory() override { return inventories++ == 0 ? first : last; }
+    bool inventory_throws = false;
+    Inventory inventory() override {
+        if (inventory_throws) throw std::runtime_error("synthetic inventory error");
+        return inventories++ == 0 ? first : last;
+    }
     Observation machine() override {
         if (throws) throw std::runtime_error("synthetic read error");
         return system;
@@ -108,6 +112,20 @@ void tests() {
     check(f, Format::msi, Decision::incomplete);
     f = Fixture{}; f.throws = true;
     check(f, Format::msi, Decision::incomplete);
+    f.disk.at("bob").owners = {Format::nsis};
+    require(check(f, Format::msi, Decision::conflict).unknowns > 0,
+            "machine exception hid a later profile conflict");
+    f = Fixture{}; f.online.clear(); f.disk.at("bob").owners = {Format::nsis};
+    require(check(f, Format::msi, Decision::conflict).unknowns > 0,
+            "loaded exception hid a later offline conflict");
+    f = Fixture{}; f.disk.clear();
+    f.first.profiles.push_back({"charlie", Storage::loaded, Kind::local}); f.last = f.first;
+    f.online["charlie"] = {ReadState::complete, {Format::nsis}};
+    require(check(f, Format::msi, Decision::conflict).unknowns > 0,
+            "offline exception hid a later loaded conflict");
+    f = Fixture{}; f.inventory_throws = true; f.system.owners = {Format::msi};
+    require(check(f, Format::nsis, Decision::conflict).unknowns > 0,
+            "inventory exception hid machine conflict");
     f = Fixture{}; f.disk.clear(); // Missing adapter record throws, never becomes absence.
     check(f, Format::msi, Decision::incomplete);
     f = Fixture{}; f.system.owners = {Format::unclassified};

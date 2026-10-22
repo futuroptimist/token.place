@@ -1,13 +1,16 @@
 --- a/windows.nsi
 +++ b/windows.nsi
-@@ -68 +68,5 @@
+@@ -0,0 +1,2 @@
++; Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
++; MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch.
+@@ -68 +70,5 @@
 -Var WixMode
 +Var TokenPlaceOwnedTarget
 +Var TokenPlaceOldRemoved
 +Var TokenPlaceResult
 +Var TokenPlaceRetained
 +Var TokenPlacePhase
-@@ -165,28 +169,2 @@
+@@ -165,28 +171,2 @@
 -  ; Uninstall previous WiX installation if exists.
 -  ;
 -  ; A WiX installer stores the installation info in registry
@@ -38,22 +41,22 @@
 -
 +  ; Only the verified NSIS owner is eligible for this reinstall page.
 +  Call TokenPlacePreviewOwnership
-@@ -200 +177,0 @@
+@@ -200 +179,0 @@
 -  compare_version:
-@@ -202,5 +179 @@
+@@ -202,5 +181 @@
 -  ${If} $WixMode = 1
 -    ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
 -  ${Else}
 -    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
 -  ${EndIf}
 +  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
-@@ -289,5 +261,0 @@
+@@ -289,5 +263,0 @@
 -  ; If migrating from Wix, always uninstall
 -  ${If} $WixMode = 1
 -    Goto reinst_uninstall
 -  ${EndIf}
 -
-@@ -327,10 +295,12 @@
+@@ -327,10 +297,12 @@
 -    ${If} $WixMode = 1
 -      ReadRegStr $R1 HKLM "$R6" "UninstallString"
 -      ExecWait '$R1' $0
@@ -76,23 +79,23 @@
 +      ${IfNot} ${Errors}
 +        StrCpy $TokenPlaceOldRemoved 1
 +      ${EndIf}
-@@ -345,6 +314,0 @@
+@@ -345,6 +316,0 @@
 -      ; User cancelled wix uninstaller? return to select un/reinstall page
 -      ${If} $WixMode = 1
 -      ${AndIf} $0 = 1602
 -        Abort
 -      ${EndIf}
 -
-@@ -364 +328 @@
+@@ -364 +330 @@
 -!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 +!define MUI_PAGE_CUSTOMFUNCTION_PRE TokenPlaceDirectoryPage
-@@ -365,0 +330,5 @@
+@@ -365,0 +332,5 @@
 +Function TokenPlaceDirectoryPage
 +  ; A verified upgrade keeps its existing target, including after uninstall.
 +  ${IfThen} $TokenPlaceOwnedTarget != "" ${|} Abort ${|}
 +  Call SkipIfPassive
 +FunctionEnd
-@@ -401,37 +370 @@
+@@ -401,37 +372 @@
 -Var DeleteAppDataCheckbox
 -Var DeleteAppDataCheckboxState
 -!define /ifndef WS_EX_LAYOUTRTL         0x00400000
@@ -131,7 +134,7 @@
 -  SendMessage $DeleteAppDataCheckbox ${BM_GETCHECK} 0 0 $DeleteAppDataCheckboxState
 -FunctionEnd
 +; User settings and models can be shared by another installation. Preserve them.
-@@ -452,0 +386,65 @@
+@@ -452,0 +388,65 @@
 +; TOKEN_PLACE_GUARD_BEGIN
 +!define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed."
 +Function TokenPlacePreviewOwnership
@@ -197,22 +200,22 @@
 +FunctionEnd
 +; TOKEN_PLACE_GUARD_END
 +
-@@ -453,0 +452,2 @@
+@@ -453,0 +454,2 @@
 +  InitPluginsDir
 +  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
-@@ -499,0 +500 @@
+@@ -499,0 +502 @@
 +  Call TokenPlacePreviewOwnership
-@@ -503,0 +505 @@
+@@ -503,0 +507 @@
 +  Call TokenPlaceVerifyOwnership
-@@ -614,0 +617 @@
+@@ -614,0 +619 @@
 +  Call TokenPlaceVerifyOwnership
-@@ -621 +624 @@
+@@ -621 +626 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 +  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-@@ -758 +761 @@
+@@ -758 +763 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 +  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-@@ -841,20 +844,8 @@
+@@ -841,20 +846,8 @@
 -    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
 -  ${EndIf}
 -
@@ -241,7 +244,7 @@
 +  ${EndIf}
 +
 +  ; Preserve per-user settings, models and shared MSI remembered metadata.
-@@ -914,6 +905,3 @@
+@@ -914,6 +907,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -251,7 +254,7 @@
 +  ${If} $UpdateMode = 1
 +  ${OrIf} $NoShortcutMode = 1
 +    Return
-@@ -943,6 +931,3 @@
+@@ -943,6 +933,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -263,7 +266,10 @@
 +    Return
 --- a/windows.wxs
 +++ b/windows.wxs
-@@ -30,0 +31,16 @@
+@@ -0,0 +1,2 @@
++<!-- Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
++     MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch. -->
+@@ -30,0 +33,16 @@
 +        <!-- TOKEN_PLACE_GUARD_BEGIN -->
 +        <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
 +        <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
@@ -280,7 +286,7 @@
 +        </InstallExecuteSequence>
 +        <!-- TOKEN_PLACE_GUARD_END -->
 +
-@@ -73,11 +89 @@
+@@ -73,11 +91 @@
 -        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
 -             RegistrySearch elements are listed under a single Property, the LAST successful
 -             match wins. We list the NSIS default-key search first and the MSI InstallDir

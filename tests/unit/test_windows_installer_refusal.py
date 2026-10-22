@@ -113,7 +113,7 @@ def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
     lock = json.loads((ROOT / "desktop-tauri/package-lock.json").read_text(encoding="utf-8"))
     assert lock["packages"]["node_modules/@tauri-apps/cli"]["version"] == metadata["tauriCliVersion"], "Rebase the custom installer templates when upgrading Tauri CLI"
     for name, digest in metadata["templates"].items():
-        text = "".join((TEMPLATES / name).read_text(encoding="utf-8").splitlines(keepends=True)[2:])
+        text = (TEMPLATES / name).read_text(encoding="utf-8")
         # Reverse the reviewed patch in memory and verify the pinned upstream
         # digest. Every local template change must have a corresponding hunk.
         patch = (TEMPLATES / "template-changes.patch").read_text(encoding="utf-8")
@@ -139,6 +139,24 @@ def test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks():
     assert config["version"] == "0.1.25"  # Explicitly approved unreleased release train.
     assert config["bundle"]["windows"]["nsis"]["template"] == "installers/windows.nsi"
     assert config["bundle"]["windows"]["wix"]["template"] == "installers/windows.wxs"
+
+
+@pytest.mark.parametrize("name", ["windows.nsi", "windows.wxs"])
+@pytest.mark.parametrize("header_line", [0, 1])
+def test_template_provenance_rejects_changed_headers(monkeypatch, name, header_line):
+    read_text = Path.read_text
+
+    def altered_header(path, *args, **kwargs):
+        text = read_text(path, *args, **kwargs)
+        if path == TEMPLATES / name:
+            lines = text.splitlines(keepends=True)
+            lines[header_line] = "unaudited header change\n"
+            return "".join(lines)
+        return text
+
+    monkeypatch.setattr(Path, "read_text", altered_header)
+    with pytest.raises(AssertionError):
+        test_custom_templates_preserve_pinned_upstream_outside_refusal_blocks()
 
 
 def test_nsis_checks_ownership_before_reinstall_and_copy():

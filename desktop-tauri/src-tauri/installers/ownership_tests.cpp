@@ -54,6 +54,13 @@ int wmain(int argc, wchar_t** argv) {
         auto root = tp::fs::absolute(argv[1]);
         tp::require(!tp::fs::exists(root));
         tp::fs::create_directories(root / L"exists");
+        for (auto unknown : {root / L"missing.exe", root / L"exists"}) {
+            bool rejected = false;
+            try { tp::process_image(unknown.wstring()); }
+            catch (const tp::Failure&) { rejected = true; }
+            tp::require(rejected);
+            ++cases;
+        }
         auto original = tp::canonical((root / L"exists").wstring());
         auto different_case = (root / L"EXISTS").wstring();
         tp::require(original == tp::canonical(different_case));
@@ -89,6 +96,8 @@ int wmain(int argc, wchar_t** argv) {
         ++cases;
         check(true, false, unicode, {{false, true, unicode, L"unicode-owner"}}, false);
         tp::write_result(report.c_str(), unicode);
+        tp::require(tp::process_image(report.wstring()) == tp::canonical(report.wstring()));
+        ++cases;
         wchar_t result[32768];
         tp::require(GetPrivateProfileStringW(L"ownership", L"target", L"", result, 32768, report.c_str()) == unicode.size());
         tp::require(unicode == result);

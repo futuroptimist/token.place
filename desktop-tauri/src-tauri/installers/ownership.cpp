@@ -72,6 +72,12 @@ bool overlaps(const wstring& a, const wstring& b) { return contains(a, b) || con
 void verify_process_identity(const wstring& target, const wstring& image, bool known, bool same_file) {
     require(known && !image.empty() && !contains(target, image) && !same_file);
 }
+wstring process_image(const wstring& image) {
+    // canonical() supports future installation paths; process images must exist.
+    std::error_code error;
+    require(fs::is_regular_file(image, error) && !error);
+    return canonical(image);
+}
 #ifndef TOKEN_PLACE_POLICY_TEST
 void verify_not_running(const wstring& root, const wstring& binary) {
     auto target = canonical(root);
@@ -88,8 +94,8 @@ void verify_not_running(const wstring& root, const wstring& binary) {
                 bool queried = QueryFullProcessImageNameW(process, 0, image, &size) != 0;
                 CloseHandle(process);
                 require(queried);
-                auto resolved = canonical(image);
                 std::error_code error;
+                auto resolved = process_image(image);
                 auto executable = fs::path(root) / binary;
                 bool exists = fs::exists(executable, error);
                 require(!error);

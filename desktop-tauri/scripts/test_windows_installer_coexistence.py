@@ -358,6 +358,8 @@ def main() -> None:
                     command = [h._msiexec(), "/x", entry.product_code, "/qn", "/norestart", "TOKEN_PLACE_BINARY=unrelated.exe", "/L*V", str(output / "running-uninstall-msi.msi.log")]
                 result = h._run(command, check=False, timeout=300, log_path=output / f"running-uninstall-{kind}.log")
                 assert result.returncode != 0 and process.poll() is None
+                diagnostic = (output / "running-uninstall-msi.msi.log").read_text(encoding="utf-16") if kind == "msi" else result.stdout
+                assert "TOKEN_PLACE_APP_RUNNING" in diagnostic
                 assert before == preserved()
                 results.append({"scenario": f"running-uninstall-{kind}", "exit": result.returncode, "process_survived": True, "preserved": True})
                 other = "msi" if kind == "nsis" else "nsis"

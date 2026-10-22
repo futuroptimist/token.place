@@ -9,6 +9,15 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(argc == 2);
         const tp::wstring a = L"\\\\?\\Volume{test}\\a", b = L"\\\\?\\Volume{test}\\b";
         int cases = 0;
+        for (auto image : {a + L"\\app.exe", a + L"\\child\\app.exe", b + L"\\app.exe", tp::wstring()}) {
+            for (bool known : {false, true}) for (bool same_file : {false, true}) {
+                bool allowed = true;
+                try { tp::verify_process_identity(a, image, known, same_file); }
+                catch (const tp::Failure&) { allowed = false; }
+                tp::require(allowed == (known && !same_file && image == b + L"\\app.exe"));
+                ++cases;
+            }
+        }
         auto check = [&](bool allowed, bool msi, const tp::wstring& target,
                          std::vector<tp::Owner> owners, bool empty,
                          const tp::wstring& retained = L"") {

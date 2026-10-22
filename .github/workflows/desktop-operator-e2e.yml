@@ -357,6 +357,7 @@ jobs:
             --nsis $nsis[0].FullName --msi $msi[0].FullName `
             --old-nsis $oldNsis[0].FullName --old-msi $oldMsi[0].FullName `
             --old-version $previousVersion --version $version --build-id $buildId `
+            --process-fixture "${{ runner.temp }}/ownership-tests/Release/process-fixture.exe" `
             --artifacts "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

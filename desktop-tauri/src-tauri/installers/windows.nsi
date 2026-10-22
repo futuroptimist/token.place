@@ -263,6 +263,7 @@ Function PageLeaveReinstall
 
   ; In update mode, always proceeds without uninstalling
   ${If} $UpdateMode = 1
+  ${OrIf} $PassiveMode = 1
     Goto reinst_done
   ${EndIf}
 
@@ -291,38 +292,10 @@ Function PageLeaveReinstall
   ${EndIf}
 
   reinst_uninstall:
-    HideWindow
-    ClearErrors
-
-    Call TokenPlaceVerifyOwnership
-    ; Never execute an arbitrary registry command or select the MSI owner.
-    ; /UPDATE preserves shared settings even with an older NSIS uninstaller.
-    StrCpy $R1 '"$INSTDIR\uninstall.exe" /UPDATE'
-    ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|}
-    StrCpy $R1 "$R1 _?=$INSTDIR"
-    ClearErrors
-    ExecWait '$R1' $0
-    ${If} $0 = 0
-      ${IfNot} ${Errors}
-        StrCpy $TokenPlaceOldRemoved 1
-      ${EndIf}
-    ${EndIf}
-
-    BringToFront
-
-    ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|} ; ExecWait failed, set fake exit code
-
-    ${If} $0 <> 0
-    ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
-      ; User cancelled NSIS uninstaller? return to select un/reinstall page
-      ${If} $0 = 1
-        Abort
-      ${EndIf}
-
-      ; Other erros? show generic error message and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
-      Abort
-    ${EndIf}
+    ; Older uninstallers can kill by basename. A preflight cannot prevent a
+    ; process starting afterwards, so never invoke that unsafe external route.
+    StrCpy $TokenPlaceResult "TOKEN_PLACE_UNSAFE_LEGACY_UNINSTALL: Automatic uninstall/reinstall cannot safely isolate running applications. Choose the in-place reinstall option instead. No process was stopped and the existing installation is unchanged."
+    Call TokenPlaceRefuse
   reinst_done:
 FunctionEnd
 
@@ -428,6 +401,9 @@ Function TokenPlaceAbortCrossFormat
   ${If} $TokenPlaceOldRemoved = 1
     StrCpy $TokenPlaceResult "TOKEN_PLACE_INTERRUPTED_UPGRADE: ownership changed after the old NSIS app was removed. Settings and models were retained. Stop and repair the installation before retrying."
   ${EndIf}
+  Call TokenPlaceRefuse
+FunctionEnd
+Function TokenPlaceRefuse
   System::Call 'kernel32::GetStdHandle(i -11)p.r0'
   ${If} $0 == 0
   ${OrIf} $0 == -1
@@ -448,6 +424,40 @@ Function TokenPlaceAbortCrossFormat
   SetErrorLevel 1638
   Quit
 FunctionEnd
+!define TOKEN_PLACE_RUNNING_MESSAGE "TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped."
+!macro TokenPlaceProcessGuard PREFIX
+Function ${PREFIX}TokenPlaceCheckProcesses
+  Push $0
+  ClearErrors
+  ExecWait '"$PLUGINSDIR\ownership.exe" --processes "$INSTDIR" "${MAINBINARYNAME}.exe"' $0
+  ${If} ${Errors}
+    StrCpy $0 1638
+  ${EndIf}
+  ${If} $0 != 0
+    DetailPrint "${TOKEN_PLACE_RUNNING_MESSAGE}"
+    System::Call 'kernel32::GetStdHandle(i -11)p.r0'
+    ${If} $0 == 0
+    ${OrIf} $0 == -1
+      System::Call 'kernel32::AttachConsole(i -1)'
+      System::Call 'kernel32::GetStdHandle(i -11)p.r0'
+    ${EndIf}
+    ${If} $0 != 0
+    ${AndIf} $0 != -1
+      FileWrite $0 "${TOKEN_PLACE_RUNNING_MESSAGE}$\r$\n"
+    ${EndIf}
+    IfSilent tp_process_refusal
+    ${If} $PassiveMode != 1
+      MessageBox MB_OK|MB_ICONSTOP "${TOKEN_PLACE_RUNNING_MESSAGE}"
+    ${EndIf}
+    tp_process_refusal:
+    SetErrorLevel 1638
+    Quit
+  ${EndIf}
+  Pop $0
+FunctionEnd
+!macroend
+!insertmacro TokenPlaceProcessGuard ""
+!insertmacro TokenPlaceProcessGuard "un."
 ; TOKEN_PLACE_GUARD_END
 
 Function .onInit
@@ -504,6 +514,7 @@ FunctionEnd
 
 
 Section EarlyChecks
+  Call TokenPlaceCheckProcesses
   Call TokenPlaceVerifyOwnership
   ; Abort silent installer if downgrades is disabled
   !if "${ALLOWDOWNGRADES}" == "false"
@@ -616,6 +627,7 @@ Section WebView2
 SectionEnd
 
 Section Install
+  Call TokenPlaceCheckProcesses
   Call TokenPlaceVerifyOwnership
   SetOutPath $INSTDIR
 
@@ -623,7 +635,7 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  Call TokenPlaceCheckProcesses
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -735,6 +747,8 @@ Function .onInstSuccess
 FunctionEnd
 
 Function un.onInit
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
   !insertmacro SetContext
 
   !if "${INSTALLMODE}" == "both"
@@ -755,12 +769,13 @@ Function un.onInit
 FunctionEnd
 
 Section Uninstall
+  Call un.TokenPlaceCheckProcesses
 
   !ifmacrodef NSIS_HOOK_PREUNINSTALL
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  Call un.TokenPlaceCheckProcesses
 
   ; Delete the app directory and its content from disk
   ; Copy main executable

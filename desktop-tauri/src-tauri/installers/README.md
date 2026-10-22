@@ -23,7 +23,7 @@ concurrent mixed-version compatibility guarantee.
 `ownership.cpp` compiles with the existing MSVC toolchain into an NSIS helper
 executable and an MSI custom-action DLL. The CRT is statically linked; no binary
 download or new runtime dependency is required. Cargo fails if compilation fails.
-The helper reads installation metadata and file identities only. NSIS stores its
+The helper reads installation metadata, file identities and matching process image paths. NSIS stores its
 canonical result in its private temporary directory. The MSI action recovers the
 related product's registered directory before costing and rejects a conflicting
 explicit target before maintenance costing can replace it with component history.
@@ -31,10 +31,11 @@ It then verifies the resolved
 target in the execute sequence before InstallInitialize/RemoveExistingProducts.
 Neither `Installed` nor `/UPDATE` grants upgrade authority.
 
-NSIS no longer selects or executes an MSI uninstaller. Before invoking an older
-NSIS uninstaller it validates the owner and passes `/UPDATE` to preserve data.
-It retains the verified canonical target across that uninstall, rechecks before
-copying, and reports an interrupted upgrade distinctly if the later check fails.
+NSIS never invokes an external legacy uninstaller: those binaries can terminate
+processes by basename, and a preflight cannot eliminate the launch-after-check
+race. Passive and update installs use the existing in-place route. An explicit
+GUI uninstall/reinstall selection refuses with guidance to select in-place
+reinstallation instead. Standalone candidate uninstall remains available.
 New NSIS uninstallers always preserve per-user settings and models because the
 namespace can be used by another installation. They no longer offer the delete
 app-data checkbox. Existing path-scoped shortcut removal remains in place.
@@ -47,7 +48,7 @@ readback. Synthetic policy tests compile without registry discovery code.
 
 The hosted interactive harness exercises dialog notification handlers, not physical
 mouse input. It waits for maintenance controls and checked-state readback before
-advancing, observes the verified owner's uninstaller, and sends each enabled
+advancing, rejects any external uninstaller launch, and sends each enabled
 button's documented `WM_COMMAND`/`BN_CLICKED` notification once. Bounded control
 text reads and flushed UI traces retain evidence when a page does not progress.
 
@@ -70,3 +71,24 @@ Native API references:
 - [MsiGetTargetPath](https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msigettargetpathw)
 - [GetFinalPathNameByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
 - [CostFinalize sequencing](https://learn.microsoft.com/en-us/windows/win32/msi/costfinalize-action)
+
+Running-app checks use Toolhelp discovery plus limited process-image queries.
+A matching main-executable basename with inaccessible/unknown identity refuses;
+a verified disjoint image may continue. Canonical target membership and hard-link
+identity refuse. Neither adapter requests process termination. NSIS embeds the
+helper in both installer and uninstaller and checks before hooks/mutation. MSI
+checks after costing and before InstallValidate, including uninstall, and authors
+MSIRESTARTMANAGERCONTROL=DisableShutdown. These snapshots are not a global
+process-launch lock. In particular, inheritance of the shutdown policy by a
+cached older MSI's RemoveExistingProducts session is **not yet established**;
+this remains a release/readiness gate, not evidence supplied by a green upgrade.
+
+Hosted survival fixtures temporarily substitute a pipe-controlled sleeper for
+only a disposable installed main executable, then restore the original after
+normal pipe-close exit. They compare installation/authority/settings/model bytes
+and verify both relevant and disjoint processes survive. They do not represent
+full application activity or prove absence of a launch-after-preflight race.
+
+- [QueryFullProcessImageName](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
+- [MSIRESTARTMANAGERCONTROL](https://learn.microsoft.com/en-us/windows/win32/msi/msirestartmanagercontrol)
+- [RemoveExistingProducts](https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action)

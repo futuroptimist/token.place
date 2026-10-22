@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
 #include <msi.h>
 #include <msiquery.h>
 #include <algorithm>
@@ -17,6 +18,7 @@ namespace tp {
 using std::wstring;
 namespace fs = std::filesystem;
 constexpr auto message = L"TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed.";
+constexpr auto running_message = L"TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped.";
 // Pinned Tauri 2.10.1: UUIDv5(DNS, product_name + ".exe.app.x64").
 // The metadata regression checks this against tauri.conf.json.
 constexpr auto upgrade_code = L"{61BCCD0F-B931-572E-902A-C30BB99AC600}";
@@ -65,6 +67,43 @@ bool contains(const wstring& parent, const wstring& child) {
         child[parent.size()] == L'\\' && equal(parent, child.substr(0, parent.size())));
 }
 bool overlaps(const wstring& a, const wstring& b) { return contains(a, b) || contains(b, a); }
+// A matching basename is only a discovery hint, never authority to stop a process.
+// Unknown identity is a refusal, including a process exiting during inspection.
+void verify_process_identity(const wstring& target, const wstring& image, bool known, bool same_file) {
+    require(known && !image.empty() && !contains(target, image) && !same_file);
+}
+#ifndef TOKEN_PLACE_POLICY_TEST
+void verify_not_running(const wstring& root, const wstring& binary) {
+    auto target = canonical(root);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    require(snapshot != INVALID_HANDLE_VALUE);
+    try {
+        PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+        BOOL found = Process32FirstW(snapshot, &entry);
+        while (found) {
+            if (equal(entry.szExeFile, binary)) {
+                HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+                require(process != nullptr);
+                wchar_t image[32768]; DWORD size = 32768;
+                bool queried = QueryFullProcessImageNameW(process, 0, image, &size) != 0;
+                CloseHandle(process);
+                require(queried);
+                auto resolved = canonical(image);
+                std::error_code error;
+                auto executable = fs::path(root) / binary;
+                bool exists = fs::exists(executable, error);
+                require(!error);
+                bool same = exists && fs::equivalent(executable, image, error);
+                require(!error);
+                verify_process_identity(target, resolved, true, same);
+            }
+            found = Process32NextW(snapshot, &entry);
+        }
+        require(GetLastError() == ERROR_NO_MORE_FILES);
+    } catch (...) { CloseHandle(snapshot); throw; }
+    CloseHandle(snapshot);
+}
+#endif
 void verify_requested_upgrade_target(const wstring& requested, const wstring& installed) {
     // MSI maintenance costing can silently replace an explicit INSTALLDIR with
     // component history. Reject a changed request before that evidence is lost.
@@ -252,9 +291,9 @@ std::wstring target_path(MSIHANDLE session) {
     tp::require(MsiGetTargetPathW(session, L"INSTALLDIR", buffer, &size) == ERROR_SUCCESS);
     return buffer;
 }
-UINT refusal(MSIHANDLE session) {
+UINT refusal(MSIHANDLE session, const wchar_t* message = tp::message) {
     MSIHANDLE record = MsiCreateRecord(1);
-    MsiRecordSetStringW(record, 0, tp::message);
+    MsiRecordSetStringW(record, 0, message);
     MsiProcessMessage(session, INSTALLMESSAGE_ERROR, record);
     MsiCloseHandle(record);
     return ERROR_INSTALL_FAILURE;
@@ -297,9 +336,24 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE sessi
         return ERROR_SUCCESS;
     } catch (...) { return refusal(session); }
 }
+extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceProcesses(MSIHANDLE session) {
+    try {
+        auto target = target_path(session);
+        // Maintenance/uninstall must inspect the registered target even if a
+        // caller supplies another INSTALLDIR. Fresh installs use the costed one.
+        auto own = related(session);
+        if (!own.root.empty()) target = own.root;
+        tp::verify_not_running(target, property(session, L"TOKEN_PLACE_BINARY"));
+        return ERROR_SUCCESS;
+    } catch (...) { return refusal(session, tp::running_message); }
+}
 #elif !defined(TOKEN_PLACE_POLICY_TEST)
 int wmain(int argc, wchar_t** argv) {
     try {
+        if (argc == 4 && tp::equal(argv[1], L"--processes")) {
+            tp::verify_not_running(argv[2], argv[3]);
+            return 0;
+        }
         tp::require(argc == 8);
         auto owners = tp::inventory(argv[2], argv[3], argv[4]);
         auto target = tp::canonical(argv[1]);

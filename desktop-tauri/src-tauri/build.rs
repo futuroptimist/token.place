@@ -32,6 +32,7 @@ fn build_windows_ownership_helper() {
             command.args([
                 "/EXPORT:TokenPlaceResolve=_TokenPlaceResolve@4",
                 "/EXPORT:TokenPlaceVerify=_TokenPlaceVerify@4",
+                "/EXPORT:TokenPlaceProcesses=_TokenPlaceProcesses@4",
             ]);
         }
         assert!(

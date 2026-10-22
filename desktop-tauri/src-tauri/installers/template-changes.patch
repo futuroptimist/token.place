@@ -56,7 +56,12 @@
 -    Goto reinst_uninstall
 -  ${EndIf}
 -
-@@ -327,10 +297,12 @@
+@@ -295,0 +266 @@
++  ${OrIf} $PassiveMode = 1
+@@ -324,36 +295,4 @@
+-    HideWindow
+-    ClearErrors
+-
 -    ${If} $WixMode = 1
 -      ReadRegStr $R1 HKLM "$R6" "UninstallString"
 -      ExecWait '$R1' $0
@@ -67,35 +72,43 @@
 -      ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
 -      StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
 -      ExecWait '$R1' $0
-+    Call TokenPlaceVerifyOwnership
-+    ; Never execute an arbitrary registry command or select the MSI owner.
-+    ; /UPDATE preserves shared settings even with an older NSIS uninstaller.
-+    StrCpy $R1 '"$INSTDIR\uninstall.exe" /UPDATE'
-+    ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|}
-+    StrCpy $R1 "$R1 _?=$INSTDIR"
-+    ClearErrors
-+    ExecWait '$R1' $0
-+    ${If} $0 = 0
-+      ${IfNot} ${Errors}
-+        StrCpy $TokenPlaceOldRemoved 1
-+      ${EndIf}
-@@ -345,6 +316,0 @@
+-    ${EndIf}
+-
+-    BringToFront
+-
+-    ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|} ; ExecWait failed, set fake exit code
+-
+-    ${If} $0 <> 0
+-    ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
 -      ; User cancelled wix uninstaller? return to select un/reinstall page
 -      ${If} $WixMode = 1
 -      ${AndIf} $0 = 1602
 -        Abort
 -      ${EndIf}
 -
-@@ -364 +330 @@
+-      ; User cancelled NSIS uninstaller? return to select un/reinstall page
+-      ${If} $0 = 1
+-        Abort
+-      ${EndIf}
+-
+-      ; Other erros? show generic error message and return to select un/reinstall page
+-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
+-      Abort
+-    ${EndIf}
++    ; Older uninstallers can kill by basename. A preflight cannot prevent a
++    ; process starting afterwards, so never invoke that unsafe external route.
++    StrCpy $TokenPlaceResult "TOKEN_PLACE_UNSAFE_LEGACY_UNINSTALL: Automatic uninstall/reinstall cannot safely isolate running applications. Choose the in-place reinstall option instead. No process was stopped and the existing installation is unchanged."
++    Call TokenPlaceRefuse
+@@ -364 +303 @@
 -!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
 +!define MUI_PAGE_CUSTOMFUNCTION_PRE TokenPlaceDirectoryPage
-@@ -365,0 +332,5 @@
+@@ -365,0 +305,5 @@
 +Function TokenPlaceDirectoryPage
 +  ; A verified upgrade keeps its existing target, including after uninstall.
 +  ${IfThen} $TokenPlaceOwnedTarget != "" ${|} Abort ${|}
 +  Call SkipIfPassive
 +FunctionEnd
-@@ -401,37 +372 @@
+@@ -401,37 +345 @@
 -Var DeleteAppDataCheckbox
 -Var DeleteAppDataCheckboxState
 -!define /ifndef WS_EX_LAYOUTRTL         0x00400000
@@ -134,7 +147,7 @@
 -  SendMessage $DeleteAppDataCheckbox ${BM_GETCHECK} 0 0 $DeleteAppDataCheckboxState
 -FunctionEnd
 +; User settings and models can be shared by another installation. Preserve them.
-@@ -452,0 +388,65 @@
+@@ -452,0 +361,102 @@
 +; TOKEN_PLACE_GUARD_BEGIN
 +!define TOKEN_PLACE_CROSS_FORMAT_MESSAGE "TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed."
 +Function TokenPlacePreviewOwnership
@@ -178,6 +191,9 @@
 +  ${If} $TokenPlaceOldRemoved = 1
 +    StrCpy $TokenPlaceResult "TOKEN_PLACE_INTERRUPTED_UPGRADE: ownership changed after the old NSIS app was removed. Settings and models were retained. Stop and repair the installation before retrying."
 +  ${EndIf}
++  Call TokenPlaceRefuse
++FunctionEnd
++Function TokenPlaceRefuse
 +  System::Call 'kernel32::GetStdHandle(i -11)p.r0'
 +  ${If} $0 == 0
 +  ${OrIf} $0 == -1
@@ -198,24 +214,65 @@
 +  SetErrorLevel 1638
 +  Quit
 +FunctionEnd
++!define TOKEN_PLACE_RUNNING_MESSAGE "TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped."
++!macro TokenPlaceProcessGuard PREFIX
++Function ${PREFIX}TokenPlaceCheckProcesses
++  Push $0
++  ClearErrors
++  ExecWait '"$PLUGINSDIR\ownership.exe" --processes "$INSTDIR" "${MAINBINARYNAME}.exe"' $0
++  ${If} ${Errors}
++    StrCpy $0 1638
++  ${EndIf}
++  ${If} $0 != 0
++    DetailPrint "${TOKEN_PLACE_RUNNING_MESSAGE}"
++    System::Call 'kernel32::GetStdHandle(i -11)p.r0'
++    ${If} $0 == 0
++    ${OrIf} $0 == -1
++      System::Call 'kernel32::AttachConsole(i -1)'
++      System::Call 'kernel32::GetStdHandle(i -11)p.r0'
++    ${EndIf}
++    ${If} $0 != 0
++    ${AndIf} $0 != -1
++      FileWrite $0 "${TOKEN_PLACE_RUNNING_MESSAGE}$\r$\n"
++    ${EndIf}
++    IfSilent tp_process_refusal
++    ${If} $PassiveMode != 1
++      MessageBox MB_OK|MB_ICONSTOP "${TOKEN_PLACE_RUNNING_MESSAGE}"
++    ${EndIf}
++    tp_process_refusal:
++    SetErrorLevel 1638
++    Quit
++  ${EndIf}
++  Pop $0
++FunctionEnd
++!macroend
++!insertmacro TokenPlaceProcessGuard ""
++!insertmacro TokenPlaceProcessGuard "un."
 +; TOKEN_PLACE_GUARD_END
 +
-@@ -453,0 +454,2 @@
+@@ -453,0 +464,2 @@
 +  InitPluginsDir
 +  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
-@@ -499,0 +502 @@
+@@ -499,0 +512 @@
 +  Call TokenPlacePreviewOwnership
-@@ -503,0 +507 @@
+@@ -503,0 +517,2 @@
++  Call TokenPlaceCheckProcesses
 +  Call TokenPlaceVerifyOwnership
-@@ -614,0 +619 @@
+@@ -614,0 +630,2 @@
++  Call TokenPlaceCheckProcesses
 +  Call TokenPlaceVerifyOwnership
-@@ -621 +626 @@
+@@ -621 +638 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-@@ -758 +763 @@
++  Call TokenPlaceCheckProcesses
+@@ -732,0 +750,2 @@
++  InitPluginsDir
++  File /oname=$PLUGINSDIR\ownership.exe "${MAINBINARYSRCPATH}.ownership.exe"
+@@ -752,0 +772 @@
++  Call un.TokenPlaceCheckProcesses
+@@ -758 +778 @@
 -  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-@@ -841,20 +846,8 @@
++  Call un.TokenPlaceCheckProcesses
+@@ -841,20 +861,8 @@
 -    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
 -  ${EndIf}
 -
@@ -244,7 +301,7 @@
 +  ${EndIf}
 +
 +  ; Preserve per-user settings, models and shared MSI remembered metadata.
-@@ -914,6 +907,3 @@
+@@ -914,6 +922,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -254,7 +311,7 @@
 +  ${If} $UpdateMode = 1
 +  ${OrIf} $NoShortcutMode = 1
 +    Return
-@@ -943,6 +933,3 @@
+@@ -943,6 +948,3 @@
 -  ; but always create if migrating from wix
 -  ${If} $WixMode = 0
 -    ${If} $UpdateMode = 1
@@ -269,24 +326,29 @@
 @@ -0,0 +1,2 @@
 +<!-- Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
 +     MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch. -->
-@@ -30,0 +33,16 @@
+@@ -30,0 +33,21 @@
 +        <!-- TOKEN_PLACE_GUARD_BEGIN -->
 +        <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
 +        <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
 +        <Property Id="INSTALLDIR" Secure="yes" />
++        <Property Id="MSIRESTARTMANAGERCONTROL" Value="DisableShutdown" />
++        <CustomAction Id="TokenPlaceProcesses" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceProcesses" Execute="immediate" Return="check" />
 +        <CustomAction Id="TokenPlaceResolve" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceResolve" Execute="immediate" Return="check" />
 +        <CustomAction Id="TokenPlaceVerify" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceVerify" Execute="immediate" Return="check" />
 +        <InstallUISequence>
++            <Custom Action="TokenPlaceProcesses" After="CostFinalize">1</Custom>
 +            <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
 +        </InstallUISequence>
 +        <InstallExecuteSequence>
 +            <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
++            <!-- Includes uninstall; precedes FilesInUse and any old-product removal. -->
++            <Custom Action="TokenPlaceProcesses" Before="InstallValidate">1</Custom>
 +            <!-- Final resolved target, before MajorUpgrade removes any product. -->
 +            <Custom Action="TokenPlaceVerify" Before="InstallInitialize">NOT REMOVE~="ALL"</Custom>
 +        </InstallExecuteSequence>
 +        <!-- TOKEN_PLACE_GUARD_END -->
 +
-@@ -73,11 +91 @@
+@@ -73,11 +96 @@
 -        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
 -             RegistrySearch elements are listed under a single Property, the LAST successful
 -             match wins. We list the NSIS default-key search first and the MSI InstallDir

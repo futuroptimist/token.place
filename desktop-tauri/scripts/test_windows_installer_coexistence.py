@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import shutil
+import queue
+import threading
 import hashlib
 import json
 import os
@@ -11,6 +15,40 @@ import time
 
 import test_windows_installer_identity as h
 from windows_installer_ui import nsis_ui_action
+
+
+@contextmanager
+def running_fixture(executable: Path, fixture: Path):
+    """Replace only a disposable installed binary; restore after normal exit."""
+    assert os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+    original = executable.with_suffix(".fixture-backup")
+    assert not original.exists()
+    executable.rename(original)
+    process = None
+    try:
+        shutil.copyfile(fixture, executable)
+        process = subprocess.Popen([str(executable)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        ready = queue.Queue()
+        threading.Thread(target=lambda: ready.put(process.stdout.readline()), daemon=True).start()
+        assert ready.get(timeout=30).strip() == "fixture-ready"
+        yield process
+        assert process.poll() is None, "installer terminated the disposable app process"
+    finally:
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.stdin.close()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        # Cleanup owns this exact disposable child handle only.
+                        process.terminate()
+                        process.wait(timeout=30)
+                        raise
+                assert process.returncode == 0, "fixture did not exit normally"
+        finally:
+            executable.unlink(missing_ok=True)
+            original.rename(executable)
 
 
 def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_target: Path | None = None) -> dict:
@@ -137,6 +175,10 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                                 checked = c.c_size_t()
                                 read = user.SendMessageTimeoutW(control["hwnd"], 0xF0, 0, 0, 0x22, 250, c.byref(checked))
                                 assert ok and read and checked.value == 0, "could not disable app auto-launch"
+                        if "TOKEN_PLACE_UNSAFE_LEGACY_UNINSTALL" in str(state):
+                            for control in controls:
+                                if control["class"] == "Button" and control["text"] == "OK":
+                                    user.PostMessageW(user.GetParent(control["hwnd"]), 0x111, control["id"], control["hwnd"])
                         action = nsis_ui_action(controls, uninstaller=is_uninstaller, fresh=choose_target is not None, directory_selected=selected_directory, owner_observed=observed_uninstaller, selected_uninstall=selected_uninstall, sent=sent)
                         if action:
                             token, button, radios = action
@@ -159,18 +201,19 @@ def drive_nsis(package: Path, target: Path, log: Path, *, passive: bool, choose_
                         record("windows", state=state)
                         previous_state = state
                 time.sleep(0.05)
-            assert process.returncode == 0
+            expected = 1638 if not passive and choose_target is None else 0
+            assert process.returncode == expected
             if choose_target is not None:
                 assert selected_directory and not observed_uninstaller
             else:
-                assert observed_uninstaller, "test did not exercise the old-owner uninstall transition"
+                assert not observed_uninstaller, "unsafe external uninstaller was launched"
             if not passive and choose_target is None:
                 assert selected_uninstall, "interactive reinstall choice was not exercised"
         finally:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=30)
-    return {"scenario": "nsis-fresh-gui-select-empty-target" if choose_target else ("nsis-passive-transition" if passive else "nsis-interactive-transition"), "exit": 0, "owned_uninstaller_observed": observed_uninstaller}
+    return {"scenario": "nsis-fresh-gui-select-empty-target" if choose_target else ("nsis-passive-transition" if passive else "nsis-interactive-transition"), "exit": process.returncode, "owned_uninstaller_observed": observed_uninstaller}
 
 
 def tree(root: Path) -> dict[str, str]:
@@ -195,7 +238,7 @@ def authority(root: Path, msi: bool) -> tuple:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    for name in ("nsis", "msi", "old-nsis", "old-msi", "version", "old-version", "build-id", "artifacts"):
+    for name in ("nsis", "msi", "old-nsis", "old-msi", "version", "old-version", "build-id", "artifacts", "process-fixture"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     if os.name != "nt" or os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
@@ -236,6 +279,22 @@ def main() -> None:
 
         def preserved() -> tuple:
             return tree(roots["nsis"] / "app"), tree(roots["msi"] / "app"), h._authority_signature(h.capture_authority_snapshot()), config.read_bytes(), model.read_bytes()
+
+        # The sleeper replaces only a disposable installed executable. These
+        # are process-identity/survival fixtures, not full application launches.
+        fixture = Path(args.process_fixture)
+        for kind in ("msi", "nsis"):
+            executable = next((roots[kind] / "app").glob("token-place*.exe"))
+            with running_fixture(executable, fixture) as process:
+                before = preserved()
+                result = h.install(packages[kind], output / f"running-upgrade-{kind}.log", install_root=roots[kind])
+                assert result.returncode != 0
+                if kind == "msi":
+                    assert "TOKEN_PLACE_APP_RUNNING" in (output / f"running-upgrade-{kind}.msi.log").read_text(encoding="utf-16")
+                else:
+                    assert "TOKEN_PLACE_APP_RUNNING" in result.stdout
+                assert process.poll() is None and before == preserved()
+                results.append({"scenario": f"running-upgrade-{kind}", "exit": result.returncode, "process_survived": True, "preserved": True})
 
         for kind, other in (("msi", "nsis"), ("nsis", "msi")):
             other_root = roots[other] / "app"
@@ -280,10 +339,33 @@ def main() -> None:
         for passive in (True, False):
             other_root = roots["msi"] / "app"
             before = tree(other_root), authority(other_root, True)
+            all_before = preserved()
             results.append(drive_nsis(packages["nsis"].path, roots["nsis"] / "app", output / f"nsis-transition-{passive}.log", passive=passive))
+            if not passive:
+                assert all_before == preserved()
             assert before == (tree(other_root), authority(other_root, True))
             assert saved_data == (config.read_bytes(), model.read_bytes())
             authority(roots["nsis"] / "app", False)
+
+        for kind in ("nsis", "msi"):
+            executable = next((roots[kind] / "app").glob("token-place*.exe"))
+            with running_fixture(executable, fixture) as process:
+                before = preserved()
+                if kind == "nsis":
+                    command = subprocess.list2cmdline([str(executable.parent / "uninstall.exe"), "/S"]) + f" _?={executable.parent}"
+                else:
+                    entry = next(item for item in h.inventory_registry_entries() if item.windows_installer)
+                    command = [h._msiexec(), "/x", entry.product_code, "/qn", "/norestart", "/L*V", str(output / "running-uninstall-msi.msi.log")]
+                result = h._run(command, check=False, timeout=300, log_path=output / f"running-uninstall-{kind}.log")
+                assert result.returncode != 0 and process.poll() is None
+                assert before == preserved()
+                results.append({"scenario": f"running-uninstall-{kind}", "exit": result.returncode, "process_survived": True, "preserved": True})
+                other = "msi" if kind == "nsis" else "nsis"
+                before_other = tree(executable.parent), authority(executable.parent, kind == "msi"), saved_data
+                result = h.install(packages[other], output / f"disjoint-running-{other}.log", install_root=roots[other])
+                assert result.returncode == 0 and process.poll() is None
+                assert before_other == (tree(executable.parent), authority(executable.parent, kind == "msi"), (config.read_bytes(), model.read_bytes()))
+                results.append({"scenario": f"disjoint-running-{other}", "process_survived": True, "preserved": True})
 
         # A stale/contradictory NSIS uninstall authority must not be executed.
         msi_entry = next(entry for entry in h.inventory_registry_entries() if entry.windows_installer)

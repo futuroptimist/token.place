@@ -168,7 +168,10 @@ def test_nsis_checks_ownership_before_reinstall_and_copy():
             assert body.index("Call TokenPlaceVerifyOwnership") < body.index("SetOutPath")
     assert "$WixMode" not in text
     assert "msiexec" not in text
-    assert '''StrCpy $R1 '"$INSTDIR\\uninstall.exe" /UPDATE' '''.strip() in text
+    assert "TOKEN_PLACE_UNSAFE_LEGACY_UNINSTALL" in text
+    reinstall = text.split("Function PageLeaveReinstall\n", 1)[1].split("FunctionEnd", 1)[0]
+    assert "ExecWait" not in reinstall
+    assert "CheckIfAppIsRunning" not in text
     assert "TOKEN_PLACE_INTERRUPTED_UPGRADE" in text
     assert "DeleteAppDataCheckbox" not in text
     assert 'RmDir /r "$APPDATA' not in text
@@ -334,3 +337,23 @@ def test_scenario_accepts_only_refusal_with_preserved_state(monkeypatch, tmp_pat
         message = "changed installed files" if outcome == "mutated" else "must refuse"
         with pytest.raises(guard.InstallerIdentityError, match=message):
             guard.run_scenario(scenario, "abcdef123456", artifacts)
+
+
+def test_process_refusal_precedes_mutation_and_never_uses_kill_macro():
+    nsis = (TEMPLATES / "windows.nsi").read_text(encoding="utf-8")
+    for section, prefix, mutation in (("Section Install", "", "SetOutPath"), ("Section Uninstall", "un.", "NSIS_HOOK_PREUNINSTALL")):
+        body = nsis.split(section + "\n", 1)[1].split("SectionEnd", 1)[0]
+        assert body.index(f"Call {prefix}TokenPlaceCheckProcesses") < body.index(mutation)
+    assert "CheckIfAppIsRunning" not in nsis
+    assert "KillProcess" not in nsis
+    uninit = nsis.split("Function un.onInit\n", 1)[1].split("FunctionEnd", 1)[0]
+    assert "InitPluginsDir" in uninit and "ownership.exe" in uninit
+    wix = (TEMPLATES / "windows.wxs").read_text(encoding="utf-8")
+    block = wix.split("<!-- TOKEN_PLACE_GUARD_BEGIN -->", 1)[1].split("<!-- TOKEN_PLACE_GUARD_END -->", 1)[0]
+    root = ET.fromstring("<Product>" + block + "</Product>")
+    assert root.find("Property[@Id='MSIRESTARTMANAGERCONTROL']").attrib["Value"] == "DisableShutdown"
+    check = root.find("InstallExecuteSequence/Custom[@Action='TokenPlaceProcesses']")
+    assert check.attrib["Before"] == "InstallValidate" and check.text == "1"
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
+    assert "PROCESS_TERMINATE" not in source and "TerminateProcess" not in source
+    assert "PROCESS_QUERY_LIMITED_INFORMATION" in source

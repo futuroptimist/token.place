@@ -34,13 +34,18 @@
         <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
         <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
         <Property Id="INSTALLDIR" Secure="yes" />
+        <Property Id="MSIRESTARTMANAGERCONTROL" Value="DisableShutdown" />
+        <CustomAction Id="TokenPlaceProcesses" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceProcesses" Execute="immediate" Return="check" />
         <CustomAction Id="TokenPlaceResolve" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceResolve" Execute="immediate" Return="check" />
         <CustomAction Id="TokenPlaceVerify" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceVerify" Execute="immediate" Return="check" />
         <InstallUISequence>
+            <Custom Action="TokenPlaceProcesses" After="CostFinalize">1</Custom>
             <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
         </InstallUISequence>
         <InstallExecuteSequence>
             <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
+            <!-- Includes uninstall; precedes FilesInUse and any old-product removal. -->
+            <Custom Action="TokenPlaceProcesses" Before="InstallValidate">1</Custom>
             <!-- Final resolved target, before MajorUpgrade removes any product. -->
             <Custom Action="TokenPlaceVerify" Before="InstallInitialize">NOT REMOVE~="ALL"</Custom>
         </InstallExecuteSequence>

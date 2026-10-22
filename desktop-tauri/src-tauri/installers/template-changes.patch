@@ -326,10 +326,9 @@
 @@ -0,0 +1,2 @@
 +<!-- Derived from Tauri CLI 2.10.1, commit 9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c.
 +     MIT license: LICENSE_MIT. Scoped ownership changes are documented in README.md and template-changes.patch. -->
-@@ -30,0 +33,21 @@
+@@ -30,0 +33,20 @@
 +        <!-- TOKEN_PLACE_GUARD_BEGIN -->
 +        <Binary Id="TokenPlaceOwnership" SourceFile="{{main_binary_path}}.ownership.dll" />
-+        <Property Id="TOKEN_PLACE_BINARY" Value="{{main_binary_name}}.exe" />
 +        <Property Id="INSTALLDIR" Secure="yes" />
 +        <Property Id="MSIRESTARTMANAGERCONTROL" Value="DisableShutdown" />
 +        <CustomAction Id="TokenPlaceProcesses" BinaryKey="TokenPlaceOwnership" DllEntry="TokenPlaceProcesses" Execute="immediate" Return="check" />
@@ -348,7 +347,7 @@
 +        </InstallExecuteSequence>
 +        <!-- TOKEN_PLACE_GUARD_END -->
 +
-@@ -73,11 +96 @@
+@@ -73,11 +95 @@
 -        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
 -             RegistrySearch elements are listed under a single Property, the LAST successful
 -             match wins. We list the NSIS default-key search first and the MSI InstallDir

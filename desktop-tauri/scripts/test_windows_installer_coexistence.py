@@ -355,7 +355,7 @@ def main() -> None:
                     command = subprocess.list2cmdline([str(executable.parent / "uninstall.exe"), "/S"]) + f" _?={executable.parent}"
                 else:
                     entry = next(item for item in h.inventory_registry_entries() if item.windows_installer)
-                    command = [h._msiexec(), "/x", entry.product_code, "/qn", "/norestart", "/L*V", str(output / "running-uninstall-msi.msi.log")]
+                    command = [h._msiexec(), "/x", entry.product_code, "/qn", "/norestart", "TOKEN_PLACE_BINARY=unrelated.exe", "/L*V", str(output / "running-uninstall-msi.msi.log")]
                 result = h._run(command, check=False, timeout=300, log_path=output / f"running-uninstall-{kind}.log")
                 assert result.returncode != 0 and process.poll() is None
                 assert before == preserved()

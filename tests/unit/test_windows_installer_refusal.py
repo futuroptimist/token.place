@@ -357,3 +357,10 @@ def test_process_refusal_precedes_mutation_and_never_uses_kill_macro():
     source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
     assert "PROCESS_TERMINATE" not in source and "TerminateProcess" not in source
     assert "PROCESS_QUERY_LIMITED_INFORMATION" in source
+
+
+def test_msi_process_identity_comes_from_packaged_file_table():
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
+    assert "SELECT `FileName` FROM `File` WHERE `File` = 'Path'" in source
+    assert 'property(session, L"TOKEN_PLACE_BINARY")' not in source
+    assert 'property(session, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown"' in source

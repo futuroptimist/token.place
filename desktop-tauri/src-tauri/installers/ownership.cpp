@@ -281,6 +281,27 @@ std::vector<Owner> inventory(const wstring& name, const wstring& publisher,
 
 #if defined(TOKEN_PLACE_MSI)
 namespace {
+struct MsiHandle {
+    MSIHANDLE value = 0;
+    ~MsiHandle() { if (value) MsiCloseHandle(value); }
+};
+std::wstring packaged_binary(MSIHANDLE session) {
+    // Bind to the main component's File table row, never a public property that
+    // msiexec callers can override (especially on the uninstall-only path).
+    MsiHandle database{MsiGetActiveDatabase(session)}, view, record;
+    tp::require(database.value != 0);
+    tp::require(MsiDatabaseOpenViewW(database.value,
+        L"SELECT `FileName` FROM `File` WHERE `File` = 'Path'", &view.value) == ERROR_SUCCESS);
+    tp::require(MsiViewExecute(view.value, 0) == ERROR_SUCCESS);
+    tp::require(MsiViewFetch(view.value, &record.value) == ERROR_SUCCESS);
+    wchar_t buffer[32768]; DWORD size = 32768;
+    tp::require(MsiRecordGetStringW(record.value, 1, buffer, &size) == ERROR_SUCCESS);
+    std::wstring name(buffer);
+    auto separator = name.find(L'|');
+    if (separator != std::wstring::npos) name = name.substr(separator + 1);
+    tp::require(!name.empty() && name.find_first_of(L"\\/:") == std::wstring::npos);
+    return name;
+}
 std::wstring property(MSIHANDLE session, const wchar_t* name) {
     wchar_t buffer[32768]; DWORD size = 32768;
     tp::require(MsiGetPropertyW(session, name, buffer, &size) == ERROR_SUCCESS);
@@ -326,7 +347,7 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceResolve(MSIHANDLE sess
 extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE session) {
     try {
         auto target = target_path(session);
-        auto owners = tp::inventory(property(session, L"ProductName"), property(session, L"Manufacturer"), property(session, L"TOKEN_PLACE_BINARY"));
+        auto owners = tp::inventory(property(session, L"ProductName"), property(session, L"Manufacturer"), packaged_binary(session));
         auto own = related(session);
         for (const auto& owner : owners) if (owner.msi)
             tp::require(!own.root.empty() && tp::equal(owner.root, tp::canonical(own.root)) && tp::equal(owner.identity, own.identity));
@@ -338,12 +359,13 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE sessi
 }
 extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceProcesses(MSIHANDLE session) {
     try {
+        tp::require(property(session, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown");
         auto target = target_path(session);
         // Maintenance/uninstall must inspect the registered target even if a
         // caller supplies another INSTALLDIR. Fresh installs use the costed one.
         auto own = related(session);
         if (!own.root.empty()) target = own.root;
-        tp::verify_not_running(target, property(session, L"TOKEN_PLACE_BINARY"));
+        tp::verify_not_running(target, packaged_binary(session));
         return ERROR_SUCCESS;
     } catch (...) { return refusal(session, tp::running_message); }
 }

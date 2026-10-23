@@ -112,6 +112,7 @@ class Scenario:
     name: str
     current: Installer
     previous: Installer | None = None
+    refusal_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -250,7 +251,7 @@ def build_scenarios(current_nsis: Path, current_msi: Path, previous_nsis: Path, 
         Scenario(f"clean-nsis-{expected_version}", current_n),
         Scenario(f"clean-msi-{expected_version}", current_m),
         Scenario("upgrade-nsis-to-nsis", current_n, previous_n),
-        Scenario("upgrade-msi-to-msi", current_m, previous_m),
+        Scenario("refuse-unsafe-msi-predecessor", current_m, previous_m, "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:"),
         Scenario("cross-nsis-to-msi", current_m, previous_n),
         Scenario("cross-msi-to-nsis", current_n, previous_m),
     ]
@@ -1546,7 +1547,8 @@ def msi_rejection_diagnostic(data: bytes) -> str:
         text = data.decode("utf-16-le", errors="replace")
     else:
         text = data.decode("utf-8", errors="replace")
-    lines = [line[:1024] for line in text.splitlines() if "TOKEN_PLACE_COMPETING_INSTALLER:" in line]
+    lines = [line[:1024] for line in text.splitlines() if any(marker in line for marker in
+        ("TOKEN_PLACE_COMPETING_INSTALLER:", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:"))]
     return "\n" + "\n".join(lines[-4:]) if lines else ""
 
 
@@ -1584,10 +1586,12 @@ def run_scenario(
     config_path: Path | None = None
     seeded = seeded_config_values()
     is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
+    refusal_marker = scenario.refusal_marker or ("TOKEN_PLACE_COMPETING_INSTALLER:" if is_cross_kind else None)
+    expects_refusal = refusal_marker is not None
     with tempfile.TemporaryDirectory(prefix=f"token-place-{scenario.name}-") as tmp:
         root = Path(tmp)
         model_path = root / "external-models" / "preserve.gguf"
-        if is_cross_kind:
+        if expects_refusal:
             model_path.parent.mkdir()
             model_path.write_bytes(b"GGUF preservation fixture; never loaded for inference\n")
             seeded["model_path"] = str(model_path)
@@ -1605,28 +1609,28 @@ def run_scenario(
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
                 verify_installed_authority(scenario.previous, install_root)
                 config_path = seed_config(seeded)
-            authority_before = capture_authority_snapshot() if is_cross_kind else None
-            preserved_before = capture_rejection_preservation(authority_before, config_path, model_path) if is_cross_kind else None
-            if is_cross_kind and artifact_dir:
+            authority_before = capture_authority_snapshot() if expects_refusal else None
+            preserved_before = capture_rejection_preservation(authority_before, config_path, model_path) if expects_refusal else None
+            if expects_refusal and artifact_dir:
                 artifact_dir.path(scenario.name, "preservation-before").with_suffix(".json").write_text(json.dumps(preserved_before, indent=2), encoding="utf-8")
             current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None, install_root=install_root)
             if current.returncode != 0:
-                if is_cross_kind and is_actionable_competing_installer_rejection(current):
+                if expects_refusal and refusal_marker in current.stdout and "uninstall the existing version first" in current.stdout.lower():
                     authority_after = capture_authority_snapshot()
                     verify_authority_unchanged(authority_before, authority_after)
                     preserved_after = capture_rejection_preservation(authority_after, config_path, model_path)
                     if artifact_dir:
                         artifact_dir.path(scenario.name, "preservation-after").with_suffix(".json").write_text(json.dumps(preserved_after, indent=2), encoding="utf-8")
                     if preserved_before != preserved_after:
-                        raise InstallerIdentityError("cross-format refusal changed installed files, settings or models")
+                        raise InstallerIdentityError("installer refusal changed installed files, settings or models")
                     verify_config_preserved(config_path, seeded)
                     _terminate_processes()
                     uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
                     verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
-            if is_cross_kind:
-                raise InstallerIdentityError("cross-format installer must refuse the existing competing installation")
+            if expects_refusal:
+                raise InstallerIdentityError("cross-format installer must refuse the existing competing installation" if is_cross_kind else "installer must refuse the unverified existing MSI predecessor")
             _terminate_processes()
             shortcut = verify_installed_authority(scenario.current, install_root, rejected_version=scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)
@@ -1691,7 +1695,7 @@ def main() -> int:
         default=None,
         help="Run the hosted-Windows PR gate against exactly one current-head NSIS package.",
     )
-    parser.add_argument("--scenario", choices=("upgrade-nsis-to-nsis", "upgrade-msi-to-msi", "cross-nsis-to-msi", "cross-msi-to-nsis"), help="Run one upgrade scenario independently, retaining its failure diagnostics.")
+    parser.add_argument("--scenario", choices=("upgrade-nsis-to-nsis", "refuse-unsafe-msi-predecessor", "cross-nsis-to-msi", "cross-msi-to-nsis"), help="Run one upgrade/refusal scenario independently, retaining its failure diagnostics.")
     parser.add_argument("--windows-nsis", type=Path)
     parser.add_argument("--windows-msi", type=Path)
     parser.add_argument("--previous-windows-nsis", type=Path)

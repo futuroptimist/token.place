@@ -202,13 +202,15 @@ def test_msi_verifies_final_target_before_major_upgrade():
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-16-le"])
-def test_msi_silent_diagnostic_only_exposes_bounded_refusal_message(encoding):
+@pytest.mark.parametrize("marker", ["TOKEN_PLACE_COMPETING_INSTALLER", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR"])
+def test_msi_silent_diagnostic_only_exposes_bounded_refusal_message(encoding, marker):
     guard = load_guard()
-    data = ("private irrelevant diagnostic\n" + MESSAGE + "\n").encode(encoding)
+    message = MESSAGE.replace("TOKEN_PLACE_COMPETING_INSTALLER", marker)
+    data = ("private irrelevant diagnostic\n" + message + "\n").encode(encoding)
     diagnostic = guard.msi_rejection_diagnostic(data)
-    assert MESSAGE in diagnostic
+    assert message in diagnostic
     assert "private" not in diagnostic
-    assert guard.is_actionable_competing_installer_rejection(subprocess.CompletedProcess([], 1603, diagnostic))
+    assert guard.is_actionable_competing_installer_rejection(subprocess.CompletedProcess([], 1603, diagnostic)) == (marker == "TOKEN_PLACE_COMPETING_INSTALLER")
     assert not guard.is_actionable_competing_installer_rejection(subprocess.CompletedProcess([], 0, diagnostic))
     assert not guard.is_actionable_competing_installer_rejection(subprocess.CompletedProcess([], 1603, "remove token.place existing installation"))
 
@@ -300,13 +302,14 @@ def test_hosted_ci_checks_refusals_and_same_format_upgrades():
     assert text.count("'desktop-tauri/src-tauri/installers/**'") == 2
     assert text.count("'tests/unit/test_windows_installer_refusal.py'") == 2
     assert "python -m pytest -q -p no:cacheprovider tests/unit/test_windows_installer_refusal.py" in text
-    assert "@('upgrade-nsis-to-nsis', 'upgrade-msi-to-msi', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in text
+    assert "@('upgrade-nsis-to-nsis', 'refuse-unsafe-msi-predecessor', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in text
     assert 'Upload current-package validation and preservation evidence\n        if: always()' in text
 
 
 
-@pytest.mark.parametrize("outcome", ["preserved", "mutated", "success"])
-def test_scenario_accepts_only_refusal_with_preserved_state(monkeypatch, tmp_path, outcome):
+@pytest.mark.parametrize("outcome", ["preserved", "mutated", "success", "wrong-diagnostic"])
+@pytest.mark.parametrize("unsafe_msi", [False, True])
+def test_scenario_accepts_only_refusal_with_preserved_state(monkeypatch, tmp_path, outcome, unsafe_msi):
     guard = load_guard()
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setattr(guard, "durable_install_parent", lambda: tmp_path.resolve())
@@ -322,11 +325,12 @@ def test_scenario_accepts_only_refusal_with_preserved_state(monkeypatch, tmp_pat
     monkeypatch.setattr(guard, "verify_installed_authority", lambda *args, **kwargs: shortcut)
     snapshots = iter([{"owned": "original"}, {"owned": "changed" if outcome == "mutated" else "original"}])
     monkeypatch.setattr(guard, "capture_rejection_preservation", lambda *args: next(snapshots))
+    diagnostic = MESSAGE.replace("TOKEN_PLACE_COMPETING_INSTALLER", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR") if unsafe_msi else MESSAGE
     def install(installer, *args, **kwargs):
-        code = 1603 if installer.kind == "msi" and outcome != "success" else 0
-        return subprocess.CompletedProcess([], code, MESSAGE)
+        code = 1603 if installer.path.name == "new.msi" and outcome != "success" else 0
+        return subprocess.CompletedProcess([], code, "unrelated failure" if outcome == "wrong-diagnostic" else diagnostic)
     monkeypatch.setattr(guard, "install", install)
-    scenario = guard.Scenario("cross-nsis-to-msi", guard.Installer(tmp_path / "new.msi", "msi", "0.1.25"), guard.Installer(tmp_path / "old.exe", "nsis", "0.1.24"))
+    scenario = guard.Scenario("refusal", guard.Installer(tmp_path / "new.msi", "msi", "0.1.25"), guard.Installer(tmp_path / "old.exe", "msi" if unsafe_msi else "nsis", "0.1.24"), "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:" if unsafe_msi else None)
     artifacts = guard.ScenarioArtifactDir(tmp_path / "logs")
     if outcome == "preserved":
         guard.run_scenario(scenario, "abcdef123456", artifacts)
@@ -334,7 +338,7 @@ def test_scenario_accepts_only_refusal_with_preserved_state(monkeypatch, tmp_pat
         after = json.loads(artifacts.path(scenario.name, "preservation-after").with_suffix(".json").read_text(encoding="utf-8"))
         assert before == after == {"owned": "original"}
     else:
-        message = "changed installed files" if outcome == "mutated" else "must refuse"
+        message = {"mutated": "changed installed files", "success": "must refuse", "wrong-diagnostic": "current installer failed"}[outcome]
         with pytest.raises(guard.InstallerIdentityError, match=message):
             guard.run_scenario(scenario, "abcdef123456", artifacts)
 
@@ -364,3 +368,21 @@ def test_msi_process_identity_comes_from_packaged_file_table():
     assert "SELECT `FileName` FROM `File` WHERE `File` = 'Path'" in source
     assert 'property(session, L"TOKEN_PLACE_BINARY")' not in source
     assert 'property(session, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown"' in source
+
+
+def test_msi_predecessor_policy_uses_registered_exact_identity_before_removal():
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
+    assert "MsiOpenDatabaseW(" not in source and "MsiOpenProductW(" not in source
+    assert "MsiGetProductInfoExW" in source and "MSIINSTALLCONTEXT_MACHINE" in source
+    for field in ("PACKAGECODE", "PRODUCTSTATE", "TRANSFORMS"):
+        assert f"INSTALLPROPERTY_{field}" in source
+    assert "MsiEnumPatchesExW" in source and "MSIPATCHSTATE_ALL" in source
+    assert "const std::vector<tp::PackageIdentity> audited_predecessors{};" in source
+    assert 'database_property(database.value, L"ProductCode")' in source
+    assert "MsiGetSummaryInformationW" in source
+    verify = source.split("UINT __stdcall TokenPlaceVerify", 1)[1].split("UINT __stdcall TokenPlaceProcesses", 1)[0]
+    assert verify.index("tp::authorize") < verify.index("verify_predecessor_protection") < verify.index("return ERROR_SUCCESS")
+    assert "tp::predecessor_message" in verify
+    harness = (ROOT / "desktop-tauri/scripts/test_windows_installer_coexistence.py").read_text(encoding="utf-8")
+    assert 'seeds = {"msi": packages["msi"], "nsis": previous["nsis"]}' in harness
+    assert '"mixed-maintenance-msi"' in harness

@@ -343,7 +343,7 @@ jobs:
           $failed = @()
           # Each invocation checks initial cleanup convergence before installing.
           # Preserve both directions' evidence even when the first fails closed.
-          foreach ($scenario in @('upgrade-nsis-to-nsis', 'upgrade-msi-to-msi', 'cross-nsis-to-msi', 'cross-msi-to-nsis')) {
+          foreach ($scenario in @('upgrade-nsis-to-nsis', 'refuse-unsafe-msi-predecessor', 'cross-nsis-to-msi', 'cross-msi-to-nsis')) {
             python desktop-tauri/scripts/test_windows_installer_identity.py `
               --windows-nsis $nsis[0].FullName --windows-msi $msi[0].FullName `
               --previous-windows-nsis $oldNsis[0].FullName --previous-windows-msi $oldMsi[0].FullName `

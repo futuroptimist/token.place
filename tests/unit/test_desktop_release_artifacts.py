@@ -4290,7 +4290,7 @@ def test_windows_installer_identity_requires_previous_artifacts(tmp_path) -> Non
         'clean-nsis-0.1.5',
         'clean-msi-0.1.5',
         'upgrade-nsis-to-nsis',
-        'upgrade-msi-to-msi',
+        'refuse-unsafe-msi-predecessor',
         'cross-nsis-to-msi',
         'cross-msi-to-nsis',
     ]
@@ -7625,7 +7625,7 @@ def test_windows_installer_identity_hosted_ci_covers_both_cross_installer_direct
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
     assert workflow.count("'tests/unit/test_desktop_release_artifacts.py'") == 2
     assert '--bundles nsis,msi' in workflow
-    assert "@('upgrade-nsis-to-nsis', 'upgrade-msi-to-msi', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in workflow
+    assert "@('upgrade-nsis-to-nsis', 'refuse-unsafe-msi-predecessor', 'cross-nsis-to-msi', 'cross-msi-to-nsis')" in workflow
     assert '--scenario $scenario' in workflow
     assert 'if ($failed.Count) { throw' in workflow
 

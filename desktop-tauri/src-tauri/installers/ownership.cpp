@@ -8,6 +8,7 @@
 #include <tlhelp32.h>
 #include <msi.h>
 #include <msiquery.h>
+#include <wtypes.h>
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
@@ -19,6 +20,7 @@ using std::wstring;
 namespace fs = std::filesystem;
 constexpr auto message = L"TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed.";
 constexpr auto running_message = L"TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped.";
+constexpr auto predecessor_message = L"TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR: Automatic upgrade of this token.place MSI is not supported because its shutdown protection could not be verified. Close token.place and uninstall the existing version first, then run this installer again. This attempt has not changed your existing app, settings or models and has not stopped any process.";
 // Pinned Tauri 2.10.1: UUIDv5(DNS, product_name + ".exe.app.x64").
 // The metadata regression checks this against tauri.conf.json.
 constexpr auto upgrade_code = L"{61BCCD0F-B931-572E-902A-C30BB99AC600}";
@@ -67,6 +69,17 @@ bool contains(const wstring& parent, const wstring& child) {
         child[parent.size()] == L'\\' && equal(parent, child.substr(0, parent.size())));
 }
 bool overlaps(const wstring& a, const wstring& b) { return contains(a, b) || contains(b, a); }
+struct PackageIdentity { wstring product; wstring package; };
+bool same_package(const PackageIdentity& a, const PackageIdentity& b) {
+    return !a.product.empty() && !a.package.empty() && equal(a.product, b.product) && equal(a.package, b.package);
+}
+void verify_predecessor(const PackageIdentity& installed, const PackageIdentity& current,
+                        const std::vector<PackageIdentity>& audited, bool installed_machine,
+                        bool unmodified_registration) {
+    require(installed_machine && unmodified_registration);
+    require(same_package(installed, current) || std::any_of(audited.begin(), audited.end(),
+        [&](const PackageIdentity& candidate) { return same_package(installed, candidate); }));
+}
 // A matching basename is only a discovery hint, never authority to stop a process.
 // Unknown identity is a refusal, including a process exiting during inspection.
 void verify_process_identity(const wstring& target, const wstring& image, bool known, bool same_file) {
@@ -291,6 +304,47 @@ struct MsiHandle {
     MSIHANDLE value = 0;
     ~MsiHandle() { if (value) MsiCloseHandle(value); }
 };
+std::wstring database_property(MSIHANDLE database, const wchar_t* name) {
+    MsiHandle view, record, parameter{MsiCreateRecord(1)};
+    tp::require(parameter.value != 0);
+    tp::require(MsiRecordSetStringW(parameter.value, 1, name) == ERROR_SUCCESS);
+    tp::require(MsiDatabaseOpenViewW(database,
+        L"SELECT `Value` FROM `Property` WHERE `Property` = ?", &view.value) == ERROR_SUCCESS);
+    tp::require(MsiViewExecute(view.value, parameter.value) == ERROR_SUCCESS);
+    tp::require(MsiViewFetch(view.value, &record.value) == ERROR_SUCCESS);
+    wchar_t buffer[32768]; DWORD size = 32768;
+    tp::require(MsiRecordGetStringW(record.value, 1, buffer, &size) == ERROR_SUCCESS && size != 0);
+    return buffer;
+}
+std::wstring registered_property(const std::wstring& product, const wchar_t* name) {
+    wchar_t buffer[32768]; DWORD size = 32768;
+    tp::require(MsiGetProductInfoExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
+        name, buffer, &size) == ERROR_SUCCESS);
+    return buffer;
+}
+void verify_predecessor_protection(MSIHANDLE session, const std::wstring& product) {
+    // Never open the cached MSI: MsiOpenDatabase is prohibited in custom actions.
+    // Match registered identities to audited packages, not a version or marker.
+    MsiHandle database{MsiGetActiveDatabase(session)}, summary;
+    tp::require(database.value != 0);
+    tp::require(database_property(database.value, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown");
+    tp::require(MsiGetSummaryInformationW(database.value, nullptr, 0, &summary.value) == ERROR_SUCCESS);
+    wchar_t package[39]; DWORD size = 39; UINT type = 0;
+    tp::require(MsiSummaryInfoGetPropertyW(summary.value, 9 /* PID_REVNUMBER */, &type,
+        nullptr, nullptr, package, &size) == ERROR_SUCCESS && type == VT_LPSTR && size == 38);
+    tp::PackageIdentity current{database_property(database.value, L"ProductCode"), package};
+    tp::PackageIdentity installed{product, registered_property(product, INSTALLPROPERTY_PACKAGECODE)};
+    bool machine = registered_property(product, INSTALLPROPERTY_PRODUCTSTATE) == L"5";
+    bool clean = registered_property(product, INSTALLPROPERTY_TRANSFORMS).empty();
+    wchar_t patch[39], target[39]; MSIINSTALLCONTEXT context{}; DWORD sid_size = 0;
+    clean = clean && MsiEnumPatchesExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
+        MSIPATCHSTATE_ALL, 0, patch, target, &context, nullptr, &sid_size) == ERROR_NO_MORE_ITEMS;
+    // No published predecessor has audited refusal-only shutdown protection.
+    // Future entries require artifact identity/configuration evidence and tests;
+    // never trust a version range, a public property, or a generic fixture ID.
+    const std::vector<tp::PackageIdentity> audited_predecessors{};
+    tp::verify_predecessor(installed, current, audited_predecessors, machine, clean);
+}
 std::wstring packaged_binary(MSIHANDLE session) {
     // Bind to the main component's File table row, never a public property that
     // msiexec callers can override (especially on the uninstall-only path).
@@ -360,6 +414,10 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE sessi
         bool upgrade = tp::authorize(true, tp::canonical(target), owners, tp::empty_target(target));
         tp::require(upgrade == !own.root.empty());
         if (upgrade) tp::verify_owned_tree(target);
+        if (upgrade) {
+            try { verify_predecessor_protection(session, own.identity); }
+            catch (...) { return refusal(session, tp::predecessor_message); }
+        }
         return ERROR_SUCCESS;
     } catch (...) { return refusal(session); }
 }

@@ -9,6 +9,27 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(argc == 2);
         const tp::wstring a = L"\\\\?\\Volume{test}\\a", b = L"\\\\?\\Volume{test}\\b";
         int cases = 0;
+        const tp::PackageIdentity current{L"current-product", L"current-package"};
+        const tp::PackageIdentity audited{L"protected-product", L"protected-package"};
+        for (const auto& installed : {current, audited,
+                tp::PackageIdentity{L"legacy-product", L"legacy-package"},
+                tp::PackageIdentity{current.product, L"changed-package"},
+                tp::PackageIdentity{L"changed-product", current.package},
+                tp::PackageIdentity{L"", L""}}) {
+            for (bool machine : {false, true}) for (bool clean : {false, true}) {
+                bool allowed = true;
+                try { tp::verify_predecessor(installed, current, {audited}, machine, clean); }
+                catch (const tp::Failure&) { allowed = false; }
+                tp::require(allowed == (machine && clean &&
+                    (tp::same_package(installed, current) || tp::same_package(installed, audited))));
+                ++cases;
+            }
+        }
+        bool unaudited_rejected = false;
+        try { tp::verify_predecessor(audited, current, {}, true, true); }
+        catch (const tp::Failure&) { unaudited_rejected = true; }
+        tp::require(unaudited_rejected);
+        ++cases;
         for (auto image : {a + L"\\app.exe", a + L"\\child\\app.exe", b + L"\\app.exe", tp::wstring()}) {
             for (bool known : {false, true}) for (bool same_file : {false, true}) {
                 bool allowed = true;

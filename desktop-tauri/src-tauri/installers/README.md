@@ -7,9 +7,10 @@ hive loading, privilege acquisition or automatic cross-format migration occurs.
 Fresh installs refuse a visible competing owner or a nonempty unowned target.
 The initial NSIS GUI check defers only unowned-target emptiness so the directory
 page can select an empty folder; strict checks precede every installation section.
-Same-format upgrades require a verified existing registration and unchanged
-canonical target. Existing mixed installations may upgrade independently only
-when their targets are disjoint. Overlap, nesting, directory aliases, executable
+Same-format operations require a verified existing registration and unchanged
+canonical target. NSIS upgrades and protected MSI maintenance can proceed in
+existing mixed installations only when their targets are disjoint. Overlap,
+nesting, directory aliases, executable
 hard-link aliases, duplicate registrations and embedded reparse points fail
 closed. An inaccessible or stale matching registration is not treated as absent.
 
@@ -30,6 +31,27 @@ explicit target before maintenance costing can replace it with component history
 It then verifies the resolved
 target in the execute sequence before InstallInitialize/RemoveExistingProducts.
 Neither `Installed` nor `/UPDATE` grants upgrade authority.
+
+Automatic MSI upgrades from v0.1.24 and all other unaudited predecessor packages
+refuse before `RemoveExistingProducts`, with close-app/uninstall-first guidance.
+The candidate's `DisableShutdown` property does not control the predecessor's
+cached removal session. The guard never opens or edits that cached database:
+Microsoft prohibits `MsiOpenDatabase` in custom actions. Instead it requires an
+installed per-machine ProductCode/PackageCode pair, no registered transforms,
+no patches in any state, and successful metadata queries. It accepts only the
+exact current package or an explicitly audited predecessor pair. Current package
+identity and shutdown policy come from the active database and summary, not
+caller-supplied public properties. There are **no audited predecessor entries**
+in this candidate. Exact-package maintenance remains supported; a different
+MSI package requires explicit uninstall first until its predecessor is audited.
+
+This is a registered-package compatibility policy, not a cryptographic check of
+cached bytes. Substituted cached bytes retaining an allowed identity are outside
+this check. A future protected major upgrade requires a reviewed identity entry
+with artifact/configuration provenance, plus hosted major-upgrade tests. A version
+range, registry marker or generic test override must never grant that trust.
+The current hosted matrix tests legacy refusal/preservation and exact-package
+maintenance; synthetic policy tests separately exercise audited-pair matching.
 
 NSIS never invokes an external legacy uninstaller: those binaries can terminate
 processes by basename, and a preflight cannot eliminate the launch-after-check
@@ -79,9 +101,8 @@ identity refuse. Neither adapter requests process termination. NSIS embeds the
 helper in both installer and uninstaller and checks before hooks/mutation. MSI
 checks after costing and before InstallValidate, including uninstall, and authors
 MSIRESTARTMANAGERCONTROL=DisableShutdown. These snapshots are not a global
-process-launch lock. In particular, inheritance of the shutdown policy by a
-cached older MSI's RemoveExistingProducts session is **not yet established**;
-this remains a release/readiness gate, not evidence supplied by a green upgrade.
+process-launch lock. Cached predecessor policy is handled by the explicit
+compatibility restriction above, not assumed to inherit from the candidate.
 
 Hosted survival fixtures temporarily substitute a pipe-controlled sleeper for
 only a disposable installed main executable, then restore the original after
@@ -92,3 +113,6 @@ full application activity or prove absence of a launch-after-preflight race.
 - [QueryFullProcessImageName](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
 - [MSIRESTARTMANAGERCONTROL](https://learn.microsoft.com/en-us/windows/win32/msi/msirestartmanagercontrol)
 - [RemoveExistingProducts](https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action)
+- [Functions prohibited in custom actions](https://learn.microsoft.com/en-us/windows/win32/msi/functions-not-for-use-in-custom-actions)
+- [Registered product information](https://learn.microsoft.com/en-us/windows/win32/api/msi/nf-msi-msigetproductinfoexw)
+- [Package identity rules](https://learn.microsoft.com/en-us/windows/win32/msi/package-codes)

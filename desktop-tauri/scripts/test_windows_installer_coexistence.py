@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import uuid
 
 import test_windows_installer_identity as h
 from windows_installer_ui import nsis_ui_action
@@ -236,6 +237,44 @@ def authority(root: Path, msi: bool) -> tuple:
     return entries, sorted(shortcuts)
 
 
+def unknown_msi_identity(package: Path, copy: Path, log: Path) -> None:
+    """CI-only candidate copy with new product/package IDs, not a trusted build."""
+    assert os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+    assert not copy.exists()
+    shutil.copyfile(package, copy)
+    product, code = ("{" + str(uuid.uuid4()).upper() + "}" for _ in range(2))
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$database = $installer.OpenDatabase('__PACKAGE__', 1)
+$view = $database.OpenView('UPDATE `Property` SET `Value` = ? WHERE `Property` = ?')
+$record = $installer.CreateRecord(2)
+$record.StringData(1) = '__PRODUCT__'
+$record.StringData(2) = 'ProductCode'
+$view.Execute($record)
+$view.Close()
+$summary = $database.SummaryInformation(1)
+$summary.Property(9) = '__CODE__'
+$summary.Persist()
+$database.Commit()
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($summary)
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)
+$database = $installer.OpenDatabase('__PACKAGE__', 0)
+$summary = $database.SummaryInformation(0)
+$view = $database.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''MSIRESTARTMANAGERCONTROL''')
+$view.Execute()
+$policy = $view.Fetch().StringData(1)
+$view.Close()
+$view = $database.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''ProductCode''')
+$view.Execute()
+$persistedProduct = $view.Fetch().StringData(1)
+@{product=$persistedProduct; package=$summary.Property(9); shutdown=$policy} | ConvertTo-Json -Compress
+""".replace('__PACKAGE__', str(copy.resolve()).replace("'", "''")).replace('__PRODUCT__', product).replace('__CODE__', code)
+    result = h._run([h._powershell(), '-NoProfile', '-NonInteractive', '-Command', script], timeout=60, log_path=log)
+    assert json.loads(result.stdout) == {"product": product, "package": code, "shutdown": "DisableShutdown"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     for name in ("nsis", "msi", "old-nsis", "old-msi", "version", "old-version", "build-id", "artifacts", "process-fixture"):
@@ -261,11 +300,14 @@ def main() -> None:
         unrelated_key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OwnershipFixture-" + roots["msi"].name
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, unrelated_key, 0, winreg.KEY_SET_VALUE) as fixture:
             winreg.SetValueEx(fixture, "DisplayName", 0, winreg.REG_EXPAND_SZ, "Unrelated application %SystemRoot%")
-        # Shipped packages establish the existing mixed/disjoint state. The old
-        # silent NSIS flow does not display its WiX migration page.
-        h.reset_msi_remembered_locations(previous["msi"])
+        # The published MSI predecessor is deliberately refused in the separate
+        # unsafe-predecessor scenario. Seed the protected candidate MSI here for
+        # exact-package maintenance; this does not establish a major upgrade.
+        # The old silent NSIS flow establishes the mixed/disjoint state.
+        seeds = {"msi": packages["msi"], "nsis": previous["nsis"]}
+        h.reset_msi_remembered_locations(seeds["msi"])
         for kind in ("msi", "nsis"):
-            result = h.install(previous[kind], output / f"seed-{kind}.log", install_root=roots[kind])
+            result = h.install(seeds[kind], output / f"seed-{kind}.log", install_root=roots[kind])
             assert result.returncode == 0, result.stdout[-1000:]
         assert len(h.inventory_registry_entries()) == 2
         for kind in roots:
@@ -279,6 +321,20 @@ def main() -> None:
 
         def preserved() -> tuple:
             return tree(roots["nsis"] / "app"), tree(roots["msi"] / "app"), h._authority_signature(h.capture_authority_snapshot()), config.read_bytes(), model.read_bytes()
+
+        # An incoming copy with the same version and DisableShutdown but new
+        # identities cannot treat the installed candidate as its own package.
+        unknown = roots["msi"] / "unknown-identity.msi"
+        try:
+            unknown_msi_identity(packages["msi"].path, unknown, output / "unknown-identity-fixture.log")
+            before = preserved()
+            result = h.install(h.Installer(unknown, "msi", args.version), output / "unknown-identity-refusal.log", install_root=roots["msi"])
+            assert result.returncode != 0 and "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:" in result.stdout
+            assert "uninstall the existing version first" in result.stdout.lower()
+            assert before == preserved()
+            results.append({"scenario": "unknown-msi-identity-refusal", "exit": result.returncode, "preserved": True})
+        finally:
+            unknown.unlink(missing_ok=True)
 
         # The sleeper replaces only a disposable installed executable. These
         # are process-identity/survival fixtures, not full application launches.
@@ -306,7 +362,7 @@ def main() -> None:
             authority(roots[kind] / "app", kind == "msi")
             exe = next((roots[kind] / "app").glob("token-place*.exe"))
             h.probe_identity(exe, dict(os.environ), args.version, args.build_id)
-            results.append({"scenario": f"mixed-upgrade-{kind}", "exit": result.returncode, "other_owner_preserved": True})
+            results.append({"scenario": "mixed-maintenance-msi" if kind == "msi" else "mixed-upgrade-nsis", "exit": result.returncode, "other_owner_preserved": True})
 
             # Same-format ownership cannot authorize another target, even when
             # nested inside the old owner or aliasing the competing owner.

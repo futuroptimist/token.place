@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import sys
 
 CPU_FIELDS = {
     "vendor_id",
@@ -88,12 +89,31 @@ def package_metadata(name: str, directory: str | None = None) -> dict:
     return result
 
 
+def bound_worker_output(directory: Path) -> None:
+    # Only these bounded copies are uploaded; raw fault files stay CI-local.
+    sources = sorted(directory.glob("worker-*.fault")) + sorted(
+        directory.glob("worker-*.maps.json")
+    )
+    workers = sorted({source.name.split(".", 1)[0] for source in sources})[:8]
+    for source in sources:
+        if source.name.split(".", 1)[0] not in workers:
+            continue
+        with source.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 65536))
+            tail = stream.read(65536)
+        source.with_name(source.name + ".tail").write_bytes(tail)
+
+
 def main() -> None:
     if (
         os.environ.get("GITHUB_ACTIONS") != "true"
         or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
     ):
         raise SystemExit("GitHub-hosted CI diagnostics only")
+    if sys.argv[1:] == ["--bound-worker-output"]:
+        bound_worker_output(Path(".ci-native-diagnostics"))
+        return
     with Path("/proc/cpuinfo").open(encoding="utf-8") as stream:
         cpu = cpu_metadata(stream.read(65536))
     report = {

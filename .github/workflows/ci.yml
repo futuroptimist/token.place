@@ -92,6 +92,7 @@ jobs:
           TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
           RUN_RELAY_REGISTRATION_TESTS: '1'
           PYTHONFAULTHANDLER: '1'
+          TOKEN_PLACE_CI_NATIVE_DIAGNOSTICS: ${{ github.workspace }}/.ci-native-diagnostics
         run: |
           mkdir -p .ci-native-diagnostics
           set +e
@@ -101,6 +102,7 @@ jobs:
           tail -c 65536 .ci-native-diagnostics/inference-full.log > .ci-native-diagnostics/inference-tail.log
           cat .ci-native-diagnostics/inference-tail.log
           rm .ci-native-diagnostics/inference-full.log
+          python scripts/ci_native_inference_diagnostics.py --bound-worker-output || echo "::warning::Worker diagnostics unavailable"
           exit "$result"
       - name: Retain bounded native inference diagnostics
         if: always() && steps.prep.outputs.rc != '2'
@@ -111,6 +113,7 @@ jobs:
             .ci-native-diagnostics/metadata.json
             .ci-native-diagnostics/metadata-after.json
             .ci-native-diagnostics/inference-tail.log
+            .ci-native-diagnostics/worker-*.tail
           if-no-files-found: warn
           retention-days: 14
       - name: Verify encrypted progress landing-page lifecycle

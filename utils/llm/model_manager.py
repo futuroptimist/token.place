@@ -3627,6 +3627,62 @@ class _SubprocessLlamaCppModule:
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
 import importlib, inspect, json, os, re, sys, time
 
+# Explicit hosted-CI diagnostics only; never change model arguments or RPC output.
+_ci_fault_stream = None
+_ci_diagnostic_directory = None
+if (sys.platform == 'linux'
+        and os.environ.get('GITHUB_ACTIONS') == 'true'
+        and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+        and os.environ.get('TOKEN_PLACE_CI_NATIVE_DIAGNOSTICS')):
+    try:
+        import faulthandler
+        _ci_diagnostic_directory = os.environ['TOKEN_PLACE_CI_NATIVE_DIAGNOSTICS']
+        _ci_fault_stream = open(os.path.join(
+            _ci_diagnostic_directory, 'worker-%s.fault' % os.getpid()), 'xb')
+        # A dedicated descriptor survives the native wrapper's dup2(stderr).
+        # Keep the stream alive until process exit, including fatal signals.
+        faulthandler.enable(file=_ci_fault_stream, all_threads=True)
+    except Exception:
+        _ci_diagnostic_directory = None
+
+
+def _ci_native_mappings(text):
+    result = []
+    seen = set()
+    for line in text[:1048576].splitlines():
+        parts = line.split(None, 5)
+        if len(parts) != 6:
+            continue
+        device, inode, path = parts[3:]
+        basename = os.path.basename(path)
+        if (len(path) > 4096 or '/llama_cpp/' not in path
+                or not re.fullmatch(r'lib(?:llama|ggml[A-Za-z0-9_-]*)[.]so(?:[.][0-9]+)*', basename)):
+            continue
+        identity = (device, inode)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append({'path': path, 'device': device, 'inode': inode})
+        if len(result) == 32:
+            break
+    return result
+
+
+def _ci_record_native_mappings():
+    if _ci_diagnostic_directory is None:
+        return
+    try:
+        with open('/proc/self/maps', encoding='utf-8') as source:
+            mappings = _ci_native_mappings(source.read(1048576))
+        with open(os.path.join(_ci_diagnostic_directory,
+                               'worker-%s.maps.json' % os.getpid()),
+                  'x', encoding='utf-8') as target:
+            json.dump({'stage': 'after_import_before_construction',
+                       'mapped_libraries': mappings,
+                       'limit': 'Later initialization loads are not captured; mapped identity is not a byte-integrity claim.'}, target)
+    except Exception:
+        pass
+
 _active_command_id = None
 _active_protocol_version = None
 
@@ -4615,6 +4671,7 @@ try:
     _active_protocol_version = init_payload.get('protocol_version')
     emit_import_handshake = isinstance(init_payload, dict) and init_payload.get('method') == '__import__'
     llama_cpp = importlib.import_module('llama_cpp')
+    _ci_record_native_mappings()
     if emit_import_handshake:
         _emit({'status': 'ok', 'module_path': getattr(llama_cpp, '__file__', None)})
         init_line = sys.stdin.readline()

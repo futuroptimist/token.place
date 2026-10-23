@@ -294,3 +294,21 @@ def test_worker_enables_fault_handler_on_retained_dedicated_stream(
         assert stream.fileno() > 2
     finally:
         stream.close()
+
+
+def test_upload_retains_hidden_directory_but_only_bounded_allowlist():
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    step = next(
+        item
+        for item in workflow["jobs"]["test"]["steps"]
+        if item.get("name") == "Retain bounded native inference diagnostics"
+    )
+    assert step["with"]["include-hidden-files"] is True
+    assert set(step["with"]["path"].splitlines()) == {
+        ".ci-native-diagnostics/metadata.json",
+        ".ci-native-diagnostics/metadata-after.json",
+        ".ci-native-diagnostics/inference-tail.log",
+        ".ci-native-diagnostics/worker-*.tail",
+    }

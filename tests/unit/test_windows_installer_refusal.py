@@ -378,7 +378,7 @@ def test_msi_predecessor_policy_uses_registered_exact_identity_before_removal():
         assert f"INSTALLPROPERTY_{field}" in source
     assert "MsiEnumPatchesExW" in source and "MSIPATCHSTATE_ALL" in source
     assert "const std::vector<tp::PackageIdentity> audited_predecessors{};" in source
-    assert 'database_property(database.value, L"ProductCode")' in source
+    assert 'database_property(session, database.value, L"ProductCode")' in source
     assert "MsiGetSummaryInformationW" in source
     verify = source.split("UINT __stdcall TokenPlaceVerify", 1)[1].split("UINT __stdcall TokenPlaceProcesses", 1)[0]
     assert verify.index("tp::authorize") < verify.index("verify_predecessor_protection") < verify.index("return ERROR_SUCCESS")
@@ -410,3 +410,13 @@ def test_command_diagnostics_preserve_string_and_argv_labels(monkeypatch, tmp_pa
     assert log.read_text() == f"$ {label}\nexit={exit_code}\nfixture output"
     assert calls[0][0] == command
     assert calls[0][1]["check"] is False and "shell" not in calls[0][1]
+
+
+def test_msi_predecessor_diagnostics_preserve_refusal_and_summary_outputs():
+    source = (TEMPLATES / "ownership.cpp").read_text()
+    helper = source.split("void predecessor_check", 1)[1].split("std::wstring packaged_binary", 1)[0]
+    assert "&integer_value, &time_value, package, &size" in helper
+    assert "TOKEN_PLACE_MSI_PREDECESSOR_CHECK: [1] status=[2] expected=[3]" in helper
+    assert "INSTALLMESSAGE_INFO" in helper and "tp::require(false)" in helper
+    assert 'L"registered-patches-empty"' in helper and "ERROR_NO_MORE_ITEMS" in helper
+    assert "tp::verify_predecessor(installed, current, audited_predecessors, machine, clean)" in helper

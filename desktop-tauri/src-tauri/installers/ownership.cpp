@@ -307,46 +307,67 @@ struct MsiHandle {
     MSIHANDLE value = 0;
     ~MsiHandle() { if (value) MsiCloseHandle(value); }
 };
-std::wstring database_property(MSIHANDLE database, const wchar_t* name) {
+void predecessor_check(MSIHANDLE session, const wchar_t* phase, UINT actual,
+                       UINT expected = ERROR_SUCCESS) {
+    if (actual == expected) return;
+    MsiHandle record{MsiCreateRecord(3)};
+    if (record.value) {
+        MsiRecordSetStringW(record.value, 0,
+            L"TOKEN_PLACE_MSI_PREDECESSOR_CHECK: [1] status=[2] expected=[3]");
+        MsiRecordSetStringW(record.value, 1, phase);
+        MsiRecordSetInteger(record.value, 2, static_cast<int>(actual));
+        MsiRecordSetInteger(record.value, 3, static_cast<int>(expected));
+        MsiProcessMessage(session, INSTALLMESSAGE_INFO, record.value);
+    }
+    tp::require(false);
+}
+std::wstring database_property(MSIHANDLE session, MSIHANDLE database, const wchar_t* name) {
     MsiHandle view, record, parameter{MsiCreateRecord(1)};
-    tp::require(parameter.value != 0);
-    tp::require(MsiRecordSetStringW(parameter.value, 1, name) == ERROR_SUCCESS);
-    tp::require(MsiDatabaseOpenViewW(database,
-        L"SELECT `Value` FROM `Property` WHERE `Property` = ?", &view.value) == ERROR_SUCCESS);
-    tp::require(MsiViewExecute(view.value, parameter.value) == ERROR_SUCCESS);
-    tp::require(MsiViewFetch(view.value, &record.value) == ERROR_SUCCESS);
+    predecessor_check(session, L"query-record", parameter.value ? ERROR_SUCCESS : ERROR_INVALID_HANDLE);
+    predecessor_check(session, L"query-parameter", MsiRecordSetStringW(parameter.value, 1, name));
+    predecessor_check(session, L"query-view", MsiDatabaseOpenViewW(database,
+        L"SELECT `Value` FROM `Property` WHERE `Property` = ?", &view.value));
+    predecessor_check(session, L"query-execute", MsiViewExecute(view.value, parameter.value));
+    predecessor_check(session, L"query-fetch", MsiViewFetch(view.value, &record.value));
     wchar_t buffer[32768]; DWORD size = 32768;
-    tp::require(MsiRecordGetStringW(record.value, 1, buffer, &size) == ERROR_SUCCESS && size != 0);
+    predecessor_check(session, L"query-string", MsiRecordGetStringW(record.value, 1, buffer, &size));
+    predecessor_check(session, L"query-nonempty", size ? ERROR_SUCCESS : ERROR_INVALID_DATA);
     return buffer;
 }
-std::wstring registered_property(const std::wstring& product, const wchar_t* name) {
+std::wstring registered_property(MSIHANDLE session, const std::wstring& product, const wchar_t* name) {
     wchar_t buffer[32768]; DWORD size = 32768;
-    tp::require(MsiGetProductInfoExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
-        name, buffer, &size) == ERROR_SUCCESS);
+    predecessor_check(session, name, MsiGetProductInfoExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
+        name, buffer, &size));
     return buffer;
 }
 void verify_predecessor_protection(MSIHANDLE session, const std::wstring& product) {
     // Never open the cached MSI: MsiOpenDatabase is prohibited in custom actions.
     // Match registered identities to audited packages, not a version or marker.
     MsiHandle database{MsiGetActiveDatabase(session)}, summary;
-    tp::require(database.value != 0);
-    tp::require(database_property(database.value, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown");
-    tp::require(MsiGetSummaryInformationW(database.value, nullptr, 0, &summary.value) == ERROR_SUCCESS);
+    predecessor_check(session, L"active-database", database.value ? ERROR_SUCCESS : ERROR_INVALID_HANDLE);
+    predecessor_check(session, L"authored-shutdown-policy",
+        database_property(session, database.value, L"MSIRESTARTMANAGERCONTROL") == L"DisableShutdown" ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    predecessor_check(session, L"summary-open", MsiGetSummaryInformationW(database.value, nullptr, 0, &summary.value));
     wchar_t package[39]; DWORD size = 39; UINT type = 0;
-    tp::require(MsiSummaryInfoGetPropertyW(summary.value, 9 /* PID_REVNUMBER */, &type,
-        nullptr, nullptr, package, &size) == ERROR_SUCCESS && type == VT_LPSTR && size == 38);
-    tp::PackageIdentity current{database_property(database.value, L"ProductCode"), package};
-    tp::PackageIdentity installed{product, registered_property(product, INSTALLPROPERTY_PACKAGECODE)};
-    bool machine = registered_property(product, INSTALLPROPERTY_PRODUCTSTATE) == L"5";
-    bool clean = registered_property(product, INSTALLPROPERTY_TRANSFORMS).empty();
+    int integer_value = 0; FILETIME time_value{};
+    predecessor_check(session, L"summary-package-code", MsiSummaryInfoGetPropertyW(summary.value, 9 /* PID_REVNUMBER */, &type,
+        &integer_value, &time_value, package, &size));
+    predecessor_check(session, L"summary-package-shape", type == VT_LPSTR && size == 38 ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    tp::PackageIdentity current{database_property(session, database.value, L"ProductCode"), package};
+    tp::PackageIdentity installed{product, registered_property(session, product, INSTALLPROPERTY_PACKAGECODE)};
+    bool machine = registered_property(session, product, INSTALLPROPERTY_PRODUCTSTATE) == L"5";
+    bool clean = registered_property(session, product, INSTALLPROPERTY_TRANSFORMS).empty();
     wchar_t patch[39], target[39]; MSIINSTALLCONTEXT context{}; DWORD sid_size = 0;
-    clean = clean && MsiEnumPatchesExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
-        MSIPATCHSTATE_ALL, 0, patch, target, &context, nullptr, &sid_size) == ERROR_NO_MORE_ITEMS;
+    predecessor_check(session, L"registered-machine-state", machine ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    predecessor_check(session, L"registered-transforms-empty", clean ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    predecessor_check(session, L"registered-patches-empty", MsiEnumPatchesExW(product.c_str(), nullptr, MSIINSTALLCONTEXT_MACHINE,
+        MSIPATCHSTATE_ALL, 0, patch, target, &context, nullptr, &sid_size), ERROR_NO_MORE_ITEMS);
     // No published predecessor has audited refusal-only shutdown protection.
     // Future entries require artifact identity/configuration evidence and tests;
     // never trust a version range, a public property, or a generic fixture ID.
     const std::vector<tp::PackageIdentity> audited_predecessors{};
-    tp::verify_predecessor(installed, current, audited_predecessors, machine, clean);
+    try { tp::verify_predecessor(installed, current, audited_predecessors, machine, clean); }
+    catch (...) { predecessor_check(session, L"audited-package-identity", ERROR_INVALID_DATA); }
 }
 std::wstring packaged_binary(MSIHANDLE session) {
     // Bind to the main component's File table row, never a public property that

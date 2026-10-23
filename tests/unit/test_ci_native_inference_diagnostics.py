@@ -78,7 +78,7 @@ def test_collector_refuses_non_hosted_execution(monkeypatch):
 
 
 def test_ci_keeps_inference_exit_status_and_bounds_retained_output():
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     section = workflow.split("      - name: Verify tiny real GGUF loads", 1)[
         1
     ].split("      - name: Verify encrypted", 1)[0]
@@ -105,7 +105,9 @@ def test_ci_shell_preserves_test_status_when_metadata_fails(
     import subprocess
     import yaml
 
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
     step = next(
         item
         for item in workflow["jobs"]["test"]["steps"]
@@ -299,7 +301,9 @@ def test_worker_enables_fault_handler_on_retained_dedicated_stream(
 def test_upload_retains_hidden_directory_but_only_bounded_allowlist():
     import yaml
 
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
     step = next(
         item
         for item in workflow["jobs"]["test"]["steps"]

@@ -413,7 +413,7 @@ def test_command_diagnostics_preserve_string_and_argv_labels(monkeypatch, tmp_pa
 
 
 def test_msi_predecessor_diagnostics_preserve_refusal_and_summary_outputs():
-    source = (TEMPLATES / "ownership.cpp").read_text()
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
     helper = source.split("void predecessor_check", 1)[1].split("std::wstring packaged_binary", 1)[0]
     assert "&integer_value, &time_value, package, &size" in helper
     assert "TOKEN_PLACE_MSI_PREDECESSOR_CHECK: [1] status=[2] expected=[3]" in helper

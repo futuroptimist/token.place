@@ -41,6 +41,9 @@ wstring canonical(const wstring& input) {
     fs::path path(unquote(input));
     require(path.is_absolute() && path.has_root_name());
     path = path.lexically_normal();
+    // MSI costing appends a separator even when the target does not exist yet.
+    // Remove that empty final component, retaining drive/volume roots.
+    if (!path.has_filename() && path != path.root_path()) path = path.parent_path();
     std::vector<fs::path> missing;
     for (;;) {
         HANDLE handle = CreateFileW(path.c_str(), 0,

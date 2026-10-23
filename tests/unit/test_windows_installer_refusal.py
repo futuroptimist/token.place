@@ -202,7 +202,7 @@ def test_msi_verifies_final_target_before_major_upgrade():
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-16-le"])
-@pytest.mark.parametrize("marker", ["TOKEN_PLACE_COMPETING_INSTALLER", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR"])
+@pytest.mark.parametrize("marker", ["TOKEN_PLACE_COMPETING_INSTALLER", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR", "TOKEN_PLACE_APP_RUNNING"])
 def test_msi_silent_diagnostic_only_exposes_bounded_refusal_message(encoding, marker):
     guard = load_guard()
     message = MESSAGE.replace("TOKEN_PLACE_COMPETING_INSTALLER", marker)

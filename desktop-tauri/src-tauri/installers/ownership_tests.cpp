@@ -123,6 +123,16 @@ int wmain(int argc, wchar_t** argv) {
         tp::require(GetPrivateProfileStringW(L"ownership", L"target", L"", result, 32768, report.c_str()) == unicode.size());
         tp::require(unicode == result);
         ++cases;
+        tp::require(!tp::canonical(root.root_path().wstring()).empty());
+        ++cases;
+        // CostFinalize supplies a trailing separator, including fresh targets.
+        for (auto candidate : {root / L"exists", root / L"fresh-app", root / L"new" / L"child"}) {
+            auto expected = tp::canonical(candidate.wstring());
+            try {
+                tp::require(expected == tp::canonical(candidate.wstring() + L"\\"));
+            } catch (...) { throw std::runtime_error("trailing-separator canonicalization failed"); }
+            ++cases;
+        }
         tp::fs::remove_all(root);
         std::cout << cases << " ownership policy/path cases passed; registry discovery excluded\n";
         return 0;

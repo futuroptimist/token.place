@@ -1548,7 +1548,7 @@ def msi_rejection_diagnostic(data: bytes) -> str:
     else:
         text = data.decode("utf-8", errors="replace")
     lines = [line[:1024] for line in text.splitlines() if any(marker in line for marker in
-        ("TOKEN_PLACE_COMPETING_INSTALLER:", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:"))]
+        ("TOKEN_PLACE_COMPETING_INSTALLER:", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:", "TOKEN_PLACE_APP_RUNNING:"))]
     return "\n" + "\n".join(lines[-4:]) if lines else ""
 
 

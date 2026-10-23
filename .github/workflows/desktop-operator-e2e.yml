@@ -198,7 +198,9 @@ jobs:
 
   desktop-operator-packaged-e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 75
+    # Packaging plus the full installer matrix consumed 73 minutes in run 39893766232.
+    # Keep time for parity/CUDA checks without reducing scenarios or assertions.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

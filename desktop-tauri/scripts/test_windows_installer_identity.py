@@ -185,7 +185,7 @@ class InstallerIdentityError(AssertionError):
 
 
 def _run(
-    cmd: list[str],
+    cmd: list[str] | str,
     *,
     env: dict[str, str] | None = None,
     timeout: int = 180,
@@ -196,8 +196,9 @@ def _run(
     # Windows PowerShell otherwise serializes redirected output using the OEM
     # code page, replacing non-ACP paths with '?'. Preserve authority paths all
     # the way from registry/shortcut JSON through cleanup command construction.
+    label = cmd if isinstance(cmd, str) else cmd[0]
     encoding = None
-    if cmd[0].replace("\\", "/").rsplit("/", 1)[-1].lower() in ("powershell.exe", "powershell", "pwsh.exe", "pwsh") and "-Command" in cmd:
+    if isinstance(cmd, list) and cmd[0].replace("\\", "/").rsplit("/", 1)[-1].lower() in ("powershell.exe", "powershell", "pwsh.exe", "pwsh") and "-Command" in cmd:
         cmd = list(cmd)
         script_index = cmd.index("-Command") + 1
         cmd[script_index] = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " + cmd[script_index]
@@ -218,12 +219,12 @@ def _run(
             output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
         else:
             output = result.stdout
-        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{output}", encoding="utf-8")
+        log_path.write_text(f"$ {label}\nexit={result.returncode}\n{output}", encoding="utf-8")
     if check and result.returncode != 0:
         diagnostic = result.stdout
         if separate_stderr and result.stderr:
             diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{diagnostic[-4000:]}")
+        raise InstallerIdentityError(f"command failed ({label}): exit={result.returncode}\n{diagnostic[-4000:]}")
     return result
 
 

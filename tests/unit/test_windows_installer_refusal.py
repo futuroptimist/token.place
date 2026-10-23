@@ -386,3 +386,27 @@ def test_msi_predecessor_policy_uses_registered_exact_identity_before_removal():
     harness = (ROOT / "desktop-tauri/scripts/test_windows_installer_coexistence.py").read_text(encoding="utf-8")
     assert 'seeds = {"msi": packages["msi"], "nsis": previous["nsis"]}' in harness
     assert '"mixed-maintenance-msi"' in harness
+
+
+@pytest.mark.parametrize("command,label", [
+    ('"C:\\fixture path\\uninstall.exe" /S _?=C:\\fixture path', '"C:\\fixture path\\uninstall.exe" /S _?=C:\\fixture path'),
+    ([r"C:\fixture path\uninstall.exe", "/S"], r"C:\fixture path\uninstall.exe"),
+])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_command_diagnostics_preserve_string_and_argv_labels(monkeypatch, tmp_path, command, label, exit_code):
+    guard = load_guard()
+    calls = []
+    def run(actual, **kwargs):
+        calls.append((actual, kwargs))
+        return subprocess.CompletedProcess(actual, exit_code, "fixture output")
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    log = tmp_path / "command.log"
+    if exit_code:
+        with pytest.raises(guard.InstallerIdentityError) as error:
+            guard._run(command, log_path=log)
+        assert str(error.value) == f"command failed ({label}): exit=7\nfixture output"
+    else:
+        assert guard._run(command, log_path=log).returncode == 0
+    assert log.read_text() == f"$ {label}\nexit={exit_code}\nfixture output"
+    assert calls[0][0] == command
+    assert calls[0][1]["check"] is False and "shell" not in calls[0][1]

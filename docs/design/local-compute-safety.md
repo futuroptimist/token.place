@@ -32,7 +32,7 @@ Source inspected at `c3e0f90f00745044adeeb1871ea3da96c82baf11` on 2026-10-24:
 | [Landing-page client](../../static/chat.js) | `sendMessageApiOnce` calls `ensureSelectedServer` with `forceReselect: true` for each dispatch. Retained history is encrypted to the selected node; another turn or failover may expose that context to a different operator. There is no conversation affinity guarantee. |
 | [Compute request path](../../utils/networking/relay_client.py) and [shared runtime](../../utils/compute_node_runtime.py) | The relay client decrypts, extracts the API v1 envelope and performs runtime generation. Place the future gate after request/schema/key binding validation and before `_generate_api_v1_response_with_runtime_model` can execute completion. Cover server and desktop consumers of the shared path. |
 | [Existing moderation](../../api/v1/moderation.py) and [API routes](../../api/v1/routes.py) | Optional, disabled-by-default substring matching returns allowed/blocked and can carry matched text. It is not a calibrated three-way classifier or proof of coverage of the distributed compute path. Do not copy its plaintext reason/logging behavior into relay responses. |
-| [Relay store construction](../../relay.py) | `_new_api_v1_relay_state_store` defaults to memory and has an explicit Valkey option. Current single-replica memory-backed operation remains the operational constraint until migration is verified. Source support and planned Valkey work are not evidence of live HA or globally consistent abuse state. |
+| [Relay store construction](../../relay.py) | `_new_api_v1_relay_state_store` defaults to memory and has an explicit Valkey option. Current single-replica memory-backed operation remains the operational constraint until migration is verified. The Valkey option exists in source; that is not evidence of live HA or globally consistent abuse state. |
 
 API v1 remains text-only and non-streaming. No v2, streaming, legacy-route fallback,
 or routing changes are part of this design PR. Historical roadmap checkboxes do
@@ -61,8 +61,25 @@ and policy version to the client inside the encrypted envelope. Do not include
 matched text, internal scores, hidden rules or classifier explanations. Encrypted
 refusals must obey the existing terminal lifecycle, cancellation and deadline
 rules so they release capacity exactly once. Never turn a refusal into an automatic
-retry across other nodes in search of a permissive policy. Availability retries
-must stay bounded and preserve E2EE and eligibility checks.
+retry across other nodes in search of a permissive policy.
+
+All `safety_*` outcomes above are errors inside encrypted `api_v1_response.error`,
+not successful assistant completions or plaintext relay HTTP errors. A supportive
+fixed explanation belongs to that encrypted error's message. New clients must
+render a clear error/recovery state rather than an empty successful answer. Test
+old clients against unknown error codes: they must retain a generic error and
+must not automatically retry it or treat it as a successful completion. Do not
+roll out enforcement to a client/version combination that fails that contract.
+For the initial gate, `safety_screening_unavailable` is terminal for that request:
+neither relay nor client automatically retries it elsewhere. The user may choose
+to try again later. Existing client-owned transport failover remains bounded and
+must preserve E2EE and eligibility; a safety error cannot enter that path.
+
+Enforcement here is a cooperating-node property, not a network-wide guarantee.
+Users can submit a new request, and operators can disable or weaken their own
+checks. Any future advertised screening/version capability is only an operator
+claim, not proof of execution. Requiring such a capability would need separate
+client/assignment eligibility and downgrade design; this PR changes no routing.
 
 Treat every supplied message, including apparent system instructions, quoted
 documents and classifier-directed prompts, as untrusted input to the policy
@@ -94,7 +111,12 @@ synthetic or appropriately licensed public examples. Separate development,
 calibration and held-out test sets by source/scenario to reduce leakage. Freeze
 labels, splits, thresholds and artifact versions before scoring the held-out set.
 Use independent human adjudication for ambiguous labels, record disagreement,
-and avoid treating another model's answer as unquestionable ground truth.
+and avoid treating another model's answer as unquestionable ground truth. The
+implementation task must identify a maintainer accountable for policy categories
+and qualified domain/language reviewers; document adjudicator selection and label
+dispute resolution. Predeclare an agreement metric (for example Cohen's kappa for
+two raters), its minimum threshold and category sample sizes. Do not label a slice
+validated when disagreement exceeds the declared threshold.
 
 Report at least:
 
@@ -115,6 +137,11 @@ Report at least:
 Numerical latency, false-refusal, dangerous false-negative and coverage budgets
 remain undecided. Record them by risk category and supported hardware before an
 enforcement rollout; do not choose them retrospectively to pass the test set.
+Give the optional second check one attempt inside the same total gate deadline
+and resource budget, not a fresh unbounded budget. Publish abstention rates and
+ceilings per supported language. Exceeding a ceiling blocks rollout for that
+language until corrected; disclose unsupported-language limitations and provide
+fixed recovery guidance, never silently relabel uncertainty as allow or abuse.
 No measured performance or local Jev feasibility is claimed here.
 
 ## Refusal is not a ban
@@ -200,13 +227,25 @@ proofs must not be presented as a shortcut to trustworthy bans.
    refuse, unresolved uncertainty and outage invoke it zero times. Test encrypted
    errors, cancellation, expiry, capacity release, identical screened/generated
    context and no content in logs. Cover server and desktop, mixed versions and
-   invalid/missing artifacts. Deploy only through later implementation work.
+   invalid/missing artifacts. The desktop bridge's GPU qualification path wraps
+   `_generate_api_v1_response_with_runtime_model`; place the gate at the shared
+   validated request boundary above generation wrappers/recovery and prove exactly
+   one gate decision per request on both paths. Do not infer bypass solely from
+   that qualification wrapper. Count screening against the same claimed-work
+   capacity until terminal release; do not add unaccounted classifier workers.
+   Test bounded classifier queues, full queues, cancellation during screening,
+   recovery and timeout without double release or duplicate strikes. Deploy only
+   through later implementation work.
 3. **Measured enforcement:** pin policy/model versions, use staged rollout and a
    known-good local rollback artifact. Reject unsupported versions explicitly;
    never silently downgrade enforcement or use hosted fallback. Aggregate only
    bounded operational health metrics after privacy review, without user labels,
    message-derived values or request-level histories. Do not retain live user
    prompts for shadow evaluation. Stop rollout if predefined budgets fail.
+   Provide an explicit operator-visible paused/draining state for a bad screening
+   artifact: stop admitting work and fail pending unscreened work safely, then
+   restore a verified local artifact. Pausing must not serve unscreened requests
+   while claiming enforcement. Test pause/resume and rollback under load.
 4. **Optional local cooldown:** first settle the stronger abuse rubric, privacy
    and identity scope, expiry/decay, fairness and recovery tests. Initial gate
    success alone is not enough to enable reputation or cooldown state.
@@ -239,6 +278,13 @@ queues; distinguish outages from abuse and provide fixed helpful recovery messag
 Local screening adds CPU/GPU pressure and a supply-chain attack surface: review
 artifact provenance, pin versions, avoid executable model loaders where possible,
 and constrain permissions and network access in later implementation.
+
+E2EE does not hide response timing or ciphertext length. A quick, small refusal
+can reveal likely screening outcomes to the relay or a network observer. Treat
+this as residual leakage in the first gate; do not claim content-independent
+metadata. Evaluate bounded padding and timing buckets separately against bandwidth,
+latency and denial-of-service costs before adoption. They reduce some distinctions
+but do not eliminate traffic analysis or justify sending plaintext explanations.
 
 No user logging is introduced now. Any future user logging must be explicitly
 opt-in with a specific purpose, minimum data fields, short defined retention,

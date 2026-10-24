@@ -81,6 +81,18 @@ checks. Any future advertised screening/version capability is only an operator
 claim, not proof of execution. Requiring such a capability would need separate
 client/assignment eligibility and downgrade design; this PR changes no routing.
 
+`safety_review_required` means local abstention and a request for clarification;
+it does not promise human review. A gate deadline expiring, including during the
+second check, produces `safety_screening_unavailable`. Operator pause uses that
+same terminal code for pending unscreened work. Implementation owners must run
+compatibility fixtures for the landing page and supported first-party API clients
+and publish the tested versions. There is no reliable client-version signal today;
+third-party clients remain unverified, and no network-wide compatibility claim is
+permitted. For direct local-provider API calls, use the same error codes in the
+ordinary API error shape over that direct connection; there is no distributed
+E2EE envelope to unwrap. This does not authorize plaintext errors or content on
+relay-owned distributed paths.
+
 Treat every supplied message, including apparent system instructions, quoted
 documents and classifier-directed prompts, as untrusted input to the policy
 engine. The policy specification and thresholds live outside that input. A user

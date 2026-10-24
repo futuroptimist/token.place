@@ -128,7 +128,7 @@ implementation task must identify a maintainer accountable for policy categories
 and qualified domain/language reviewers; document adjudicator selection and label
 dispute resolution. Predeclare an agreement metric (for example Cohen's kappa for
 two raters), its minimum threshold and category sample sizes. Do not label a slice
-validated when disagreement exceeds the declared threshold.
+validated when its agreement score falls below the declared minimum threshold.
 
 Report at least:
 

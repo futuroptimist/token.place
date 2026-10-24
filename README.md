@@ -326,6 +326,10 @@ just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
 
 > Canonical migration plan: [docs/roadmap/desktop_compute_node_migration.md](docs/roadmap/desktop_compute_node_migration.md).
 
+- [ ] [K-376: local compute-node safety screening](docs/design/local-compute-safety.md)
+  - Staged design for local pre-inference checks, encrypted refusals, evaluation,
+    and deferred cooldown/report controls; no runtime enforcement implemented.
+
 - [x] hello world: it literally just echoes your message param back to you
 - [x] find an initial model to support (llama 2 7b chat gguf)
 - [x] download model programmatically on device

@@ -8,9 +8,95 @@ import signal
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 
-PROBE_SUBJECT = "[native-probe-once] Capture backend initialization SIGILL"
+PROBE_SUBJECT = (
+    "[native-probe-provisioned-once] Capture backend initialization SIGILL"
+)
+
+
+def validate_ubuntu_source(text: str) -> None:
+    """Accept only the runner's signed official Ubuntu deb822 source."""
+    if len(text) > 65536:
+        raise ValueError("Ubuntu source exceeds bound")
+    blocks = text.strip().split("\n\n")
+    if not blocks:
+        raise ValueError("Missing Ubuntu source")
+    for block in blocks:
+        fields = {}
+        for line in block.splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            key, separator, value = line.partition(":")
+            if not separator or key in fields:
+                raise ValueError("Unsupported source field")
+            fields[key] = value.strip()
+        if not fields:
+            raise ValueError("Empty Ubuntu source stanza")
+        if set(fields) - {
+            "Types",
+            "URIs",
+            "Suites",
+            "Components",
+            "Signed-By",
+            "Architectures",
+        }:
+            raise ValueError("Unsupported source options")
+        if fields.get("Types") != "deb" or fields.get("Signed-By") != (
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+        ):
+            raise ValueError("Official signed binary source required")
+        uris = fields.get("URIs", "").split()
+        if (
+            not uris
+            or not fields.get("Suites")
+            or not fields.get("Components")
+        ):
+            raise ValueError("Incomplete Ubuntu source")
+        for uri in uris:
+            parsed = urlsplit(uri)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.netloc
+                not in {
+                    "archive.ubuntu.com",
+                    "security.ubuntu.com",
+                    "azure.archive.ubuntu.com",
+                }
+                or parsed.path.rstrip("/") != "/ubuntu"
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("Nonofficial Ubuntu source")
+
+
+def check_output_budget(directory: Path) -> None:
+    names = [
+        "metadata.json",
+        "metadata-after.json",
+        "inference-tail.log",
+        "debugger-probe.json",
+        "gdb-setup-tail.log",
+        "gdb-setup.json",
+    ]
+    files = [directory / name for name in names]
+    files += list(directory.glob("worker-*.tail"))
+    total = 0
+    for path in files:
+        if not path.exists():
+            continue
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size > 65536
+        ):
+            raise ValueError("Diagnostic file exceeds allowlist bound")
+        total += path.stat().st_size
+    if total > 8 * 1024 * 1024:
+        raise ValueError("Diagnostic bundle exceeds 8 MiB")
+
+
 INFERIOR = """
 import os
 import resource
@@ -211,4 +297,13 @@ def run_probe(output: Path) -> None:
 
 
 if __name__ == "__main__":
-    run_probe(Path(".ci-native-diagnostics/debugger-probe.json"))
+    if sys.argv[1:] == ["--validate-ubuntu-source"]:
+        validate_ubuntu_source(
+            Path("/etc/apt/sources.list.d/ubuntu.sources").read_text(
+                encoding="utf-8"
+            )
+        )
+    elif sys.argv[1:] == ["--check-output-budget"]:
+        check_output_budget(Path(".ci-native-diagnostics"))
+    else:
+        run_probe(Path(".ci-native-diagnostics/debugger-probe.json"))

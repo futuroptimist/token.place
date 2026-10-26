@@ -108,20 +108,61 @@ jobs:
           rm .ci-native-diagnostics/inference-full.log
           python scripts/ci_native_inference_diagnostics.py --bound-worker-output || echo "::warning::Worker diagnostics unavailable"
           exit "$result"
-      - name: One approved disposable native debugger probe
-        if: always() && (steps.native_inference.outcome == 'failure' || steps.native_inference.outcome == 'success') && github.event_name == 'pull_request' && github.run_attempt == 1
+      - name: Select the single approved provisioned debugger attempt
+        id: probe_gate
+        if: always() && (steps.native_inference.outcome == 'failure' || steps.native_inference.outcome == 'success') && github.event_name == 'pull_request' && github.event.pull_request.number == 1927 && github.event.action == 'synchronize' && github.run_attempt == 1
         env:
           PROBE_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           # A later commit or retry must not silently repeat this one probe.
           subject=$(git show -s --format=%s "$PROBE_HEAD")
-          if [ "$subject" != '[native-probe-once] Capture backend initialization SIGILL' ]; then
+          if [ "$subject" != '[native-probe-provisioned-once] Capture backend initialization SIGILL' ]; then
             exit 0
           fi
-          export TOKEN_PLACE_PROBE_SUBJECT="$subject"
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+      - name: Provision GDB from the official runner OS source once
+        id: gdb_setup
+        if: always() && steps.probe_gate.outputs.enabled == 'true'
+        timeout-minutes: 10
+        run: |
+          ulimit -c 0
+          python scripts/ci_native_debugger_probe.py --validate-ubuntu-source
+          mkdir -p .ci-native-diagnostics
+          set +e
+          sudo -n timeout --signal=TERM --kill-after=5s 580s bash -euo pipefail <<'SETUP' > "$RUNNER_TEMP/gdb-setup.log" 2>&1
+          lists=$(mktemp -d /tmp/token-place-gdb-apt.XXXXXX)
+          chmod 755 "$lists"
+          options=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+                   -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$lists"
+                   -o Acquire::Retries=0 -o APT::Get::Update::Error-Mode=any
+                   -o Dpkg::Use-Pty=0)
+          apt-get "${options[@]}" update
+          apt-get "${options[@]}" --simulate install --no-upgrade --no-remove --no-install-recommends gdb > "$lists/plan.txt"
+          if grep -Eq '^(Remv|Inst [^ ]+ \[)' "$lists/plan.txt"; then
+            echo 'Refusing a debugger plan that changes existing OS packages'
+            exit 1
+          fi
+          apt-get "${options[@]}" install --yes --no-upgrade --no-remove --no-install-recommends gdb
+          dpkg-query -W -f='${Package} ${Version}\n' gdb
+          SETUP
+          result=$?
+          tail -c 65536 "$RUNNER_TEMP/gdb-setup.log" > .ci-native-diagnostics/gdb-setup-tail.log
+          printf '{"setup_exit":%d}\n' "$result" > .ci-native-diagnostics/gdb-setup.json
+          exit "$result"
+      - name: One approved disposable native debugger probe
+        if: always() && steps.probe_gate.outputs.enabled == 'true' && steps.gdb_setup.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          TOKEN_PLACE_PROBE_SUBJECT: '[native-probe-provisioned-once] Capture backend initialization SIGILL'
+        run: |
+          ulimit -c 0
           python scripts/ci_native_debugger_probe.py
-      - name: Retain bounded native inference diagnostics
+      - name: Enforce the diagnostic text allowlist and 8 MiB cap
+        id: diagnostic_budget
         if: always() && steps.prep.outputs.rc != '2'
+        run: python scripts/ci_native_debugger_probe.py --check-output-budget
+      - name: Retain bounded native inference diagnostics
+        if: always() && steps.prep.outputs.rc != '2' && steps.diagnostic_budget.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: native-inference-diagnostics
@@ -133,6 +174,8 @@ jobs:
             .ci-native-diagnostics/inference-tail.log
             .ci-native-diagnostics/worker-*.tail
             .ci-native-diagnostics/debugger-probe.json
+            .ci-native-diagnostics/gdb-setup-tail.log
+            .ci-native-diagnostics/gdb-setup.json
           if-no-files-found: warn
           retention-days: 14
       - name: Verify encrypted progress landing-page lifecycle

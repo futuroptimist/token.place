@@ -316,4 +316,6 @@ def test_upload_retains_hidden_directory_but_only_bounded_allowlist():
         ".ci-native-diagnostics/inference-tail.log",
         ".ci-native-diagnostics/worker-*.tail",
         ".ci-native-diagnostics/debugger-probe.json",
+        ".ci-native-diagnostics/gdb-setup-tail.log",
+        ".ci-native-diagnostics/gdb-setup.json",
     }

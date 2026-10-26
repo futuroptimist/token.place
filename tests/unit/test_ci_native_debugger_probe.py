@@ -169,15 +169,130 @@ def test_workflow_one_shot_gate_and_inference_remain_intact():
     )
     steps = workflow["jobs"]["test"]["steps"]
     assert steps[0]["with"]["fetch-depth"] == 2
+    gate = next(s for s in steps if s.get("id") == "probe_gate")
     step = next(
         s
         for s in steps
         if s.get("name") == "One approved disposable native debugger probe"
     )
-    assert "steps.native_inference.outcome == 'failure'" in step["if"]
-    assert "github.run_attempt == 1" in step["if"]
-    assert probe.PROBE_SUBJECT in step["run"]
-    assert 'git show -s --format=%s "$PROBE_HEAD"' in step["run"]
+    assert "steps.native_inference.outcome == 'failure'" in gate["if"]
+    assert "github.run_attempt == 1" in gate["if"]
+    assert "github.event.pull_request.number == 1927" in gate["if"]
+    assert "github.event.action == 'synchronize'" in gate["if"]
+    assert probe.PROBE_SUBJECT in gate["run"]
+    assert 'git show -s --format=%s "$PROBE_HEAD"' in gate["run"]
+    assert "steps.gdb_setup.outcome == 'success'" in step["if"]
+    assert step["timeout-minutes"] == 10
+    setup = next(s for s in steps if s.get("id") == "gdb_setup")
+    assert setup["timeout-minutes"] == 10
+    assert "steps.probe_gate.outputs.enabled == 'true'" in setup["if"]
+    assert "Acquire::Retries=0" in setup["run"]
+    assert "--no-upgrade --no-remove" in setup["run"]
+    assert "Dir::Etc::sourceparts=-" in setup["run"]
+    assert "--kill-after=5s 580s" in setup["run"]
+    assert workflow["jobs"]["test"]["timeout-minutes"] == 30
+    upload = next(
+        s
+        for s in steps
+        if s.get("name") == "Retain bounded native inference diagnostics"
+    )
+    assert "steps.diagnostic_budget.outcome == 'success'" in upload["if"]
     assert "continue-on-error" not in next(
         s for s in steps if s.get("id") == "native_inference"
     )
+
+
+SOURCE = """Types: deb
+URIs: http://azure.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates
+Components: main universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+"""
+
+
+def test_official_source_accepted():
+    probe.validate_ubuntu_source(SOURCE)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        SOURCE.replace("azure.archive.ubuntu.com", "example.com"),
+        SOURCE.replace("ubuntu-archive-keyring.gpg", "other.gpg"),
+        SOURCE + "Trusted: yes\n",
+        SOURCE + "URIs: http://example.com/ubuntu\n",
+        SOURCE.replace("Types: deb", "Types: deb-src"),
+    ],
+)
+def test_nonofficial_or_ambiguous_source_refused(source):
+    with pytest.raises(ValueError):
+        probe.validate_ubuntu_source(source)
+
+
+def test_output_allowlist_and_size_limits(tmp_path):
+    (tmp_path / "gdb-setup-tail.log").write_bytes(b"x" * 65536)
+    (tmp_path / "unrelated-secret.txt").write_bytes(b"x" * 100000)
+    probe.check_output_budget(tmp_path)
+    (tmp_path / "debugger-probe.json").write_bytes(b"x" * 65537)
+    with pytest.raises(ValueError, match="allowlist"):
+        probe.check_output_budget(tmp_path)
+
+
+def test_total_output_cap(tmp_path):
+    for i in range(129):
+        (tmp_path / f"worker-{i}.fault.tail").write_bytes(b"x" * 65536)
+    with pytest.raises(ValueError, match="8 MiB"):
+        probe.check_output_budget(tmp_path)
+
+
+@pytest.mark.skipif(
+    probe.sys.platform != "linux", reason="Hosted Bash contract"
+)
+@pytest.mark.parametrize(
+    "plan,allowed",
+    [
+        ("Inst gdb (15.0 Ubuntu:24.04/noble [amd64])", True),
+        ("Inst libc6 [2.39] (2.40 Ubuntu:24.04/noble [amd64])", False),
+        ("Remv existing-package [1.0]", False),
+    ],
+)
+def test_setup_plan_refuses_existing_package_changes(tmp_path, plan, allowed):
+    import os
+    import subprocess
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    setup = next(
+        s
+        for s in workflow["jobs"]["test"]["steps"]
+        if s.get("id") == "gdb_setup"
+    )
+    script = setup["run"].split("\nlists=", 1)[1].split("\nSETUP", 1)[0]
+    script = "lists=" + script
+    # The actual shell plan guard runs; package tools are inert functions.
+    stubs = """
+mktemp() { printf '%s\\n' "$FIXTURE_ROOT"; }
+chmod() { :; }
+dpkg-query() { :; }
+apt-get() {
+  case "$*" in
+    *--simulate*) printf '%s\\n' "$FIXTURE_PLAN" ;;
+    *install*) touch "$FIXTURE_ROOT/installed" ;;
+  esac
+}
+"""
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", stubs + script],
+        env={
+            **os.environ,
+            "FIXTURE_ROOT": str(tmp_path),
+            "FIXTURE_PLAN": plan,
+        },
+        capture_output=True,
+        timeout=10,
+    )
+    assert (result.returncode == 0) is allowed
+    assert (tmp_path / "installed").exists() is allowed

@@ -214,6 +214,43 @@ def test_official_source_accepted():
     probe.validate_ubuntu_source(SOURCE)
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("separator", ["\n\n", "\n\n\n\n", "\n \n\t\n"])
+def test_blank_and_comment_blocks_preserve_valid_sources(newline, separator):
+    source = (
+        "# leading header\n# comment only\n\n"
+        + SOURCE
+        + separator
+        + "# interleaved header\n\n"
+        + SOURCE.replace("azure.archive.ubuntu.com", "security.ubuntu.com")
+        + "\n\n# trailing comments\n\n"
+    )
+    probe.validate_ubuntu_source(source.replace("\n", newline))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "\n \n\t\n",
+        "# comments only\n\n# still no source\n",
+        SOURCE + "\n\nmalformed paragraph\n",
+        SOURCE + "\n\n # indented unsupported continuation\n",
+        SOURCE
+        + "\n\n"
+        + SOURCE.replace("azure.archive.ubuntu.com", "example.com"),
+        SOURCE
+        + "\n\n"
+        + SOURCE.replace("ubuntu-archive-keyring.gpg", "foreign.gpg"),
+        SOURCE + "\n\nTrusted: yes\n",
+    ],
+)
+def test_ignorable_blocks_do_not_hide_missing_malformed_or_foreign_source(
+    source,
+):
+    with pytest.raises(ValueError):
+        probe.validate_ubuntu_source(source)
+
+
 @pytest.mark.parametrize(
     "source",
     [

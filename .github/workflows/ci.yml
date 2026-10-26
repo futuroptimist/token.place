@@ -116,7 +116,7 @@ jobs:
         run: |
           # A later commit or retry must not silently repeat this one probe.
           subject=$(git show -s --format=%s "$PROBE_HEAD")
-          if [ "$subject" != '[native-probe-provisioned-once] Capture backend initialization SIGILL' ]; then
+          if [ "$subject" != '[native-probe-source-fix-once] Capture backend initialization SIGILL' ]; then
             exit 0
           fi
           echo 'enabled=true' >> "$GITHUB_OUTPUT"
@@ -153,7 +153,7 @@ jobs:
         if: always() && steps.probe_gate.outputs.enabled == 'true' && steps.gdb_setup.outcome == 'success'
         timeout-minutes: 10
         env:
-          TOKEN_PLACE_PROBE_SUBJECT: '[native-probe-provisioned-once] Capture backend initialization SIGILL'
+          TOKEN_PLACE_PROBE_SUBJECT: '[native-probe-source-fix-once] Capture backend initialization SIGILL'
         run: |
           ulimit -c 0
           python scripts/ci_native_debugger_probe.py

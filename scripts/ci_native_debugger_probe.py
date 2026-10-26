@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 
 PROBE_SUBJECT = (
-    "[native-probe-provisioned-once] Capture backend initialization SIGILL"
+    "[native-probe-source-fix-once] Capture backend initialization SIGILL"
 )
 
 
@@ -20,20 +20,30 @@ def validate_ubuntu_source(text: str) -> None:
     """Accept only the runner's signed official Ubuntu deb822 source."""
     if len(text) > 65536:
         raise ValueError("Ubuntu source exceeds bound")
-    blocks = text.strip().split("\n\n")
-    if not blocks:
-        raise ValueError("Missing Ubuntu source")
+    blocks = []
+    lines = []
+    for line in text.splitlines():
+        if not line.strip():
+            if lines:
+                blocks.append(lines)
+                lines = []
+        else:
+            lines.append(line)
+    if lines:
+        blocks.append(lines)
+    validated = 0
     for block in blocks:
         fields = {}
-        for line in block.splitlines():
-            if not line.strip() or line.startswith("#"):
+        for line in block:
+            if line.startswith("#"):
                 continue
             key, separator, value = line.partition(":")
             if not separator or key in fields:
                 raise ValueError("Unsupported source field")
             fields[key] = value.strip()
         if not fields:
-            raise ValueError("Empty Ubuntu source stanza")
+            # Only column-zero comments can remain in a zero-field block.
+            continue
         if set(fields) - {
             "Types",
             "URIs",
@@ -69,6 +79,9 @@ def validate_ubuntu_source(text: str) -> None:
                 or parsed.fragment
             ):
                 raise ValueError("Nonofficial Ubuntu source")
+        validated += 1
+    if not validated:
+        raise ValueError("Missing Ubuntu source")
 
 
 def check_output_budget(directory: Path) -> None:

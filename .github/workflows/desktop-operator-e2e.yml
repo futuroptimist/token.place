@@ -22,6 +22,13 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'desktop-tauri/scripts/test_windows_installer_coexistence.py'
+      - 'desktop-tauri/scripts/windows_installer_ui.py'
+      - 'desktop-tauri/src-tauri/build.rs'
+      - 'desktop-tauri/src-tauri/Cargo.toml'
+      - 'tests/unit/test_desktop_release_artifacts.py'
+      - 'tests/unit/test_windows_installer_refusal.py'
+      - 'desktop-tauri/src-tauri/installers/**'
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
       - 'scripts/long_context_benchmark.py'
@@ -48,6 +55,13 @@ on:
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'desktop-tauri/scripts/test_windows_installer_coexistence.py'
+      - 'desktop-tauri/scripts/windows_installer_ui.py'
+      - 'desktop-tauri/src-tauri/build.rs'
+      - 'desktop-tauri/src-tauri/Cargo.toml'
+      - 'tests/unit/test_desktop_release_artifacts.py'
+      - 'tests/unit/test_windows_installer_refusal.py'
+      - 'desktop-tauri/src-tauri/installers/**'
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
       - 'scripts/long_context_benchmark.py'
@@ -184,7 +198,9 @@ jobs:
 
   desktop-operator-packaged-e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 40
+    # Packaging plus the full installer matrix consumed 73 minutes in run 39893766232.
+    # Keep time for parity/CUDA checks without reducing scenarios or assertions.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -200,6 +216,9 @@ jobs:
 
       - name: Run long-context benchmark harness unit contracts
         run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py
+
+      - name: Run Windows installer refusal unit contracts
+        run: python -m pytest -q -p no:cacheprovider tests/unit/test_windows_installer_refusal.py
 
       - name: Smoke test long-context benchmark matrix plan
         run: python scripts/long_context_benchmark.py matrix-plan
@@ -260,9 +279,19 @@ jobs:
         working-directory: desktop-tauri
         run: npm run build
 
-      - name: Build current-head Windows NSIS release package
+      - name: Build current-head Windows NSIS and MSI release packages
         working-directory: desktop-tauri
-        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis,msi
+
+      - name: Test native ownership policy with disposable paths
+        shell: pwsh
+        run: |
+          cmake -S desktop-tauri/src-tauri/installers -B "${{ runner.temp }}/ownership-tests" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "${{ runner.temp }}/ownership-tests" --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir "${{ runner.temp }}/ownership-tests" -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Hosted Windows is driverless, so the cu124 runtime cannot import without
       # nvcuda.dll. Issue #1555 reserves native GPU proof for a GPU runner.
@@ -284,6 +313,54 @@ jobs:
             --expected-version $version `
             --expected-build-id $buildId `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate same-format upgrades and cross-format refusals
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content 'desktop-tauri/package.json' -Raw | ConvertFrom-Json).version
+          $buildId = (git rev-parse --short=12 HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $releases = gh release list --repo futuroptimist/token.place --limit 100 --json tagName,isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $previous = @($releases | Where-Object {
+            -not $_.isDraft -and -not $_.isPrerelease -and
+            $_.tagName -match '^desktop-v[0-9]+\.[0-9]+\.[0-9]+$' -and
+            [version]($_.tagName -replace '^desktop-v', '') -lt [version]$version
+          } | Sort-Object { [version]($_.tagName -replace '^desktop-v', '') } -Descending)[0]
+          if (-not $previous) { throw 'No stable predecessor desktop release found.' }
+          $previousVersion = $previous.tagName -replace '^desktop-v', ''
+          $previousDir = Join-Path $env:RUNNER_TEMP 'token-place-previous-installers'
+          New-Item -ItemType Directory -Path $previousDir | Out-Null
+          gh release download $previous.tagName --repo futuroptimist/token.place --dir $previousDir --pattern "*$previousVersion*.msi" --pattern "*$previousVersion*-setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bundle = 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $nsis = @(Get-ChildItem "$bundle/nsis" -Filter '*-setup.exe' -File)
+          $msi = @(Get-ChildItem "$bundle/msi" -Filter '*.msi' -File)
+          $oldNsis = @(Get-ChildItem $previousDir -Filter '*-setup.exe' -File)
+          $oldMsi = @(Get-ChildItem $previousDir -Filter '*.msi' -File)
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1 -or $oldNsis.Count -ne 1 -or $oldMsi.Count -ne 1) { throw 'Expected exactly one installer of each kind/version.' }
+          $failed = @()
+          # Each invocation checks initial cleanup convergence before installing.
+          # Preserve both directions' evidence even when the first fails closed.
+          foreach ($scenario in @('upgrade-nsis-to-nsis', 'refuse-unsafe-msi-predecessor', 'cross-nsis-to-msi', 'cross-msi-to-nsis')) {
+            python desktop-tauri/scripts/test_windows_installer_identity.py `
+              --windows-nsis $nsis[0].FullName --windows-msi $msi[0].FullName `
+              --previous-windows-nsis $oldNsis[0].FullName --previous-windows-msi $oldMsi[0].FullName `
+              --previous-version $previousVersion --expected-version $version `
+              --expected-build-id $buildId --scenario $scenario `
+              --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
+            if ($LASTEXITCODE -ne 0) { $failed += $scenario }
+          }
+          if ($failed.Count) { throw "Installer transition checks failed: $($failed -join ', ')" }
+          python desktop-tauri/scripts/test_windows_installer_coexistence.py `
+            --nsis $nsis[0].FullName --msi $msi[0].FullName `
+            --old-nsis $oldNsis[0].FullName --old-msi $oldMsi[0].FullName `
+            --old-version $previousVersion --version $version --build-id $buildId `
+            --process-fixture "${{ runner.temp }}/ownership-tests/Release/process-fixture.exe" `
+            --artifacts "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run shared desktop parity checks (Windows)
@@ -309,8 +386,8 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
-      - name: Upload current-package validation logs on failure
-        if: failure()
+      - name: Upload current-package validation and preservation evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: desktop-current-package-validation-windows

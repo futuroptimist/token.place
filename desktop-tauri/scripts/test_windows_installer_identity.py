@@ -112,6 +112,7 @@ class Scenario:
     name: str
     current: Installer
     previous: Installer | None = None
+    refusal_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,7 +185,7 @@ class InstallerIdentityError(AssertionError):
 
 
 def _run(
-    cmd: list[str],
+    cmd: list[str] | str,
     *,
     env: dict[str, str] | None = None,
     timeout: int = 180,
@@ -192,10 +193,21 @@ def _run(
     log_path: Path | None = None,
     separate_stderr: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    # Windows PowerShell otherwise serializes redirected output using the OEM
+    # code page, replacing non-ACP paths with '?'. Preserve authority paths all
+    # the way from registry/shortcut JSON through cleanup command construction.
+    label = cmd if isinstance(cmd, str) else cmd[0]
+    encoding = None
+    if isinstance(cmd, list) and cmd[0].replace("\\", "/").rsplit("/", 1)[-1].lower() in ("powershell.exe", "powershell", "pwsh.exe", "pwsh") and "-Command" in cmd:
+        cmd = list(cmd)
+        script_index = cmd.index("-Command") + 1
+        cmd[script_index] = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " + cmd[script_index]
+        encoding = "utf-8"
     result = subprocess.run(
         cmd,
         check=False,
         text=True,
+        encoding=encoding,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
         env=env,
@@ -207,12 +219,12 @@ def _run(
             output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
         else:
             output = result.stdout
-        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{output}", encoding="utf-8")
+        log_path.write_text(f"$ {label}\nexit={result.returncode}\n{output}", encoding="utf-8")
     if check and result.returncode != 0:
         diagnostic = result.stdout
         if separate_stderr and result.stderr:
             diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{diagnostic[-4000:]}")
+        raise InstallerIdentityError(f"command failed ({label}): exit={result.returncode}\n{diagnostic[-4000:]}")
     return result
 
 
@@ -240,7 +252,7 @@ def build_scenarios(current_nsis: Path, current_msi: Path, previous_nsis: Path, 
         Scenario(f"clean-nsis-{expected_version}", current_n),
         Scenario(f"clean-msi-{expected_version}", current_m),
         Scenario("upgrade-nsis-to-nsis", current_n, previous_n),
-        Scenario("upgrade-msi-to-msi", current_m, previous_m),
+        Scenario("refuse-unsafe-msi-predecessor", current_m, previous_m, "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:"),
         Scenario("cross-nsis-to-msi", current_m, previous_n),
         Scenario("cross-msi-to-nsis", current_n, previous_m),
     ]
@@ -548,6 +560,26 @@ def resolve_authoritative_shortcut(rejected_version: str | None = None) -> Short
     return next(shortcut for shortcut in inventory.shortcuts if str(shortcut.target).lower() == str(target).lower())
 
 
+def verify_installed_authority(installer: Installer, install_root: Path, rejected_version: str | None = None) -> Shortcut:
+    """Reject remembered destinations and overlapping installer ownership."""
+    shortcut = resolve_authoritative_shortcut(rejected_version)
+    expected = install_root / "app"
+    if expected.resolve() != expected or _canonical_path(shortcut.target.resolve().parent) != _canonical_path(expected):
+        raise InstallerIdentityError(
+            f"installed executable escaped scenario destination: expected {expected}, "
+            f"found {shortcut.target.resolve()}"
+        )
+    entries = inventory_registry_entries()
+    if len(entries) != 1:
+        raise InstallerIdentityError(
+            f"expected one authoritative installer registration, found {len(entries)}; "
+            "coincident executable paths do not establish exclusive installer ownership"
+        )
+    if entries[0].windows_installer != (installer.kind == "msi"):
+        raise InstallerIdentityError("authoritative installer registration has the wrong installer kind")
+    return shortcut
+
+
 def app_config_dir() -> Path:
     return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / TAURI_IDENTIFIER
 
@@ -615,9 +647,98 @@ def cleanup_install_directory(root: Path) -> None:
         shutil.rmtree(root)
 
 
+def msi_location_searches(installer: Installer) -> list[dict]:
+    """Read the package's actual INSTALLDIR registry searches without installing it."""
+    package = str(installer.path.resolve()).replace("'", "''")
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$database = $installer.OpenDatabase('__PACKAGE__', 0)
+$guardView = $database.OpenView("SELECT ``Action``, ``Target`` FROM ``CustomAction``")
+$guardView.Execute()
+$guards = @{}
+while ($guard = $guardView.Fetch()) { $guards[$guard.StringData(1)] = $guard.StringData(2) }
+if ($guards['TokenPlaceResolve'] -eq 'TokenPlaceResolve' -and $guards['TokenPlaceVerify'] -eq 'TokenPlaceVerify') {
+  # The guarded package deliberately has no INSTALLDIR AppSearch. Do not erase
+  # another format's remembered metadata to make this package pass.
+  '{"ownershipPreflight":true,"rows":[]}'
+  exit 0
+}
+$query = @'
+SELECT `RegLocator`.`Root`, `RegLocator`.`Key`, `RegLocator`.`Name`, `RegLocator`.`Type` FROM `AppSearch`, `RegLocator` WHERE `AppSearch`.`Property` = 'INSTALLDIR' AND `AppSearch`.`Signature_` = `RegLocator`.`Signature_`
+'@
+$view = $database.OpenView($query)
+$view.Execute()
+$items = @()
+while ($record = $view.Fetch()) {
+  $items += [pscustomobject]@{ Root = $record.IntegerData(1); Key = $record.StringData(2); Name = $record.StringData(3); Type = $record.IntegerData(4) }
+}
+ConvertTo-Json -InputObject @($items) -Compress
+'''.replace("__PACKAGE__", package)
+    result = _run([_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout=60)
+    rows = json.loads(result.stdout)
+    if rows == {"ownershipPreflight": True, "rows": []}:
+        return []
+    if not isinstance(rows, list) or not rows:
+        raise InstallerIdentityError("MSI has no supported INSTALLDIR registry searches")
+    return rows
+
+
+def reset_msi_remembered_locations(installer: Installer, log_path: Path | None = None) -> None:
+    """Isolate fresh scenarios, never the previous/current halves of an upgrade.
+
+    Tauri's AppSearch can override a command-line INSTALLDIR with an NSIS path
+    retained after uninstall. Delete only the two location values searched by
+    this MSI, and only when they point into an owned harness scenario directory.
+    """
+    import winreg
+
+    pending = []
+    for row in msi_location_searches(installer):
+        key = str(row.get("Key", "")).replace("\\\\", "\\")
+        name = row.get("Name") or ""
+        locator_type = row.get("Type")
+        if (row.get("Root") != 1 or not key.casefold().startswith("software\\")
+                or not key.casefold().endswith("\\token.place desktop")
+                or name not in ("", "InstallDir") or locator_type not in (2, 18)):
+            raise InstallerIdentityError("refusing unsupported MSI remembered-location search")
+        view = winreg.KEY_WOW64_64KEY if locator_type & 16 else winreg.KEY_WOW64_32KEY
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_READ | view) as handle:
+                value, value_type = winreg.QueryValueEx(handle, name)
+        except FileNotFoundError:
+            continue
+        path = Path(value) if isinstance(value, str) else Path()
+        if (value_type != winreg.REG_SZ or not path.is_absolute()
+                or path.name.casefold() != "app"
+                or not path.parent.name.startswith("scenario-")
+                or path.parent.parent != durable_install_parent()
+                or path.resolve() != path):
+            raise InstallerIdentityError("refusing to clear a remembered MSI destination outside owned test scenarios")
+        pending.append({"key": key, "name": name, "view": view, "value": value})
+    # Preserve old values before any mutation. Validate every candidate first,
+    # so an unrelated destination cannot cause a partial reset.
+    if log_path:
+        log_path.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+    for item in pending:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, item["key"], 0, winreg.KEY_READ | winreg.KEY_SET_VALUE | item["view"]) as handle:
+            if winreg.QueryValueEx(handle, item["name"]) != (item["value"], winreg.REG_SZ):
+                raise InstallerIdentityError("remembered MSI destination changed during scenario reset")
+            winreg.DeleteValue(handle, item["name"])
+
+
 def install(installer: Installer, log_path: Path | None = None, *, install_root: Path) -> subprocess.CompletedProcess[str]:
     if installer.kind == "msi":
-        return _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart"], timeout=300, check=False, log_path=log_path)
+        with tempfile.TemporaryDirectory(prefix="token-place-msi-diagnostic-") as temporary:
+            native_log = log_path.with_suffix(".msi.log") if log_path else Path(temporary) / "installer.log"
+            result = _run([_msiexec(), "/i", str(installer.path), "/qn", "/norestart", f"INSTALLDIR={install_root / 'app'}", "/L*V", str(native_log)], timeout=300, check=False, log_path=log_path)
+            if result.returncode and native_log.is_file():
+                diagnostic = msi_rejection_diagnostic(native_log.read_bytes())
+                result.stdout += diagnostic
+                if log_path and diagnostic:
+                    with log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(diagnostic)
+            return result
     # NSIS remembers /D even after uninstall. Static payload validation uses a
     # temporary extraction directory, so never inherit its remembered path.
     return _run([str(installer.path), "/S", f"/D={install_root / 'app'}"], timeout=300, check=False, log_path=log_path)
@@ -1420,9 +1541,39 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 
+def msi_rejection_diagnostic(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16", errors="replace")
+    elif b"\x00" in data[:100]:
+        text = data.decode("utf-16-le", errors="replace")
+    else:
+        text = data.decode("utf-8", errors="replace")
+    lines = [line[:1024] for line in text.splitlines() if any(marker in line for marker in
+        ("TOKEN_PLACE_COMPETING_INSTALLER:", "TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR:", "TOKEN_PLACE_APP_RUNNING:"))]
+    return "\n" + "\n".join(lines[-4:]) if lines else ""
+
+
+def capture_rejection_preservation(authority: AuthoritySnapshot, config_path: Path, model_path: Path) -> dict[str, str]:
+    if len(authority.canonical_targets) != 1:
+        raise InstallerIdentityError("cannot snapshot an ambiguous installation before cross-format refusal")
+    roots = {"installed": authority.canonical_targets[0].parent, "settings": config_path.parent, "models": model_path.parent}
+    snapshot = {}
+    for label, root in roots.items():
+        if not root.is_dir():
+            raise InstallerIdentityError(f"cross-format preservation root is missing: {label}")
+        for path in sorted(root.rglob("*")):
+            key = f"{label}/{path.relative_to(root).as_posix()}"
+            if path.is_file():
+                stat = path.stat()
+                snapshot[key] = f"{stat.st_size}:{stat.st_mtime_ns}:{_sha256_file(path)}"
+            elif path.is_dir():
+                snapshot[key] = "directory"
+    return snapshot
+
+
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
     text = result.stdout.lower()
-    return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
+    return result.returncode != 0 and "token_place_competing_installer:" in text and "uninstall the existing version first" in text and "token.place" in text
 
 
 def run_scenario(
@@ -1435,32 +1586,54 @@ def run_scenario(
     uninstall_best_effort()
     config_path: Path | None = None
     seeded = seeded_config_values()
+    is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
+    refusal_marker = scenario.refusal_marker or ("TOKEN_PLACE_COMPETING_INSTALLER:" if is_cross_kind else None)
+    expects_refusal = refusal_marker is not None
     with tempfile.TemporaryDirectory(prefix=f"token-place-{scenario.name}-") as tmp:
         root = Path(tmp)
+        model_path = root / "external-models" / "preserve.gguf"
+        if expects_refusal:
+            model_path.parent.mkdir()
+            model_path.write_bytes(b"GGUF preservation fixture; never loaded for inference\n")
+            seeded["model_path"] = str(model_path)
         sentinel_log = root / "sentinel.log"
         env = _safe_env(_sentinel_dir(root), sentinel_log)
         install_root = create_install_directory()
         try:
             print(f"{scenario.name}: test installation directory {install_root}", flush=True)
+            msi = next((item for item in (scenario.previous, scenario.current) if item and item.kind == "msi"), None)
+            if msi:
+                reset_msi_remembered_locations(msi, artifact_dir.path(scenario.name, "remembered-msi-locations") if artifact_dir else None)
             if scenario.previous is not None:
                 previous = install(scenario.previous, artifact_dir.path(scenario.name, "install-previous") if artifact_dir else None, install_root=install_root)
                 if previous.returncode != 0:
                     raise InstallerIdentityError(f"previous installer failed before upgrade: {previous.stdout[-1000:]}")
+                verify_installed_authority(scenario.previous, install_root)
                 config_path = seed_config(seeded)
-            is_cross_kind = scenario.previous is not None and scenario.previous.kind != scenario.current.kind
-            authority_before = capture_authority_snapshot() if is_cross_kind else None
+            authority_before = capture_authority_snapshot() if expects_refusal else None
+            preserved_before = capture_rejection_preservation(authority_before, config_path, model_path) if expects_refusal else None
+            if expects_refusal and artifact_dir:
+                artifact_dir.path(scenario.name, "preservation-before").with_suffix(".json").write_text(json.dumps(preserved_before, indent=2), encoding="utf-8")
             current = install(scenario.current, artifact_dir.path(scenario.name, "install-current") if artifact_dir else None, install_root=install_root)
             if current.returncode != 0:
-                if is_cross_kind and is_actionable_competing_installer_rejection(current):
+                if expects_refusal and refusal_marker in current.stdout and "uninstall the existing version first" in current.stdout.lower():
                     authority_after = capture_authority_snapshot()
                     verify_authority_unchanged(authority_before, authority_after)
+                    preserved_after = capture_rejection_preservation(authority_after, config_path, model_path)
+                    if artifact_dir:
+                        artifact_dir.path(scenario.name, "preservation-after").with_suffix(".json").write_text(json.dumps(preserved_after, indent=2), encoding="utf-8")
+                    if preserved_before != preserved_after:
+                        raise InstallerIdentityError("installer refusal changed installed files, settings or models")
+                    verify_config_preserved(config_path, seeded)
                     _terminate_processes()
                     uninstall_best_effort(artifact_dir.path(scenario.name, "uninstall-after-rejection") if artifact_dir else None)
                     verify_no_authority_remains()
                     return
                 raise InstallerIdentityError(f"current installer failed: {current.stdout[-1000:]}")
+            if expects_refusal:
+                raise InstallerIdentityError("cross-format installer must refuse the existing competing installation" if is_cross_kind else "installer must refuse the unverified existing MSI predecessor")
             _terminate_processes()
-            shortcut = resolve_authoritative_shortcut(scenario.previous.version if scenario.previous else None)
+            shortcut = verify_installed_authority(scenario.current, install_root, rejected_version=scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)
             probe_identity(shortcut.target, env, scenario.current.version, expected_build_id)
             record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
@@ -1523,6 +1696,7 @@ def main() -> int:
         default=None,
         help="Run the hosted-Windows PR gate against exactly one current-head NSIS package.",
     )
+    parser.add_argument("--scenario", choices=("upgrade-nsis-to-nsis", "refuse-unsafe-msi-predecessor", "cross-nsis-to-msi", "cross-msi-to-nsis"), help="Run one upgrade/refusal scenario independently, retaining its failure diagnostics.")
     parser.add_argument("--windows-nsis", type=Path)
     parser.add_argument("--windows-msi", type=Path)
     parser.add_argument("--previous-windows-nsis", type=Path)
@@ -1545,7 +1719,7 @@ def main() -> int:
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
     if args.pr_current_windows_nsis is not None:
-        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
+        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version, args.scenario)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
         if args.tokenizer_boundary_model is not None and not args.tokenizer_boundary_model.is_file():
             raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
@@ -1572,6 +1746,8 @@ def main() -> int:
     previous_version = args.previous_version or immediate_prior_version(args.expected_version)
     validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
     scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)
+    if args.scenario:
+        scenarios = [scenario for scenario in scenarios if scenario.name == args.scenario]
     if sys.platform != "win32":
         print("validated Windows installer scenario contract; real installs run only on hosted Windows")
         return 0

@@ -41,7 +41,9 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libgomp1"]
+        "depends": [
+          "libgomp1"
+        ]
       }
     },
     "icon": [
@@ -50,6 +52,14 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "template": "installers/windows.nsi"
+      },
+      "wix": {
+        "template": "installers/windows.wxs"
+      }
+    }
   }
 }

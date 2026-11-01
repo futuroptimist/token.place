@@ -146,7 +146,16 @@ model; neither may turn the consolidated CI green.
 Keep the script itself as the local/full-suite entrypoint.
 
 Remove the PR Linux job only after owners migrate required contexts to the surviving
-check and verify historical consumers. Preserve Metal detection/bootstrap in
+check and verify historical consumers. In the same implementation PR, migrate
+[tests/unit/test_workflow_ci_sentinel.py](../../tests/unit/test_workflow_ci_sentinel.py):
+its dedicated-workflow helpers, `linux-run-all-tests` identity/name, direct
+`./run_all_tests.sh` invocation, required PR triggers, coverage, model provisioning
+and failure-log assertions must follow the surviving execution owner. Preserve
+their behavioral guarantees rather than deleting assertions to make CI green;
+retain the Metal-specific contracts against their existing workflow. Run
+`python -m pytest -q tests/unit/test_workflow_ci_sentinel.py` before and after
+consolidation, alongside the full suite and intentional failure cases.
+Preserve Metal detection/bootstrap in
 `run-all-tests-pr.yml`; preserve manual full-suite access through an explicitly
 reviewed replacement trigger or retain its Linux job for manual runs only. A
 reusable workflow called twice is not deduplication. Do not create an always-green

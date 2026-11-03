@@ -326,6 +326,7 @@ just app-deploy app=tokenplace env=staging tag=main-REPLACE_SHORTSHA
 
 > Canonical migration plan: [docs/roadmap/desktop_compute_node_migration.md](docs/roadmap/desktop_compute_node_migration.md).
 
+- [ ] [K-392: CI runtime optimization design](docs/design/ci-runtime-optimization.md)
 - [ ] [K-376: local compute-node safety screening](docs/design/local-compute-safety.md)
   - Staged design for local pre-inference checks, encrypted refusals, evaluation,
     and deferred cooldown/report controls; no runtime enforcement implemented.

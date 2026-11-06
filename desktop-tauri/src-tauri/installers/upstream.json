@@ -1,0 +1,8 @@
+{
+  "tauriCliVersion": "2.10.1",
+  "commit": "9b17a7aeae9a83222ffe829aa4e2d8a5ba6bed8c",
+  "templates": {
+    "windows.nsi": "fe22026f68bdb3292fab376756035496ce0a35e3d580e06ebaa6a28295916eb3",
+    "windows.wxs": "57741539ea0f67eafd86c7d50247f79c0da1ec2e094bad0e8bf0f27ae8990402"
+  }
+}

@@ -236,7 +236,7 @@ def _sanitize_process_output(text: str, artifact: Path, dest: Path) -> str:
     return sanitized[-1200:]
 
 
-def _run_native_materializer(cmd: list[str], artifact: Path, dest: Path, *, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+def _run_native_materializer(cmd: list[str] | str, artifact: Path, dest: Path, *, timeout: int = 240) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             cmd,
@@ -263,7 +263,13 @@ def _cleanup_nsis_install(root: Path) -> None:
         return
     artifact = uninstallers[0]
     try:
-        _run_native_materializer([str(artifact.resolve()), '/S'], artifact, root, timeout=120)
+        # NSIS otherwise starts a detached temporary copy, so subprocess.run can
+        # return before shortcut cleanup. Keep the extraction tree alive until
+        # the real uninstaller finishes. NSIS requires an unquoted final _?=
+        # suffix even for paths containing spaces (Docs/Chapter3.html#installerusage).
+        command = subprocess.list2cmdline([str(artifact.resolve()), '/S'])
+        command += f' _?={root.resolve()}'
+        _run_native_materializer(command, artifact, root, timeout=120)
     except ValidationError as exc:
         raise ValidationError(f'failed to clean NSIS install for {root.name}: {exc}') from exc
 

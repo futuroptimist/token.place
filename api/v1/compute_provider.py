@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import json
+import ipaddress
 import os
 import time
 import uuid
@@ -67,9 +69,19 @@ def _coerce_admitted_ttl(value: object) -> float:
 class DistributedTargetSelection:
     """Resolved distributed relay target and diagnostics for provider logs."""
 
-    url: str
-    source: str
+    url: str = ""
+    source: str = "unset"
     relay_only: bool = False
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    """One server-owned policy snapshot, resolved after request validation."""
+
+    mode: str
+    target: DistributedTargetSelection = DistributedTargetSelection()
+    profile: str = "local"
+    fallback: bool = False
 
 
 class ComputeProviderError(Exception):
@@ -244,6 +256,22 @@ class DistributedApiV1ComputeProvider:
 
     base_url: str
     timeout_seconds: float = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
+    destination_profile: str = "general"
+
+    def _request(self, method: str, url: str, **kwargs):
+        """Keep strict LAN hops on the selected URL, without ambient proxies.
+
+        This is a client configuration boundary, not DNS or compute-node isolation.
+        General distributed federation retains its existing HTTP behavior.
+        """
+        if self.destination_profile != "trusted_lan":
+            return getattr(requests, method)(url, **kwargs)
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.request(method, url, allow_redirects=False, **kwargs)
+        if 300 <= response.status_code < 400:
+            raise _routing_configuration_error()
+        return response
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -276,7 +304,8 @@ class DistributedApiV1ComputeProvider:
 
         def _cancel_relay_request(status: str = "cancelled", reason: str = "requester_gave_up") -> None:
             try:
-                requests.post(
+                self._request(
+                    "post",
                     self._relay_url("/api/v1/relay/requests/cancel"),
                     json={
                         "client_public_key": crypto_manager.public_key_b64,
@@ -287,12 +316,8 @@ class DistributedApiV1ComputeProvider:
                     },
                     timeout=1.0,
                 )
-            except requests.RequestException:
-                logger.debug(
-                    "api_v1.compute_provider.cancel_failed request_id=%s status=%s",
-                    relay_request_id,
-                    status,
-                )
+            except (requests.RequestException, ComputeProviderError):
+                logger.debug("api_v1.compute_provider.cancel_failed code=compute_provider_error")
 
         def _cancel_relay_request_once(status: str, reason: str) -> None:
             nonlocal relay_cancel_attempted
@@ -315,7 +340,8 @@ class DistributedApiV1ComputeProvider:
                 _cancel_relay_request_once(status="expired", reason="provider_timeout")
 
         try:
-            next_server_response = requests.get(
+            next_server_response = self._request(
+                "get",
                 self._relay_url("/api/v1/relay/servers/next"),
                 params={
                     "model": model_id or CANONICAL_LAUNCH_MODEL_ID,
@@ -416,7 +442,8 @@ class DistributedApiV1ComputeProvider:
         }
 
         try:
-            faucet_response = requests.post(
+            faucet_response = self._request(
+                "post",
                 self._relay_url("/api/v1/relay/requests"),
                 json=faucet_payload,
                 timeout=_remaining_timeout(),
@@ -471,7 +498,8 @@ class DistributedApiV1ComputeProvider:
                 raise
 
             try:
-                retrieve_response = requests.post(
+                retrieve_response = self._request(
+                    "post",
                     self._relay_url("/api/v1/relay/responses/retrieve"),
                     json={
                         "client_public_key": crypto_manager.public_key_b64,
@@ -614,7 +642,7 @@ class FallbackApiV1ComputeProvider:
             )
             return coerce_completion_result(message)
         except ComputeProviderError as exc:
-            logger.warning("distributed compute fallback triggered: %s", exc)
+            logger.warning("api_v1.compute_provider.fallback code=%s", safe_provider_error_code(exc.code))
             message = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
@@ -637,12 +665,23 @@ def _validated_target_url(value: str | None, *, source: str) -> str:
     if not target:
         return ""
 
-    parsed = urlparse(target)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ComputeProviderError(
-            f"Invalid distributed relay target from {source}: target must be an "
-            "absolute HTTP(S) URL."
+    try:
+        parsed = urlparse(target)
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.port != 0
+            and not any(char.isspace() or ord(char) < 32 for char in target)
         )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise _routing_configuration_error()
+
     return target
 
 
@@ -659,13 +698,13 @@ def _config_value(key: str) -> str:
         from config import get_config
 
         value = get_config().get(key, "")
-    except Exception as exc:  # pragma: no cover - defensive against early bootstrap cycles
-        logger.debug("api_v1.compute_provider.config_read_failed key=%s", key, exc_info=exc)
+    except Exception:  # pragma: no cover - defensive against early bootstrap cycles
+        logger.debug("api_v1.compute_provider.config_read_failed")
         return ""
     return value if isinstance(value, str) else ""
 
 
-def _select_distributed_target() -> DistributedTargetSelection:
+def _select_distributed_target(*, allow_production_default: bool = True) -> DistributedTargetSelection:
     """Resolve the distributed API v1 relay target with explicit staging-safe precedence.
 
     Precedence:
@@ -729,7 +768,7 @@ def _select_distributed_target() -> DistributedTargetSelection:
             relay_only=False,
         )
 
-    if env_name == "production":
+    if allow_production_default and env_name == "production":
         return DistributedTargetSelection(
             url=_DEFAULT_PRODUCTION_RELAY_URL,
             source="production_default",
@@ -739,68 +778,130 @@ def _select_distributed_target() -> DistributedTargetSelection:
     return DistributedTargetSelection(url="", source="unset", relay_only=False)
 
 
-def _select_implicit_relay_public_target() -> DistributedTargetSelection:
-    """Resolve only public relay URLs eligible for implicit relay-only selection."""
+def _routing_configuration_error(
+    code: str = "distributed_target_configuration_error",
+) -> ComputeProviderError:
+    return ComputeProviderError(
+        "Invalid API v1 routing configuration.",
+        code=code,
+        error_type="service_unavailable_error",
+        public_message="The service's compute routing configuration is invalid.",
+        status_code=503,
+    )
 
-    for env_name in _RELAY_PUBLIC_URL_ENVS:
-        target = _validated_target_url(
-            os.environ.get(env_name),
-            source=f"env:{env_name}",
+
+def safe_provider_error_code(code: str) -> str:
+    """Never include an upstream or exception-controlled string in diagnostics."""
+    allowed = set(_RELAY_ERROR_MAP) | {
+        "distributed_routing_disabled", "explicit_distributed_mode_required",
+        "invalid_compute_provider_configuration", "distributed_target_configuration_error",
+        "untrusted_relay_origin", "compute_provider_error",
+    }
+    return code if code in allowed else "compute_provider_error"
+
+
+def _configured_mode() -> str:
+    mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip().lower()
+    if mode not in {"", "local", "distributed"}:
+        raise _routing_configuration_error("invalid_compute_provider_configuration")
+    return mode
+
+
+def _require_distributed_mode(mode: str) -> None:
+    if mode == "distributed":
+        return
+    explicit_local = mode == "local"
+    message = (
+        "Distributed execution is disabled for this service."
+        if explicit_local else
+        "This bridge requires an explicitly configured distributed service."
+    )
+    raise ComputeProviderError(
+        message,
+        code="distributed_routing_disabled" if explicit_local else "explicit_distributed_mode_required",
+        error_type="invalid_request_error",
+        public_message=message,
+        status_code=400,
+    )
+
+
+def _validate_lan_target(target: DistributedTargetSelection) -> None:
+    """Require exact operator enumeration; never infer authority from DNS or Host.
+
+    Named destinations are operator assertions about topology. Public IP literals
+    and public/default selection sources cannot qualify for this profile.
+    """
+    try:
+        values = json.loads(os.environ.get("TOKENPLACE_API_V1_TRUSTED_LAN_TARGETS", "[]"))
+        if not isinstance(values, list) or not values or not all(isinstance(v, str) for v in values):
+            raise ValueError
+        allowed = {_validated_target_url(value, source="lan_allowlist") for value in values}
+        if "" in allowed or len(allowed) != len(values):
+            raise ValueError
+        for value in allowed:
+            host = urlparse(value).hostname
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                continue  # Explicit hostname enumeration; no DNS security claim.
+            networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+            if not address.is_loopback and not any(address in ipaddress.ip_network(n) for n in networks):
+                raise ValueError
+        if target.url not in allowed or target.source.split(":", 1)[0] not in {
+            "explicit_env", "relay_internal_env", "config",
+        }:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise _routing_configuration_error() from None
+
+
+def resolve_api_v1_routing(*, bridge_intent: bool = False) -> RoutingDecision:
+    """Resolve mode before even reading distributed inputs, exactly once per request."""
+    mode = _configured_mode()
+    if bridge_intent:
+        _require_distributed_mode(mode)
+    if mode != "distributed":
+        return RoutingDecision(mode="local")
+
+    profile = os.environ.get("TOKENPLACE_API_V1_DESTINATION_PROFILE", "general").strip().lower()
+    if profile not in {"general", "bridge", "trusted_lan"}:
+        raise _routing_configuration_error()
+    if bridge_intent and profile == "general":
+        profile = "bridge"
+    fallback = profile == "general" and (
+        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    target = _select_distributed_target(allow_production_default=profile == "general")
+    if profile == "trusted_lan":
+        _validate_lan_target(target)
+    if not target.url and profile == "bridge":
+        raise ComputeProviderError(
+            "No trusted relay origin is configured for this request.",
+            code="untrusted_relay_origin",
+            error_type="invalid_request_error",
+            public_message="No trusted relay origin is configured for this request.",
+            status_code=400,
         )
-        if target:
-            return DistributedTargetSelection(
-                url=target,
-                source=f"relay_public_env:{env_name}",
-                relay_only=True,
-            )
-    return DistributedTargetSelection(url="", source="unset", relay_only=False)
+    if not target.url and not fallback:
+        raise _routing_configuration_error()
+    return RoutingDecision(mode="distributed", target=target, profile=profile, fallback=fallback)
 
 
 @lru_cache(maxsize=16)
-def _build_api_v1_compute_provider(
-    mode: str,
-    distributed_url: str,
-    distributed_fallback_enabled: bool,
-    target_source: str = "unknown",
-    relay_only: bool = False,
-) -> ApiV1ComputeProvider:
-    """Create a compute provider for the normalized environment inputs."""
-
-    local_provider = LocalApiV1ComputeProvider()
-
-    if mode != "distributed":
-        logger.info("api_v1.compute_provider.selected provider=local mode=%s", mode)
-        return local_provider
-
-    if not distributed_url:
-        if not distributed_fallback_enabled:
-            message = (
-                "TOKENPLACE_API_V1_COMPUTE_PROVIDER=distributed requires "
-                "TOKENPLACE_DISTRIBUTED_COMPUTE_URL or another explicit distributed "
-                "relay target outside production. Set one of "
-                f"{', '.join(_EXPLICIT_DISTRIBUTED_TARGET_ENVS)}, "
-                "TOKENPLACE_RELAY_INTERNAL_URL, or TOKENPLACE_RELAY_PUBLIC_URL."
-            )
-            logger.error(
-                "api_v1.compute_provider.target_unset mode=%s fallback_enabled=%s "
-                "target_source=%s relay_only=%s",
-                mode,
-                distributed_fallback_enabled,
-                target_source,
-                relay_only,
-            )
-            raise ComputeProviderError(message)
-        logger.warning(
-            "api_v1.compute_provider.target_unset mode=%s fallback_enabled=%s "
-            "target_source=%s relay_only=%s; using local fallback",
-            mode,
-            distributed_fallback_enabled,
-            target_source,
-            relay_only,
-        )
-        return local_provider
-
-    selected_target = distributed_url.rstrip("/")
+def _build_api_v1_compute_provider(decision: RoutingDecision) -> ApiV1ComputeProvider:
+    """Cache only distributed decisions, including source, profile and fallback."""
+    if decision.mode != "distributed":
+        raise _routing_configuration_error("invalid_compute_provider_configuration")
+    source_class = decision.target.source.split(":", 1)[0]
+    logger.info(
+        "api_v1.compute_provider.selected mode=distributed profile=%s target_source=%s",
+        decision.profile, source_class,
+    )
+    if not decision.target.url:
+        if decision.fallback:
+            return LocalApiV1ComputeProvider()
+        raise _routing_configuration_error()
     timeout_raw = os.environ.get(
         "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS",
         str(DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS),
@@ -810,91 +911,32 @@ def _build_api_v1_compute_provider(
     except (TypeError, ValueError):
         timeout_seconds = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
     distributed_provider = DistributedApiV1ComputeProvider(
-        base_url=selected_target,
+        base_url=decision.target.url,
         timeout_seconds=timeout_seconds,
+        destination_profile=decision.profile,
     )
-    if not distributed_fallback_enabled:
-        logger.info(
-            "api_v1.compute_provider.selected provider=distributed mode=%s "
-            "fallback_enabled=false target=%s target_source=%s relay_only=%s",
-            mode,
-            selected_target,
-            target_source,
-            relay_only,
-        )
+    if not decision.fallback:
         return distributed_provider
-
-    logger.info(
-        "api_v1.compute_provider.selected provider=distributed_with_local_fallback "
-        "mode=%s fallback_enabled=true target=%s target_source=%s relay_only=%s",
-        mode,
-        selected_target,
-        target_source,
-        relay_only,
-    )
-    return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=local_provider)
+    return FallbackApiV1ComputeProvider(primary=distributed_provider, fallback=LocalApiV1ComputeProvider())
 
 
-def get_api_v1_compute_provider() -> ApiV1ComputeProvider:
-    """Resolve the active provider based on environment configuration."""
-
-    mode, target_selection, distributed_fallback_enabled = _read_api_v1_provider_env()
-    return _build_api_v1_compute_provider(
-        mode,
-        target_selection.url,
-        distributed_fallback_enabled,
-        target_selection.source,
-        target_selection.relay_only,
-    )
-
-
-def is_api_v1_implicit_relay_only_selection(
-    target_selection: DistributedTargetSelection | None = None,
-) -> bool:
-    """Return True when env should implicitly select relay-only distributed mode.
-
-    Only public relay URLs are auto-selected. Internal loopback relay URLs may
-    point back at the same Gunicorn worker pool, so they require an explicit
-    provider mode to avoid blocking relay self-dispatch by default.
-    """
-
-    if os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip():
-        return False
-    selection = target_selection or _select_implicit_relay_public_target()
-    return bool(selection.url) and selection.relay_only and selection.source.startswith(
-        "relay_public_env:"
-    )
-
-
-def _read_api_v1_provider_env() -> tuple[str, DistributedTargetSelection, bool]:
-    """Read and normalize API v1 provider environment configuration.
-
-    Relay-only deployments publish the relay URL instead of a local model
-    runtime. Treat that as an explicit distributed API v1 target so public chat
-    requests do not fall through to the in-process llama.cpp loader. Local mode
-    remains the default when no relay-only target is configured.
-    """
-
-    configured_mode = os.environ.get("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "").strip().lower()
-    distributed_fallback_enabled = (
-        os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    )
-
-    implicit_relay_public_target = _select_implicit_relay_public_target()
-    if is_api_v1_implicit_relay_only_selection(implicit_relay_public_target):
-        return "distributed", implicit_relay_public_target, False
-
-    mode = configured_mode or "local"
-    target_selection = _select_distributed_target()
-
-    return mode, target_selection, distributed_fallback_enabled
+def get_api_v1_compute_provider(*, routing_decision: RoutingDecision | None = None) -> ApiV1ComputeProvider:
+    configured_mode = _configured_mode() if routing_decision is not None else None
+    decision = routing_decision if routing_decision is not None else resolve_api_v1_routing()
+    if decision.mode == "local":
+        # Deliberately outside the distributed provider cache, including on error paths.
+        return LocalApiV1ComputeProvider()
+    if routing_decision is not None:
+        # A retained decision cannot re-enable distributed execution after an
+        # operator switches to local. Recheck authority only, never destinations.
+        _require_distributed_mode(configured_mode)
+    return _build_api_v1_compute_provider(decision)
 
 
 def get_api_v1_distributed_target_selection() -> DistributedTargetSelection:
-    """Resolve the distributed API v1 relay target for route-level overrides."""
-
-    return _select_distributed_target()
+    """Internal caller entrypoint; an offered target cannot authorize distribution."""
+    _require_distributed_mode(_configured_mode())
+    return resolve_api_v1_routing().target
 
 
 def get_api_v1_compute_provider_for_mode(
@@ -904,29 +946,23 @@ def get_api_v1_compute_provider_for_mode(
     distributed_fallback_enabled: bool | None = None,
     distributed_target_selection: DistributedTargetSelection | None = None,
 ) -> ApiV1ComputeProvider:
-    """Resolve provider with an explicit mode override for request-scoped routing."""
-
-    normalized_mode = (mode or "local").strip().lower()
-    _, env_target_selection, fallback_enabled_from_env = _read_api_v1_provider_env()
-    if distributed_fallback_enabled is None:
-        distributed_fallback_enabled = fallback_enabled_from_env
-    if distributed_target_selection is not None:
-        target_selection = distributed_target_selection
-    elif distributed_url is not None:
-        target_selection = DistributedTargetSelection(
-            url=_normalise_target_url(distributed_url),
-            source="request_override",
-            relay_only=False,
-        )
-    else:
-        target_selection = env_target_selection
-    return _build_api_v1_compute_provider(
-        normalized_mode,
-        target_selection.url,
-        bool(distributed_fallback_enabled),
-        target_selection.source,
-        target_selection.relay_only,
-    )
+    """Compatibility helper may tighten policy, but cannot override mode or target."""
+    configured_mode = _configured_mode()
+    requested_mode = (mode or "local").strip().lower()
+    if requested_mode not in {"local", "distributed"}:
+        raise _routing_configuration_error("invalid_compute_provider_configuration")
+    if requested_mode == "local":
+        return LocalApiV1ComputeProvider()
+    _require_distributed_mode(configured_mode)
+    decision = resolve_api_v1_routing()
+    # Legacy internal callers may confirm a selected target, never replace it.
+    if distributed_url is not None and _normalise_target_url(distributed_url) != decision.target.url:
+        raise _routing_configuration_error()
+    if distributed_target_selection is not None and distributed_target_selection != decision.target:
+        raise _routing_configuration_error()
+    if distributed_fallback_enabled is False:
+        decision = RoutingDecision(decision.mode, decision.target, decision.profile, False)
+    return get_api_v1_compute_provider(routing_decision=decision)
 
 
 def get_api_v1_resolved_provider_path(provider: ApiV1ComputeProvider) -> str:

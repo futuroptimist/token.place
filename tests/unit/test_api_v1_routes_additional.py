@@ -208,7 +208,7 @@ def test_chat_completion_model_error_preserves_status_and_type(client, monkeypat
                 error_type="model_unavailable",
             )
 
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _Provider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _Provider())
 
     payload = {
         "model": "qwen3-8b-instruct",
@@ -243,7 +243,7 @@ def test_chat_completion_echoes_request_metadata(client, monkeypatch):
             assert model_id == 'qwen3-8b-instruct'
             return {'role': 'assistant', 'content': 'Mock reply'}
 
-    monkeypatch.setattr(routes, 'get_api_v1_compute_provider', lambda: _Provider())
+    monkeypatch.setattr(routes, 'get_api_v1_compute_provider', lambda **_kwargs: _Provider())
 
     response = client.post('/api/v1/chat/completions', json=payload)
     assert response.status_code == 200
@@ -267,7 +267,7 @@ def test_chat_completion_sets_provider_path_and_stream_mode_headers(client, monk
     monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "qwen3-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _DistributedProvider())
     monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
 
     backend_path_token = compute_provider._last_backend_path.set("unknown")
@@ -338,7 +338,7 @@ def test_chat_completion_encrypted_response_sets_provider_headers(client, monkey
     monkeypatch.setattr(routes, "get_models_info", lambda: [{"id": "qwen3-8b-instruct"}])
     monkeypatch.setattr(routes, "validate_model_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _DistributedProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _DistributedProvider())
     monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "distributed")
     monkeypatch.setattr(routes, "validate_encrypted_request", lambda _data: None)
     monkeypatch.setattr(
@@ -376,7 +376,7 @@ def test_legacy_completion_sets_provider_headers(client, monkeypatch):
     }
 
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _LocalProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _LocalProvider())
     monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "local")
 
     response = client.post("/api/v1/completions", json=payload)
@@ -402,7 +402,7 @@ def test_legacy_completion_rejects_streaming_for_api_v1(client, monkeypatch):
     }
 
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _GuardrailProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _GuardrailProvider())
 
     response = client.post("/api/v1/completions", json=payload)
 
@@ -429,7 +429,7 @@ def test_legacy_completion_encrypted_response_sets_provider_headers(client, monk
     }
 
     monkeypatch.setattr(routes, "evaluate_messages_for_policy", lambda _messages: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: _LocalProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: _LocalProvider())
     monkeypatch.setattr(routes, "get_api_v1_resolved_provider_path", lambda _provider: "local")
     monkeypatch.setattr(
         routes.encryption_manager,

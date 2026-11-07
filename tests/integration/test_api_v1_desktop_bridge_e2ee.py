@@ -21,7 +21,7 @@ import requests
 from werkzeug.serving import make_server
 
 import relay
-from api.v1 import compute_provider, routes
+from api.v1 import compute_provider
 from api.v1.encryption import EncryptionManager, encryption_manager
 from utils.crypto.crypto_manager import CryptoManager
 from utils.networking import relay_client as relay_client_module
@@ -115,9 +115,10 @@ def reset_relay_state(monkeypatch):
     relay.streaming_sessions.clear()
     relay.streaming_sessions_by_client.clear()
     compute_provider._build_api_v1_compute_provider.cache_clear()
-    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
     monkeypatch.delenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", raising=False)
-    monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DESTINATION_PROFILE", "bridge")
     monkeypatch.setenv("CONTENT_MODERATION_MODE", "off")
     yield
     relay._reset_api_v1_relay_state_store()
@@ -231,14 +232,8 @@ def test_api_v1_encrypted_desktop_bridge_round_trip(monkeypatch):
     monkeypatch.setattr(relay_client_module.requests, "post", guard_relay_client_post)
 
     with live_relay_server() as base_url:
-        monkeypatch.setattr(
-            routes,
-            "get_api_v1_compute_provider_for_mode",
-            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
-                base_url=base_url,
-                timeout_seconds=5,
-            ),
-        )
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", base_url)
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
 
         desktop_done = threading.Event()
         desktop_thread, model_manager = _start_fake_desktop_loop(base_url, desktop_done)
@@ -301,14 +296,8 @@ def test_api_v1_encrypted_desktop_bridge_three_sequential_turns_clear_queue(monk
     """One desktop node drains three sequential browser turns without stale queue depth."""
 
     with live_relay_server() as base_url:
-        monkeypatch.setattr(
-            routes,
-            "get_api_v1_compute_provider_for_mode",
-            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
-                base_url=base_url,
-                timeout_seconds=5,
-            ),
-        )
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", base_url)
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
 
         model_manager = FakeDesktopModelManager()
         desktop_client = RelayClient(
@@ -400,14 +389,8 @@ def test_api_v1_desktop_bridge_without_response_post_times_out_instead_of_passin
         )
         assert desktop_client.register_api_v1_compute_node(base_url)["next_ping_in_x_seconds"] > 0
 
-        monkeypatch.setattr(
-            routes,
-            "get_api_v1_compute_provider_for_mode",
-            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
-                base_url=base_url,
-                timeout_seconds=1,
-            ),
-        )
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", base_url)
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "1")
 
         browser_crypto = EncryptionManager()
         response = requests.post(
@@ -511,14 +494,8 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
         assert poll_heartbeat_call.kwargs == {}
         assert requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code == 200
 
-        monkeypatch.setattr(
-            routes,
-            "get_api_v1_compute_provider_for_mode",
-            lambda **_kwargs: compute_provider.DistributedApiV1ComputeProvider(
-                base_url=base_url,
-                timeout_seconds=5,
-            ),
-        )
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_RELAY_URL", base_url)
+        monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "5")
         browser_crypto = EncryptionManager()
         user_text = "ping after idle no-work"
         payload = {

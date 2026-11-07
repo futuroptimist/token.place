@@ -310,7 +310,9 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     monkeypatch, client
 ):
     _reset_api_v1_provider_state()
-    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DESTINATION_PROFILE", "bridge")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
     _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
@@ -323,14 +325,14 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
     fake_crypto = _FakeCryptoManager()
 
     def fake_get(url, timeout, params=None):
-        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        assert url == "http://127.0.0.1:5010/api/v1/relay/servers/next"
         return _FakeResponse(200, {"server_public_key": "server-public-key"})
 
     def fake_post(url, json, timeout):
-        if url == "https://staging.token.place/api/v1/relay/requests":
+        if url == "http://127.0.0.1:5010/api/v1/relay/requests":
             assert "messages" not in json
             return _FakeResponse(200, {"status": "queued"})
-        if url == "https://staging.token.place/api/v1/relay/responses/retrieve":
+        if url == "http://127.0.0.1:5010/api/v1/relay/responses/retrieve":
             encrypted = fake_crypto.encrypt_message(
                 {
                     "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -372,8 +374,12 @@ def test_relay_only_public_chat_uses_compute_node_without_local_llama(
 def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     monkeypatch, client
 ):
+    monkeypatch.setattr(compute_provider.DistributedApiV1ComputeProvider,
+                        "_build_request_crypto_manager", lambda _self: _FakeCryptoManager())
     _reset_api_v1_provider_state()
-    monkeypatch.delenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", raising=False)
+    monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DESTINATION_PROFILE", "bridge")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "0")
     _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv("TOKENPLACE_RELAY_INTERNAL_URL", "http://127.0.0.1:5010")
     monkeypatch.setenv("TOKENPLACE_RELAY_PUBLIC_URL", "https://staging.token.place")
@@ -384,7 +390,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     )
 
     def fake_no_node_get(url, timeout, params=None):
-        assert url == "https://staging.token.place/api/v1/relay/servers/next"
+        assert url == "http://127.0.0.1:5010/api/v1/relay/servers/next"
         return _FakeResponse(
             503,
             {
@@ -409,7 +415,7 @@ def test_relay_only_public_chat_without_compute_node_returns_relay_error(
     assert response.status_code == 503
     payload = response.get_json()
     assert payload["error"]["type"] == "service_unavailable_error"
-    assert payload["error"]["code"] == "no_compute_node_available"
+    assert payload["error"]["code"] == "no_registered_compute_nodes"
     assert "llama-cpp-python is not installed" not in payload["error"]["message"]
     assert response.headers["Access-Control-Allow-Origin"] == "*"
 
@@ -481,29 +487,25 @@ def test_explicit_local_public_chat_ignores_relay_public_url(monkeypatch, client
     }
 
 
-def test_compute_error_remap_fails_closed_when_implicit_relay_check_fails(
+def test_compute_error_does_not_resolve_routing_again(
     monkeypatch, client
 ):
     _reset_api_v1_provider_state()
 
     class FailingProvider:
         def complete_chat(self, *, model_id, messages, options=None):
+            monkeypatch.setattr(routes, "resolve_api_v1_routing", lambda **_kwargs: pytest.fail("routing resolved twice"))
             raise compute_provider.ComputeProviderError(
                 "No registered compute nodes",
                 code="no_registered_compute_nodes",
                 status_code=503,
             )
 
-    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda: FailingProvider())
+    monkeypatch.setattr(routes, "get_api_v1_compute_provider", lambda **_kwargs: FailingProvider())
     monkeypatch.setattr(
         routes,
         "get_api_v1_resolved_provider_path",
         lambda _provider: "distributed",
-    )
-    monkeypatch.setattr(
-        routes,
-        "is_api_v1_implicit_relay_only_selection",
-        lambda: (_ for _ in ()).throw(RuntimeError("predicate failed")),
     )
 
     response = client.post(

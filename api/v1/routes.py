@@ -14,8 +14,6 @@ import uuid
 import logging
 import os
 import math
-import ipaddress
-from urllib.parse import urlparse
 
 from api.v1.encryption import encryption_manager
 from api.security import ensure_operator_access
@@ -38,11 +36,9 @@ from api.v1.models import (
     get_model_instance as _get_model_instance,
 )
 from api.v1.compute_provider import (
-    DistributedTargetSelection,
     get_api_v1_compute_provider,
-    get_api_v1_compute_provider_for_mode,
-    get_api_v1_distributed_target_selection,
-    is_api_v1_implicit_relay_only_selection,
+    resolve_api_v1_routing,
+    safe_provider_error_code,
     get_api_v1_last_backend_path,
     get_api_v1_resolved_provider_path,
     reset_api_v1_generate_response_override,
@@ -121,119 +117,13 @@ def _format_model_error_response(exc: Exception):
         status_code=getattr(exc, "status_code", 400),
     )
 
-def _should_force_desktop_bridge_distributed(request_metadata, is_encrypted_request: bool) -> bool:
-    """Allow desktop-bridge distributed override only for explicit API v1 E2EE intent."""
-
-    if not isinstance(request_metadata, dict) or not is_encrypted_request:
-        return False
-    if request_metadata.get("inference_target") != "desktop_bridge_api_v1_e2ee":
-        return False
-    return request_metadata.get("relay_path") == "api_v1_e2ee"
-
-
-def _normalise_relay_origin(value: str) -> str:
-    """Return a normalized HTTP(S) origin, or an empty string for invalid input."""
-
-    candidate = (value or "").strip().rstrip("/")
-    if not candidate:
-        return ""
-
-    parsed = urlparse(candidate)
-    path = parsed.path.rstrip("/")
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or path not in {"", "/api/v1"}
-    ):
-        return ""
-
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        return ""
-
-    try:
-        port = parsed.port
-    except ValueError:
-        return ""
-
-    netloc = hostname
-    try:
-        if ipaddress.ip_address(hostname).version == 6:
-            netloc = f"[{hostname}]"
-    except ValueError:
-        pass
-
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    return f"{parsed.scheme.lower()}://{netloc}{path}"
-
-
-def _origin_host_is_loopback(origin: str) -> bool:
-    """Return True when an origin targets a loopback host."""
-
-    hostname = (urlparse(origin).hostname or "").lower()
-    if hostname == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        return False
-
-
-def _request_remote_addr_is_loopback() -> bool:
-    """Return True when the inbound Flask request came from loopback."""
-
-    remote_addr = request.remote_addr or ""
-    try:
-        return ipaddress.ip_address(remote_addr).is_loopback
-    except ValueError:
-        return False
-
-
-def _request_loopback_relay_origin() -> str:
-    """Return the request origin only when it is verified loopback-local."""
-
-    request_origin = _normalise_relay_origin(request.host_url)
-    if (
-        request_origin
-        and _origin_host_is_loopback(request_origin)
-        and _request_remote_addr_is_loopback()
-    ):
-        return request_origin
-    return ""
-
-
-def _request_relay_target_selection() -> DistributedTargetSelection:
-    """Return a trusted API v1 relay target selection for desktop bridge work."""
-
-    target_selection = get_api_v1_distributed_target_selection()
-    if target_selection.url and target_selection.source.startswith("explicit_env:"):
-        return target_selection
-
-    loopback_origin = _request_loopback_relay_origin()
-    if loopback_origin:
-        return DistributedTargetSelection(
-            url=loopback_origin,
-            source="request_override:loopback_same_origin",
-            relay_only=True,
-        )
-
-    if target_selection.url:
-        return target_selection
-
-    raise ComputeProviderError(
-        "desktop bridge distributed routing requires a trusted relay origin",
-        code="untrusted_relay_origin",
-        error_type="invalid_request_error",
-        public_message="No trusted relay origin is configured for this request.",
-        status_code=400,
+def _has_desktop_bridge_intent(request_metadata) -> bool:
+    """Caller intent may demand stricter routing, never grant routing authority."""
+    return (
+        isinstance(request_metadata, dict)
+        and request_metadata.get("inference_target") == "desktop_bridge_api_v1_e2ee"
+        and request_metadata.get("relay_path") == "api_v1_e2ee"
     )
-
-
-def _request_relay_base_url() -> str:
-    """Return a trusted API v1 relay base URL for desktop bridge work."""
-
-    return _request_relay_target_selection().url
 
 
 def _get_service_name() -> str:
@@ -377,6 +267,14 @@ def _handle_chat_completion_request(data):
         validate_required_fields(data, ["model"])
 
         is_encrypted_request = bool(data.get("encrypted", False))
+        bridge_intent = _has_desktop_bridge_intent(data.get("metadata"))
+        if bridge_intent and not is_encrypted_request:
+            return format_error_response(
+                "The desktop bridge requires an encrypted request.",
+                error_type="invalid_request_error",
+                code="encrypted_request_required",
+                status_code=400,
+            )
         stream_requested = data.get("stream")
         if stream_requested:
             log_warning(
@@ -427,7 +325,7 @@ def _handle_chat_completion_request(data):
 
                 try:
                     messages = json.loads(decrypted_data.decode("utf-8"))
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     return format_error_response(
                         "Failed to parse JSON from decrypted messages",
                         error_type="encryption_error",
@@ -489,21 +387,8 @@ def _handle_chat_completion_request(data):
             ]
 
         request_metadata = data.get("metadata")
-        force_desktop_bridge_distributed = _should_force_desktop_bridge_distributed(
-            request_metadata,
-            is_encrypted_request,
-        )
-
-        log_info(f"Generating response using model {model_id}")
-        provider = (
-            get_api_v1_compute_provider_for_mode(
-                mode="distributed",
-                distributed_target_selection=_request_relay_target_selection(),
-                distributed_fallback_enabled=False,
-            )
-            if force_desktop_bridge_distributed
-            else get_api_v1_compute_provider()
-        )
+        routing_decision = resolve_api_v1_routing(bridge_intent=bridge_intent)
+        provider = get_api_v1_compute_provider(routing_decision=routing_decision)
         resolved_provider_name = provider.__class__.__name__
         resolved_provider_path = get_api_v1_resolved_provider_path(provider)
         log_info(
@@ -623,29 +508,11 @@ def _handle_chat_completion_request(data):
             status_code=e.status_code,
         )
     except ComputeProviderError as e:
-        execution_backend_path = get_api_v1_last_backend_path()
-        log_warning(
-            "API v1 compute provider error "
-            f"code={e.code} status={e.status_code} "
-            f"path={execution_backend_path} detail={str(e)}"
-        )
-        try:
-            implicit_relay_only_error = is_api_v1_implicit_relay_only_selection()
-        except Exception:
-            implicit_relay_only_error = False
-        public_code = (
-            "no_compute_node_available"
-            if (
-                e.code == "no_registered_compute_nodes"
-                and implicit_relay_only_error
-                and not force_desktop_bridge_distributed
-            )
-            else e.code
-        )
+        log_warning("API v1 compute provider error code=%s" % safe_provider_error_code(e.code))
         return format_error_response(
             e.public_message,
             error_type=e.error_type,
-            code=public_code,
+            code=e.code,
             status_code=e.status_code,
         )
     except Exception as e:  # pragma: no cover - defensive guard for unexpected errors

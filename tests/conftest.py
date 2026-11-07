@@ -328,8 +328,11 @@ def setup_servers(
         test_env["TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED"] = "1"
         test_env["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "distributed"
         test_env["TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"] = "0"
+        test_env["TOKENPLACE_API_V1_DESTINATION_PROFILE"] = "bridge"
         test_env["TOKENPLACE_DISTRIBUTED_COMPUTE_URL"] = E2E_BASE_URL
     else:
+        # Generic mock UI tests use local execution explicitly.
+        test_env["TOKENPLACE_API_V1_COMPUTE_PROVIDER"] = "local"
         test_env["TOKENPLACE_API_V1_ENFORCE_RELAY_DISTRIBUTED"] = "0"
 
     # Start the relay server with the --use_mock_llm flag

@@ -1,8 +1,8 @@
 # K061: independently verified compute identity
 
-Status: proposed design, requested by Daniel; no runtime changes or deployment.
+Status: proposed design; no runtime changes or deployment.
 K061 remains the kanban tracking item; the coordinating task owns its board updates.
-K069 owns the coordinated authenticated-envelope migration. Daniel requires a
+K069 owns the coordinated authenticated-envelope migration. The design requires a
 coordinated encryption design first, preserving the relay-blind goal for token.place,
 DSPACE and Gabriel. None of these migrations is implemented by this document. This design is separate from staging-shadow and relay-state ADR work.
 
@@ -43,7 +43,7 @@ Keep all existing ciphertext-only guards and disabled plaintext routes intact.
 
 ## Decision and threat boundaries
 
-Daniel's selected preference is **verified compute by default for new clients**:
+The selected policy is **verified compute by default for new clients**:
 users choose operator trust roots provisioned independently of relay discovery.
 Relay selection remains useful for availability, but cannot grant identity trust.
 Any self-hosted relay, including `https://example.com`, remains supported. There is
@@ -136,13 +136,16 @@ adapters consume that policy. Enrollment is local trust configuration, not a
 mandatory token.place user account, relay account or central identity service.
 Do not ask ordinary users to create or custody an operator root private key.
 
-For a supported default deployment, a trusted client release or independently
-verified operator setup channel can offer a documented root bundle and operator
-identity. Setup must explain who receives plaintext and record the user's choice
-(or show the administrator-managed policy). The default relay URL is a convenience,
-not trust evidence; relay-fetched mutable configuration cannot silently add roots.
-Which operators/bundles ship as supported choices, their provenance and update
-owners must be approved at the coordination gate, not guessed by this proposal.
+Initial setup accepts public operator bundles supplied by users or administrators
+and independently verified. No project-maintained operator offering is required
+for the first release. Setup explains who receives plaintext and records explicit
+trust (or shows the administrator-managed policy). The default relay URL is a
+convenience, not trust evidence; relay-fetched mutable configuration cannot silently
+add roots. Offline operation lasts only while all local authorization constraints
+remain valid, including fresh signed revocation status, persisted epochs and a
+trustworthy clock. There is no guaranteed minimum disconnected duration and no
+mandatory centralized live authorization lookup. Supported bundle distribution and
+recovery paths still require review before a later offering is shipped.
 
 For an arbitrary self-hosted relay such as `https://example.com`, configure its URL
 and independently import the chosen compute operator's bundle/fingerprint. Those
@@ -154,6 +157,14 @@ plaintext. Recovery after lost policy or root compromise repeats independent
 bootstrap; a relay cannot repair trust by offering a new root without verification.
 
 ## Protocol direction and K069 contract
+
+The [candidate authenticated-inference protocol](authenticated-inference-protocol.md)
+and [review/vector plan](authenticated-inference-review-plan.md) refine this design
+with exact candidate records, composition and replay/lifecycle rules, a blocking
+decision ledger and qualification gates. They are documentation proposals, not an
+implemented or independently qualified security profile. Named specialist review,
+separately authorized executable vectors and all-client interoperability remain
+required; documentation CI or agreement between libraries is not security signoff.
 
 Use established schemes through maintained libraries. The preferred review profile
 is [HPKE (RFC 9180)](https://www.rfc-editor.org/rfc/rfc9180) with

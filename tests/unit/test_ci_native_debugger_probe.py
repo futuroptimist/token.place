@@ -267,6 +267,91 @@ def test_nonofficial_or_ambiguous_source_refused(source):
         probe.validate_ubuntu_source(source)
 
 
+def ubuntu_runner(monkeypatch):
+    monkeypatch.setattr(probe.sys, "platform", "linux")
+    monkeypatch.setattr(probe.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        probe.platform,
+        "freedesktop_os_release",
+        lambda: {"ID": "ubuntu", "VERSION_ID": "24.04",
+                 "VERSION_CODENAME": "noble"},
+    )
+    original = Path.is_file
+    monkeypatch.setattr(
+        Path, "is_file",
+        lambda path: True if str(path) == (
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+        ) else original(path),
+    )
+    monkeypatch.setattr(probe.os, "access", lambda *args: True)
+
+
+def test_canonical_source_uses_existing_key_and_private_output(
+    monkeypatch, tmp_path
+):
+    ubuntu_runner(monkeypatch)
+    output = tmp_path / "ubuntu.sources"
+    probe.prepare_ubuntu_source(output)
+    source = output.read_text()
+    probe.validate_ubuntu_source(source)
+    assert "https://archive.ubuntu.com/ubuntu" in source
+    assert "https://security.ubuntu.com/ubuntu" in source
+    assert "http:" not in source and "mirror+file" not in source
+    assert source.count(
+        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+    ) == 2
+    assert "Suites: noble noble-updates" in source
+    assert "Suites: noble-security" in source
+    assert "Trusted:" not in source
+    # Never overwrite any existing source, including a symlink target.
+    with pytest.raises(FileExistsError):
+        probe.prepare_ubuntu_source(output)
+    link = tmp_path / "existing-link.sources"
+    link.symlink_to(output)
+    with pytest.raises(FileExistsError):
+        probe.prepare_ubuntu_source(link)
+    assert output.read_text() == source
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("ID", "debian"), ("VERSION_ID", "26.04"),
+     ("VERSION_CODENAME", "unknown")],
+)
+def test_canonical_source_refuses_other_releases(
+    monkeypatch, tmp_path, field, value
+):
+    ubuntu_runner(monkeypatch)
+    release = probe.platform.freedesktop_os_release()
+    release[field] = value
+    monkeypatch.setattr(
+        probe.platform, "freedesktop_os_release", lambda: release
+    )
+    output = tmp_path / "ubuntu.sources"
+    with pytest.raises(ValueError, match="Ubuntu 24.04"):
+        probe.prepare_ubuntu_source(output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "reason", ["architecture", "missing-key", "unreadable-key"]
+)
+def test_canonical_source_refuses_unsupported_runner_or_key(
+    monkeypatch, tmp_path, reason
+):
+    ubuntu_runner(monkeypatch)
+    if reason == "architecture":
+        monkeypatch.setattr(probe.platform, "machine", lambda: "aarch64")
+    elif reason == "missing-key":
+        monkeypatch.setattr(Path, "is_file", lambda path: False)
+    else:
+        monkeypatch.setattr(probe.os, "access", lambda *args: False)
+    output = tmp_path / "ubuntu.sources"
+    with pytest.raises(ValueError):
+        probe.prepare_ubuntu_source(output)
+    assert not output.exists()
+
+
 def test_output_allowlist_and_size_limits(tmp_path):
     (tmp_path / "gdb-setup-tail.log").write_bytes(b"x" * 65536)
     (tmp_path / "unrelated-secret.txt").write_bytes(b"x" * 100000)
@@ -309,12 +394,27 @@ def test_setup_plan_refuses_existing_package_changes(tmp_path, plan, allowed):
     )
     script = setup["run"].split("\nlists=", 1)[1].split("\nSETUP", 1)[0]
     script = "lists=" + script
+    source_command = (
+        "/usr/bin/python3 scripts/ci_native_debugger_probe.py "
+        '--prepare-ubuntu-source "$lists/ubuntu.sources"'
+    )
+    assert source_command in script
+    # Platform/source creation is tested independently above. Never provision
+    # or probe the actual local system from these shell-contract tests.
+    script = script.replace(source_command, "prepare_source")
     # The actual shell plan guard runs; package tools are inert functions.
     stubs = """
 mktemp() { printf '%s\\n' "$FIXTURE_ROOT"; }
 chmod() { :; }
+prepare_source() { touch "$FIXTURE_ROOT/ubuntu.sources"; }
 dpkg-query() { :; }
 apt-get() {
+  [[ "$*" == *"Dir::Etc::sourcelist=$FIXTURE_ROOT/ubuntu.sources"* ]]
+  [[ "$*" == *"Dir::Etc::sourceparts=-"* ]]
+  [[ "$*" == *"Acquire::AllowInsecureRepositories=false"* ]]
+  [[ "$*" == *"APT::Get::AllowUnauthenticated=false"* ]]
+  [[ "$*" == *"Acquire::https::Verify-Peer=true"* ]]
+  [[ "$*" == *"Acquire::https::Verify-Host=true"* ]]
   case "$*" in
     *--simulate*) printf '%s\\n' "$FIXTURE_PLAN" ;;
     *install*) touch "$FIXTURE_ROOT/installed" ;;

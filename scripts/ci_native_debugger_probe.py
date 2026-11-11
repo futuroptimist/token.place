@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import signal
 import subprocess
@@ -12,8 +13,43 @@ from urllib.parse import urlsplit
 
 
 PROBE_SUBJECT = (
-    "[native-probe-source-fix-once] Capture backend initialization SIGILL"
+    "[native-probe-canonical-https-once] Capture backend initialization SIGILL"
 )
+
+
+def prepare_ubuntu_source(destination: Path) -> None:
+    """Write local sources using Ubuntu's installed archive trust root."""
+    release = platform.freedesktop_os_release()
+    if (
+        sys.platform != "linux"
+        or release.get("ID") != "ubuntu"
+        or release.get("VERSION_ID") != "24.04"
+        or release.get("VERSION_CODENAME") != "noble"
+        or platform.machine() != "x86_64"
+    ):
+        raise ValueError("Expected Ubuntu 24.04 amd64 hosted runner")
+    keyring = Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+    if not keyring.is_file() or not os.access(keyring, os.R_OK):
+        raise ValueError("Existing Ubuntu archive signing keyring required")
+    source = (
+        "Types: deb\n"
+        "URIs: https://archive.ubuntu.com/ubuntu\n"
+        "Suites: noble noble-updates\n"
+        "Components: main universe\n"
+        "Architectures: amd64\n"
+        f"Signed-By: {keyring}\n\n"
+        "Types: deb\n"
+        "URIs: https://security.ubuntu.com/ubuntu\n"
+        "Suites: noble-security\n"
+        "Components: main universe\n"
+        "Architectures: amd64\n"
+        f"Signed-By: {keyring}\n"
+    )
+    validate_ubuntu_source(source)
+    # The caller supplies a new file inside its private mktemp directory.
+    # Exclusive creation also refuses a pre-existing file or symlink.
+    with destination.open("x", encoding="utf-8") as stream:
+        stream.write(source)
 
 
 def validate_ubuntu_source(text: str) -> None:
@@ -310,7 +346,9 @@ def run_probe(output: Path) -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--validate-ubuntu-source"]:
+    if len(sys.argv) == 3 and sys.argv[1] == "--prepare-ubuntu-source":
+        prepare_ubuntu_source(Path(sys.argv[2]))
+    elif sys.argv[1:] == ["--validate-ubuntu-source"]:
         validate_ubuntu_source(
             Path("/etc/apt/sources.list.d/ubuntu.sources").read_text(
                 encoding="utf-8"

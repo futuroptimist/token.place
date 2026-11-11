@@ -116,24 +116,31 @@ jobs:
         run: |
           # A later commit or retry must not silently repeat this one probe.
           subject=$(git show -s --format=%s "$PROBE_HEAD")
-          if [ "$subject" != '[native-probe-source-fix-once] Capture backend initialization SIGILL' ]; then
+          if [ "$subject" != '[native-probe-canonical-https-once] Capture backend initialization SIGILL' ]; then
             exit 0
           fi
           echo 'enabled=true' >> "$GITHUB_OUTPUT"
-      - name: Provision GDB from the official runner OS source once
+      - name: Provision GDB from canonical Ubuntu HTTPS sources once
         id: gdb_setup
         if: always() && steps.probe_gate.outputs.enabled == 'true'
         timeout-minutes: 10
         run: |
           ulimit -c 0
-          python scripts/ci_native_debugger_probe.py --validate-ubuntu-source
           mkdir -p .ci-native-diagnostics
           set +e
           sudo -n timeout --signal=TERM --kill-after=5s 580s bash -euo pipefail <<'SETUP' > "$RUNNER_TEMP/gdb-setup.log" 2>&1
           lists=$(mktemp -d /tmp/token-place-gdb-apt.XXXXXX)
           chmod 755 "$lists"
-          options=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
-                   -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$lists"
+          /usr/bin/python3 scripts/ci_native_debugger_probe.py --prepare-ubuntu-source "$lists/ubuntu.sources"
+          mkdir -p "$lists/lists/partial" "$lists/cache/archives/partial"
+          options=(-o "Dir::Etc::sourcelist=$lists/ubuntu.sources"
+                   -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$lists/lists"
+                   -o "Dir::Cache=$lists/cache"
+                   -o Acquire::AllowInsecureRepositories=false
+                   -o Acquire::AllowDowngradeToInsecureRepositories=false
+                   -o APT::Get::AllowUnauthenticated=false
+                   -o Acquire::https::Verify-Peer=true
+                   -o Acquire::https::Verify-Host=true
                    -o Acquire::Retries=0 -o APT::Get::Update::Error-Mode=any
                    -o Dpkg::Use-Pty=0)
           apt-get "${options[@]}" update
@@ -153,7 +160,7 @@ jobs:
         if: always() && steps.probe_gate.outputs.enabled == 'true' && steps.gdb_setup.outcome == 'success'
         timeout-minutes: 10
         env:
-          TOKEN_PLACE_PROBE_SUBJECT: '[native-probe-source-fix-once] Capture backend initialization SIGILL'
+          TOKEN_PLACE_PROBE_SUBJECT: '[native-probe-canonical-https-once] Capture backend initialization SIGILL'
         run: |
           ulimit -c 0
           python scripts/ci_native_debugger_probe.py

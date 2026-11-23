@@ -49,8 +49,8 @@ to an accepted contract invalidates affected acceptance until re-reviewed.
 | P05 | Operator lifecycle reviewer; trust-store persistence owners; security reviewer | Specify root/status signing custody and cadence, cumulative revocation handling, generation/epoch persistence, atomic policy replacement and same-epoch conflict recovery. Trace update interruption, issuer coordination, rotation overlap, state loss, restore and root replacement. |
 | P06 | Compute/replay maintainer; client persistence owners; independent security reviewer | Define authoritative acceptance-domain identity, atomic reservation/capacity/grant/terminal boundaries, monotonic progress and client acceptance. Prove duplicate/conflicting retries and stale workers cannot acquire fresh execution/publication authority. Serialize revocation/cancel against admission/output acceptance. |
 | P07 | Storage specialist; compute owner; recovery reviewer | Choose topology and backend only after specifying crash/partition/restore/failover model, fencing enforcement, execution coupling, result/tombstone retention and cleanup. Trace every crash point and require a recovery proof for unknown outcomes. No exactly-once inference claim based on database durability alone. |
-| P08 | Dependency-security reviewer; protocol and runtime maintainers | Select exact HPKE artifacts after current release/advisory/license/maintenance/audit review. Record pins, hashes, transitive locks, runtime capability results and same-maintainer assurance limits. No floating latest version or package-name approval. |
-| P09 | Independent cryptographic specialist; signing/JCS maintainers | Qualify Ed25519 and strict JSON/JCS implementations independently of HPKE. Record RFC primitive conformance, malformed-input handling, number/Unicode behavior, cross-language byte agreement and independent application-vector review. |
+| P08 | Dependency-security reviewer; protocol and runtime maintainers | At G1, pin candidate HPKE artifacts after current release/advisory/license/maintenance/audit review. Record hashes, transitive locks, required runtime capabilities and same-maintainer assurance limits. Record execution-based capability results at G2. No floating latest version or package-name approval. |
+| P09 | Independent cryptographic specialist; signing/JCS maintainers | Review and pin candidate Ed25519 and strict JSON/JCS implementations independently of HPKE at G1. Under G2 authorization, record RFC primitive conformance, malformed-input handling, number/Unicode behavior, cross-language byte agreement and independent application-vector review. Missing or rejected results block G3. |
 | P10 | All client/compute/relay owners; privacy reviewer | Approve API v1 routing/control allowlist and adapters, safe model/tier selection, pre-relay encryption, every old/new pair and terminal/progress/cancel behavior. Document bounded relay visibility, plaintext-sentinel checks, user-visible unknown execution/failover and fail-closed capability errors. |
 
 Mandatory P03 numbers include maximum request duration and accepted age; maximum
@@ -86,7 +86,11 @@ Require established RFC primitive vectors, independent expected-output review an
 application-composition analysis. Passing any one of those is insufficient alone.
 No new package/version is selected, installed or tested by this packet.
 
-Create one qualification row per actual target, with these mandatory columns:
+Create one qualification row per actual target. At G1, record the contract,
+fixture schema, candidate artifact pins and planned evidence, not execution
+results. At G2, populate the results and independent review for those exact
+pins before requesting G3 authorization. A pending G2 result is not a pass.
+Use these mandatory columns:
 
 - Client/compute release/source commit; exact supported OS, architecture, runtime
   and browser engine/version; plaintext/encryption boundary and update origin.
@@ -97,9 +101,11 @@ Create one qualification row per actual target, with these mandatory columns:
   available audit scope/date/artifact, unresolved findings and reviewer decision.
 - RNG source and failure behavior; key import/export/validation; derivation APIs;
   capability detection; packaging/minification; context/sequence/nonce limits;
-  error behavior; secret lifetime/erasure limits; reproducibility evidence.
-- RFC/application vector IDs and exact results, independent review record,
-  unsupported-capability message and confirmation that no weaker suite activates.
+  error behavior; secret lifetime/erasure limits; and the reproducibility plan
+  at G1 with execution evidence at G2.
+- RFC/application vector plan and expected checks at G1. At G2, record vector
+  IDs and exact results, the independent review record, unsupported-capability
+  messages and evidence that no weaker suite activates.
 
 | Required integration surface | Runtime inventory required before qualification |
 | --- | --- |
@@ -235,9 +241,9 @@ passing an honest-relay happy path cannot substitute for malicious-relay cases.
 
 | Gate | Required evidence and boundary |
 | --- | --- |
-| G1: protocol review | Named protocol, compute, client, storage/lifecycle/dependency owners and independent cryptographic specialist accept the exact document revision, all P01-P10 decisions, numeric limits and pinned qualification matrix. Every blocking comment resolved or explicitly prevents advancement. |
-| G2: separately authorized vectors | Freeze fixture schemas; generate positive/negative vectors with synthetic inputs, reproducibility records and independent expected-output review. Bind to G1 revision and precise library artifacts. |
-| G3: separately authorized implementation | Bounded compute, enrollment/persistence and client-adapter changes consume the same accepted contract. Merged docs/vectors do not by themselves authorize implementation. |
+| G1: protocol review | Named protocol, compute, client, storage/lifecycle/dependency owners and independent cryptographic specialist accept the exact document revision, all P01-P10 pre-execution decisions, numeric limits, fixture schemas and pinned candidate qualification plan. Resolve all blocking design comments. Application vector execution and results are not a G1 prerequisite. |
+| G2: separately authorized vectors | After G1 acceptance and separate G2 authorization, generate positive/negative vectors with synthetic inputs using the frozen schemas. Record reproducibility, exact qualified results and independent expected-output review bound to the G1 revision and precise artifacts. Missing or rejected evidence blocks G3. |
+| G3: separately authorized implementation | Only after G2 qualification is accepted and G3 separately authorized, bounded compute, enrollment/persistence and client-adapter changes consume the same accepted contract. Merged docs or vector artifacts do not by themselves authorize implementation. |
 | G4: offline interoperability | Every surface/runtime and old/new combination passes shared vectors, negative cases, relay plaintext sentinels, delivery/update checks and lifecycle/recovery tests; record unsupported-target refusals honestly. |
 | G5: separately authorized staging and rollout | Synthetic staging only after prior gates; then explicitly approved operator/client rollout with enrollment, trusted delivery, key custody, revocation and independent recovery acceptance. No automatic trust downgrade on rollback. |
 

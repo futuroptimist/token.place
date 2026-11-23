@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::ComputeMode;
 
+#[path = "runtime_integrity.rs"]
+mod runtime_integrity;
+
 pub const ENABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP";
 pub const DISABLE_RUNTIME_BOOTSTRAP_ENV: &str = "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP";
 #[cfg(test)]
@@ -127,6 +130,8 @@ pub enum PythonLauncherCategory {
     BundledRuntimeNotPython3,
     BundledRuntimeWrongArchitecture,
     BundledRuntimeProbeFailed,
+    BundledRuntimeTemporaryInstallation,
+    BundledRuntimeIncomplete,
     BundledRuntimeProvenanceInvalid,
     BundledRuntimeAmbiguous,
     OverrideMissing,
@@ -144,6 +149,8 @@ impl PythonLauncherCategory {
             Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
             Self::BundledRuntimeWrongArchitecture => "bundled_runtime_wrong_architecture",
             Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::BundledRuntimeTemporaryInstallation => "bundled_runtime_temporary_installation",
+            Self::BundledRuntimeIncomplete => "bundled_runtime_incomplete",
             Self::BundledRuntimeProvenanceInvalid => "bundled_runtime_provenance_invalid",
             Self::BundledRuntimeAmbiguous => "bundled_runtime_ambiguous",
             Self::OverrideMissing => "override_missing",
@@ -197,6 +204,8 @@ fn runtime_architecture_decision(
             expected_machine: "arm64",
             windows_attestation: None,
         })
+    } else if target_os == "linux" && target_arch != "x86_64" {
+        Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture)
     } else if target_arch == "x86_64" {
         Ok(RuntimeArchitectureDecision {
             expected_machine: "x86_64",
@@ -729,6 +738,7 @@ fn bundled_runtime_layout_is_eligible(layout: &ResourceLayoutKind, packaged: boo
     *layout == ResourceLayoutKind::MacOsAppResources
         || *layout == ResourceLayoutKind::WindowsResources
         || *layout == ResourceLayoutKind::TauriResourceDir
+        || *layout == ResourceLayoutKind::LinuxDebResources
         || (*layout == ResourceLayoutKind::DevSourceTree && !packaged)
 }
 
@@ -830,6 +840,44 @@ fn validate_bundled_runtime_candidate(
     candidate: PythonLauncher,
     packaged: bool,
 ) -> Result<PythonLauncher, PythonLauncherError> {
+    if cfg!(target_os = "linux") && packaged {
+        let valid = bundled_runtime_root_from_candidate(&candidate)
+            .is_some_and(|root| runtime_integrity::validate_linux(&root).is_ok());
+        if !valid {
+            return Err(launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                PythonLauncherCategory::BundledRuntimeIncomplete,
+                Some(&candidate),
+                packaged,
+                None,
+            ));
+        }
+    }
+    // Check installation location and essential files without starting Python.
+    // Failure remains fatal: never repair from, or fall back to, a host runtime.
+    if cfg!(target_os = "windows") && packaged {
+        if let Some(root) = bundled_runtime_root_from_candidate(&candidate) {
+            runtime_integrity::validate(&root, &runtime_integrity::temporary_roots()).map_err(
+                |failure| {
+                    let category = match failure {
+                        runtime_integrity::IntegrityFailure::TemporaryInstallation => {
+                            PythonLauncherCategory::BundledRuntimeTemporaryInstallation
+                        }
+                        runtime_integrity::IntegrityFailure::MissingStandardLibrary => {
+                            PythonLauncherCategory::BundledRuntimeIncomplete
+                        }
+                    };
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        category,
+                        Some(&candidate),
+                        packaged,
+                        None,
+                    )
+                },
+            )?;
+        }
+    }
     let architecture = runtime_architecture_decision(std::env::consts::OS, std::env::consts::ARCH)
         .map_err(|category| {
             launcher_error(
@@ -870,6 +918,15 @@ fn validate_bundled_runtime_candidate(
         .output()
     {
         Ok(output) => {
+            if !output.status.success() {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::BundledRuntimeProbeFailed,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
@@ -1049,6 +1106,7 @@ pub enum ResourceLayoutKind {
     TauriResourceDir,
     WindowsResources,
     LinuxResources,
+    LinuxDebResources,
     MacOsAppResources,
     ExecutablePythonSibling,
     DevSourceTree,
@@ -1096,6 +1154,31 @@ pub fn resource_root_candidates(
 
     if let Some(exe_path) = exe_path {
         if let Some(exe_dir) = exe_path.parent() {
+            // Debian packages install the binary in usr/bin and resources in
+            // usr/lib/<product-name>. Sidecars/headless commands do not have a
+            // Tauri AppHandle, so they need the same installed resource root.
+            #[cfg(target_os = "linux")]
+            if exe_dir.file_name().is_some_and(|name| name == "bin") {
+                if let Some(prefix) = exe_dir.parent() {
+                    let config: serde_json::Value =
+                        serde_json::from_str(include_str!("../tauri.conf.json"))
+                            .expect("valid embedded Tauri configuration");
+                    if let Some(product_name) = config.get("productName").and_then(|v| v.as_str()) {
+                        push_unique_resource_root(
+                            &mut candidates,
+                            prefix.join("lib").join(product_name),
+                            ResourceLayoutKind::LinuxDebResources,
+                        );
+                    }
+                }
+                if let (Some(prefix), Some(name)) = (exe_dir.parent(), exe_path.file_name()) {
+                    push_unique_resource_root(
+                        &mut candidates,
+                        prefix.join("lib").join(name),
+                        ResourceLayoutKind::LinuxDebResources,
+                    );
+                }
+            }
             push_unique_resource_root(
                 &mut candidates,
                 exe_dir.join("resources"),
@@ -2105,6 +2188,26 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
+    fn temporary_packaged_runtime_fails_before_interpreter_spawn() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp
+            .path()
+            .join("tokenplace-step05-attempt63-test/candidate-install");
+        // No interpreter exists: installation validation must precede spawning it.
+        let error = resolve_bundled_python_launcher_at_root(&root, true).unwrap_err();
+        assert_eq!(
+            error.category,
+            PythonLauncherCategory::BundledRuntimeTemporaryInstallation
+        );
+        assert_eq!(error.public_code, DESKTOP_PYTHON_RUNTIME_INVALID);
+        assert_eq!(error.exit_status, None);
+        assert!(!error
+            .to_string()
+            .contains(&temp.path().display().to_string()));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
     fn bundled_runtime_candidate_selects_existing_runtime_not_first_nominal_root() {
         let temp = TempDir::new().expect("tempdir");
         let exe = temp
@@ -2316,6 +2419,53 @@ mod tests {
         assert!(exe_roots.iter().any(|candidate| {
             candidate.layout == expected_layout && candidate.root.ends_with("App/resources")
         }));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_deb_sidecar_resolves_private_python_without_app_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let exe = temp.path().join("usr/bin/token-place-desktop-tauri");
+        let resources = temp.path().join("usr/lib/token.place desktop");
+        let runtime = resources.join("python-runtime");
+        let py = runtime.join("bin/python3");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        let payload = serde_json::json!({
+            "version": [3,11,13], "machine": "x86_64", "pointer_bits": 64,
+            "executable": py, "prefix": runtime,
+        });
+        std::fs::write(&py, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload)).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for relative in [
+            "encodings/__init__.py",
+            "json/__init__.py",
+            "os.py",
+            "platform.py",
+            "struct.py",
+        ] {
+            let path = runtime.join("lib/python3.11").join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "# fixture").unwrap();
+        }
+        let script = resources.join("python/inference_sidecar.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# fixture").unwrap();
+        let manifest = temp.path().join("absent-source-checkout");
+        let selected =
+            resolve_bridge_script_path("inference_sidecar.py", Some(&exe), &manifest, None, None)
+                .unwrap();
+        assert_eq!(selected, script);
+        let launcher = resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
+            override_var_name: "TOKEN_PLACE_TEST_PYTHON_NOT_SET",
+            tauri_resource_dir: None,
+            current_exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            packaged: true,
+        })
+        .unwrap();
+        assert_eq!(Path::new(&launcher.program), py);
+        assert_eq!(launcher.source, PythonLauncherSource::BundledRuntime);
     }
 
     #[test]
@@ -2537,6 +2687,21 @@ mod tests {
         let runtime_bin = resource_root.join("python-runtime").join("bin");
         std::fs::create_dir_all(&python_dir).expect("create python dir");
         std::fs::create_dir_all(&runtime_bin).expect("create runtime bin");
+        if cfg!(target_os = "linux") {
+            for relative in [
+                "encodings/__init__.py",
+                "json/__init__.py",
+                "os.py",
+                "platform.py",
+                "struct.py",
+            ] {
+                let path = resource_root
+                    .join("python-runtime/lib/python3.11")
+                    .join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "# fixture").unwrap();
+            }
+        }
         let model_script = python_dir.join("model_bridge.py");
         let compute_script = python_dir.join("compute_node_bridge.py");
         std::fs::write(&model_script, "# model bridge\n").expect("write model bridge");
@@ -2860,6 +3025,19 @@ mod tests {
         let py = resources.join("python-runtime/bin/python3");
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
+        if cfg!(target_os = "linux") {
+            for relative in [
+                "encodings/__init__.py",
+                "json/__init__.py",
+                "os.py",
+                "platform.py",
+                "struct.py",
+            ] {
+                let file = runtime_root.join("lib/python3.11").join(relative);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, "# fixture").unwrap();
+            }
+        }
         let probe = format!(
             r#"{{"version":[3,11,13],"machine":"{}","pointer_bits":64,"executable":"{}","prefix":"{}"}}"#,
             expected_runtime_arch(),

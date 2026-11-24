@@ -203,6 +203,14 @@ oracle. Include RFC primitive vectors separately from application vectors.
 For each mutated field, include the original valid case and one isolated change,
 then selected combined changes to check rejection ordering. Include concurrency
 schedules that reverse the apparent winner of cancellation, revocation and success.
+
+Include pre-admission cancellation cases with (a) a valid signed original
+interval followed by the exact request, which remains fenced;
+(b) a missing or changed original creation time, overlong or over-age original
+interval with a still-fresh cancel, or cancel creation outside the original
+interval, which must not reserve a tombstone; and (c) a delayed request whose
+original interval or digest does not match a retained tombstone, which must
+not gain execution authority or be accepted as the same cancelled request.
 Synthetic plaintext sentinels must be checked at relay boundaries even when an
 error aborts early. Rejection must specify forbidden inference and policy effects,
 not merely assert an exception was raised.

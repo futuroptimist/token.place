@@ -313,23 +313,37 @@ A `cancel` record contains exactly `type:"cancel"`, `schema:1`, `profile`, `suit
 `mode:"verified"`, `root_id`, `operator_id`, `node_id`, `descriptor_digest`,
 `acceptance_domain`, `compute_encryption_key_id`, `compute_signing_key_id`,
 `client_response_key_id`, `client_continuity_key_id`, `request_digest`, `nonce`,
-`route_id`, `created_at`, `expires_at`, `client_continuity_key:EdKey` and
-`client_response_key:XKey`. The full keys match the two key IDs; all other
-types/bindings equal section 4.3. It is signed by the original continuity key and
-encrypted to the original compute key using
+`route_id`, `request_created_at:Time`, `created_at`, `expires_at`,
+`client_continuity_key:EdKey` and `client_response_key:XKey`. The full keys
+match the two key IDs. The signed `request_created_at` is the original request’s
+`created_at`; the cancel’s own `created_at` is its creation time. The signed
+`expires_at` is the original request expiration and equals the encrypted header’s
+expiration. Other types and bindings follow section 4.3. The original continuity
+key signs it. The record is encrypted to the original compute key using
 `client-to-compute`. It does not alter the accepted request digest or authorize
 execution. There is no new relay endpoint implied by this record (P10).
 
 Local cancellation first atomically closes client acceptance; late output is never
 rendered. Authenticated compute cancellation can fence pending work but does not
 prove that physical execution stopped. The race with success is serialized by the
-acceptance store: one terminal outcome wins. Cancellation before request acceptance
-validates the supplied continuity key/signature, descriptor, claimed request
-interval and current authorization before reserving a tombstone for that identity
-and request digest through the replay window. The full key permits validation
-without an already stored request. It cannot grant request admission; a delayed
-original request must not acquire authority. If capacity cannot retain that tombstone,
-cancellation cannot claim compute prevention; the client remains locally closed.
+acceptance store: one terminal outcome wins.
+
+For any cancellation, require
+`request_created_at <= created_at < expires_at`. Apply the original request
+duration and age limits to `[request_created_at, expires_at)`, not to the
+shorter cancel interval. Independently apply section 5’s trusted-time checks to
+both intervals. If the request is stored, compare its creation time, expiration,
+digest and other bindings with the signed cancel before changing state.
+
+Before request acceptance, verify the supplied continuity key and signature,
+descriptor, both signed intervals and current authorization before reserving
+a tombstone for that replay identity and digest. The signed original creation
+time permits the interval checks before the request is available. Retain its
+creation time and expiration with the tombstone through the replay window.
+A delayed request must match the stored digest, creation time and expiration
+to be treated as cancelled; mismatches are binding conflicts and never grant
+execution authority. If capacity cannot retain the tombstone, cancellation
+cannot claim compute prevention; the client remains locally closed.
 
 ## 5. Lifecycle and offline decisions
 
@@ -337,7 +351,7 @@ Treat trustworthy time as an interval `[earliest_now, latest_now]`, not a relay
 clock. Accept a validity interval only if `not_before <= earliest_now` and
 `latest_now < expires_at`. For every encrypted record, use `created_at` as its own
 lower bound, in addition to the original request interval wherever that request is
-known.
+known or carried in a signed cancellation.
 Clock skew/uncertainty policies may narrow acceptance but cannot extend signed
 expiry. Time evidence source, maximum uncertainty, suspend/resume and offline reboot
 behavior require P03/P05 approval. Missing reliable time means no verified use.

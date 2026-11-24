@@ -508,6 +508,12 @@ class DistributedApiV1ComputeProvider:
                     },
                     timeout=retrieve_timeout,
                 )
+            except ComputeProviderError as exc:
+                # A trusted-LAN redirect is terminal, but the request was
+                # already accepted. Try one cancellation on the pinned relay.
+                if relay_request_enqueued and exc.code == "distributed_target_configuration_error":
+                    _cancel_relay_request_once(status="cancelled", reason="requester_gave_up")
+                raise
             except requests.RequestException:
                 time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 continue

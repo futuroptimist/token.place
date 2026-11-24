@@ -39,6 +39,11 @@
       "../../requirements.txt": "../../requirements.txt",
       "python/embedded_python_runtime_windows_x86_64_manifest.json": "python/embedded_python_runtime_windows_x86_64_manifest.json"
     },
+    "linux": {
+      "deb": {
+        "depends": ["libgomp1"]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

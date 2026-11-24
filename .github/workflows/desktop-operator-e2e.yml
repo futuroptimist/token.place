@@ -274,6 +274,11 @@ jobs:
           $version = (Get-Content 'desktop-tauri/package.json' -Raw | ConvertFrom-Json).version
           $buildId = (git rev-parse --short=12 HEAD).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Reproduce the release flow: static NSIS extraction leaves a remembered
+          # temporary /D destination even after uninstall. The identity harness
+          # must explicitly select its own durable installation directory.
+          python -c "import sys; from pathlib import Path; from scripts import validate_windows_desktop_release_artifacts as v; v.validate_artifact(Path(sys.argv[1]), sys.argv[2], 'NSIS', v._load_json(v.MANIFEST))" $installers[0].FullName $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python desktop-tauri/scripts/test_windows_installer_identity.py `
             --pr-current-windows-nsis $installers[0].FullName `
             --expected-version $version `

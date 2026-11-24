@@ -738,10 +738,19 @@ def test_get_api_v1_resolved_provider_path_labels_instance_types():
 
 
 def test_api_v1_chat_completion_emits_execution_backend_path_header_for_fallback(monkeypatch):
-    def unavailable(*_args, **_kwargs):
-        raise compute_provider.requests.RequestException("synthetic unavailable")
+    next_server_url = "https://node-a.example/api/v1/relay/servers/next"
+    relay_calls = []
 
-    monkeypatch.setattr(compute_provider.requests, "get", unavailable)
+    def fail_next_server(url, **_kwargs):
+        assert url == next_server_url
+        relay_calls.append(url)
+        raise compute_provider.requests.ConnectionError("synthetic relay transport failure")
+
+    def unexpected_relay_post(*_args, **_kwargs):
+        raise AssertionError("relay should not accept a request after discovery fails")
+
+    monkeypatch.setattr(compute_provider.requests, "get", fail_next_server)
+    monkeypatch.setattr(compute_provider.requests, "post", unexpected_relay_post)
     monkeypatch.setattr(
         compute_provider,
         "generate_response",
@@ -764,6 +773,7 @@ def test_api_v1_chat_completion_emits_execution_backend_path_header_for_fallback
         )
 
     try:
+        assert relay_calls == [next_server_url]
         assert response.status_code == 200
         assert (
             response.headers["X-Tokenplace-API-V1-Execution-Backend-Path"]

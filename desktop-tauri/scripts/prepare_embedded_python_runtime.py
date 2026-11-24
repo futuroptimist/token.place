@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -73,20 +74,28 @@ def download_verified(m: dict, cache_dir: Path) -> Path:
     tmp.replace(archive)
     return archive
 
-def validate_tar_member(member: tarfile.TarInfo, root: str) -> None:
+def validate_tar_member(member: tarfile.TarInfo, root: str, *, allow_internal_parent_links: bool = False) -> None:
     name = PurePosixPath(member.name)
     if name.is_absolute() or ".." in name.parts: raise RuntimePrepError(f"unsafe archive path: {member.name}")
     if not name.parts or name.parts[0] != root: raise RuntimePrepError(f"unexpected archive root: {member.name}")
     if member.islnk() or member.issym():
         target = PurePosixPath(member.linkname)
-        if target.is_absolute() or ".." in target.parts: raise RuntimePrepError(f"archive link escapes extraction root: {member.name}")
+        if target.is_absolute(): raise RuntimePrepError(f"archive link escapes extraction root: {member.name}")
+        if ".." in target.parts:
+            # Linux terminfo contains sibling links such as ../x/xterm. Resolve
+            # those lexically inside the archive root; data_filter additionally
+            # checks resolved symlink chains during extraction.
+            base = name.parent if member.issym() else PurePosixPath()
+            resolved = PurePosixPath(posixpath.normpath(str(base / target)))
+            if not allow_internal_parent_links or not resolved.is_relative_to(PurePosixPath(root)):
+                raise RuntimePrepError(f"archive link escapes extraction root: {member.name}")
 
-def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
+def extract_archive(archive: Path, m: dict, tmp_parent: Path, *, allow_internal_parent_links: bool = False) -> Path:
     extract_dir = tmp_parent / "extract"; extract_dir.mkdir(parents=True)
     with tarfile.open(archive, "r:gz") as tf:
         members = tf.getmembers()
         if not members: raise RuntimePrepError("runtime archive is empty")
-        for member in members: validate_tar_member(member, m["expected_archive_root"])
+        for member in members: validate_tar_member(member, m["expected_archive_root"], allow_internal_parent_links=allow_internal_parent_links)
         tf.extractall(extract_dir, filter="data")  # nosec B202 - all members are validated before extraction
     runtime = extract_dir / m["expected_archive_root"]
     if not (runtime / m["expected_interpreter_path"]).is_file(): raise RuntimePrepError("archive missing expected interpreter")

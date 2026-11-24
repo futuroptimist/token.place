@@ -575,3 +575,54 @@ def test_lan_cancel_redirect_cannot_mask_original_timeout(routing, monkeypatch):
         provider.complete_chat(model_id="qwen3-8b-instruct", messages=[{"role": "user", "content": "synthetic"}])
     assert caught.value.code == "compute_node_timeout"
     assert len(calls) == 3 and calls[-1].endswith("/cancel")
+
+
+@pytest.mark.parametrize("cancel_outcome", ["success", "redirect", "transport_error"])
+def test_lan_retrieval_redirect_attempts_cleanup_once_on_pinned_target(routing, monkeypatch, cancel_outcome):
+    cp = routing.cp
+    target = "https://lan.example/api/v1"
+    paths = ["/servers/next", "/requests", "/responses/retrieve", "/requests/cancel"]
+    calls = []
+    crypto = SimpleNamespace(
+        public_key_b64="opaque",
+        encrypt_message=lambda *_args: {"chat_history": "opaque", "cipherkey": "opaque", "iv": "opaque"},
+    )
+    monkeypatch.setattr(cp.DistributedApiV1ComputeProvider, "_build_request_crypto_manager", lambda _self: crypto)
+
+    class Session:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def request(self, method, url, **kwargs):
+            path = paths[len(calls)]
+            assert url == target + "/relay" + path
+            assert method == ("get" if path == "/servers/next" else "post")
+            assert not self.trust_env and kwargs["allow_redirects"] is False
+            calls.append(kwargs)
+            if path == "/servers/next":
+                return FakeResponse(200, {"server_public_key": "opaque"})
+            if path == "/requests":
+                return FakeResponse(200)
+            if path == "/responses/retrieve":
+                monkeypatch.setenv(TARGETS[0], "https://changed.example")
+                return FakeResponse(302)
+            assert kwargs["timeout"] == 1.0
+            if cancel_outcome == "transport_error":
+                raise cp.requests.ConnectionError("synthetic cleanup failure")
+            return FakeResponse(302 if cancel_outcome == "redirect" else 200)
+
+    monkeypatch.setattr(cp.requests, "Session", Session)
+    provider = cp.DistributedApiV1ComputeProvider(target, timeout_seconds=1, destination_profile="trusted_lan")
+    with pytest.raises(cp.ComputeProviderError) as caught:
+        provider.complete_chat(model_id="qwen3-8b-instruct", messages=[{"role": "user", "content": "synthetic"}])
+    assert caught.value.code == "distributed_target_configuration_error"
+    assert len(calls) == len(paths)
+    for field in ("request_id", "cancel_token", "client_public_key"):
+        assert calls[-1]["json"][field] == calls[1]["json"][field]
+    assert calls[-1]["json"]["status"] == "cancelled"
+    assert calls[-1]["json"]["reason"] == "requester_gave_up"

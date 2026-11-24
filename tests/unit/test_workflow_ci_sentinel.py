@@ -418,7 +418,7 @@ def test_canonical_chart_sets_release_metadata_env_defaults() -> None:
     )
     deployment = Path("charts/tokenplace/templates/deployment.yaml").read_text(encoding="utf-8")
 
-    assert chart["appVersion"] == "0.1.2"
+    assert chart["appVersion"] == "0.2.0"
     assert "deployEnv" in values
     assert '"TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)' in deployment
     assert '"TOKENPLACE_CHART_VERSION" (dict "name" "TOKENPLACE_CHART_VERSION" "value" .Chart.Version)' in deployment
@@ -438,7 +438,7 @@ def test_canonical_relay_image_copies_release_metadata_module() -> None:
     assert "release_metadata.py /app/" in dockerfile
 
 
-def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
+def test_canonical_chart_version_is_bumped_for_explicit_routing_defaults() -> None:
     chart = yaml.safe_load(
         Path("charts/tokenplace/Chart.yaml").read_text(encoding="utf-8")
     )
@@ -446,7 +446,7 @@ def test_canonical_chart_version_is_bumped_for_main_latest_default() -> None:
         Path("charts/tokenplace/values.yaml").read_text(encoding="utf-8")
     )
 
-    assert chart["version"] == "0.1.8"
+    assert chart["version"] == "0.1.9"
     assert values["image"]["tag"] == "main-latest"
     assert values["image"]["pullPolicy"] == "Always"
 

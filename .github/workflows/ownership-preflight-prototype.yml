@@ -1,0 +1,36 @@
+name: Ownership preflight prototype (synthetic only)
+on:
+  pull_request:
+    paths:
+      - 'experiments/windows-ownership-preflight/**'
+      - '.github/workflows/ownership-preflight-prototype.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'experiments/windows-ownership-preflight/**'
+      - '.github/workflows/ownership-preflight-prototype.yml'
+permissions:
+  contents: read
+jobs:
+  synthetic-native-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure standalone fixture tests with existing runner toolchain
+        run: cmake -S experiments/windows-ownership-preflight -B build/ownership-preflight -DCMAKE_BUILD_TYPE=Release
+      - name: Compile native fixture tests
+        run: cmake --build build/ownership-preflight --config Release
+      - name: Exercise synthetic profiles (no host registry or profile access)
+        run: ctest --test-dir build/ownership-preflight --build-config Release --verbose --output-junit ownership-results.xml
+      - name: Retain fixture test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ownership-synthetic-${{ matrix.os }}
+          path: build/ownership-preflight/ownership-results.xml
+          if-no-files-found: warn

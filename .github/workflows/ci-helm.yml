@@ -110,6 +110,11 @@ jobs:
 
           grep -n -E '127\.0\.0\.1:(6000|\$\(RELAY_PORT\))' /tmp/tokenplace-render-port.yaml
 
+      - name: Set up Python for focused verification
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install Python dependencies for Helm assertions
         run: python3 -m pip install -r config/requirements_codex_verification.txt
 

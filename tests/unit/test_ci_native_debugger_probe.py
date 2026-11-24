@@ -161,6 +161,86 @@ def test_separate_group_inferior_requires_session_and_start_identity(
         assert result == "identity_unverified" and killed == []
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (FileNotFoundError, "already_exited"),
+        (PermissionError, "cleanup_unverified"),
+    ],
+)
+def test_cleanup_refuses_unverified_process_and_closes_descriptor(
+    monkeypatch, tmp_path, failure, expected
+):
+    (tmp_path / "owned-inferior.json").write_text(
+        json.dumps({"pid": 222, "session": 111, "start": "777"})
+    )
+    opened = []
+    closed = []
+
+    def open_pidfd(pid):
+        opened.append(pid)
+        return 333
+
+    def fail_read_stat(self, *args, **kwargs):
+        if self == Path("/proc/222/stat"):
+            raise failure("synthetic unreadable process record")
+        return read_text(self, *args, **kwargs)
+
+    read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", fail_read_stat)
+    monkeypatch.setattr(probe.os, "pidfd_open", open_pidfd, raising=False)
+    monkeypatch.setattr(probe.os, "close", closed.append)
+    monkeypatch.setattr(
+        probe.signal,
+        "pidfd_send_signal",
+        lambda *_: pytest.fail("unverified process must not receive a signal"),
+        raising=False,
+    )
+
+    assert probe.cleanup_inferior(tmp_path, 111) == expected
+    assert opened == [222]
+    assert closed == [333]
+
+
+def test_cleanup_fails_closed_when_pidfd_is_unavailable(monkeypatch, tmp_path):
+    (tmp_path / "owned-inferior.json").write_text(
+        json.dumps({"pid": 222, "session": 111, "start": "777"})
+    )
+    monkeypatch.delattr(probe.os, "pidfd_open", raising=False)
+    monkeypatch.setattr(
+        probe.signal,
+        "pidfd_send_signal",
+        lambda *_: pytest.fail("no signal without a descriptor"),
+        raising=False,
+    )
+
+    assert probe.cleanup_inferior(tmp_path, 111) == "cleanup_unverified"
+
+
+def test_probe_launch_permission_failure_reports_only_error_type(
+    monkeypatch, tmp_path
+):
+    enable(monkeypatch)
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/gdb")
+    attempted = []
+
+    def denied(command, **_kwargs):
+        attempted.append(command[0])
+        raise PermissionError("fixture error text must not enter the report")
+
+    monkeypatch.setattr(probe.subprocess, "Popen", denied)
+    output = tmp_path / "report.json"
+
+    probe.run_probe(output)
+
+    assert attempted == ["/usr/bin/gdb"]
+    assert json.loads(output.read_text()) == {
+        "status": "debugger_unavailable_or_denied",
+        "error": "PermissionError",
+        "inferior_cleanup": "not_started",
+    }
+
+
 def test_workflow_one_shot_gate_and_inference_remain_intact():
     import yaml
 

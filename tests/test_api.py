@@ -517,10 +517,37 @@ def test_api_v1_chat_completion_staging_no_nodes_returns_clear_503(client, monke
     )
 
 
-def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_nodes(client, monkeypatch):
+@pytest.fixture
+def offline_distributed_discovery(monkeypatch):
+    """Exercise the real provider without making any relay HTTP requests."""
+    compute_provider = importlib.import_module('api.v1.compute_provider')
+    base_url = 'https://compute.example'
+    _clear_distributed_target_env(monkeypatch)
     monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
-    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', base_url)
+
+    discovery = MagicMock(side_effect=compute_provider.requests.ConnectionError('synthetic transport failure'))
+    submit = MagicMock(side_effect=AssertionError('relay POST must not follow failed discovery'))
+    monkeypatch.setattr(compute_provider.requests, 'get', discovery)
+    monkeypatch.setattr(compute_provider.requests, 'post', submit)
+
+    yield discovery
+
+    discovery.assert_called_once()
+    assert discovery.call_args.args == (f'{base_url}/api/v1/relay/servers/next',)
+    submit.assert_not_called()
+
+
+def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_nodes(
+    client, monkeypatch, offline_distributed_discovery
+):
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
+
+    offline_distributed_discovery.side_effect = None
+    offline_distributed_discovery.return_value = MagicMock(status_code=503)
+    offline_distributed_discovery.return_value.json.return_value = {
+        'error': {'code': 'no_registered_compute_nodes'},
+    }
 
     payload = {
         'model': 'llama-3.1-8b-instruct',
@@ -532,10 +559,12 @@ def test_api_v1_chat_completion_returns_503_when_distributed_has_no_registered_n
     assert response.status_code == 503
     data = response.get_json()
     assert data['error']['type'] == 'service_unavailable_error'
-    assert data['error']['code'] in {'no_registered_compute_nodes', 'compute_node_unreachable'}
+    assert data['error']['code'] == 'no_registered_compute_nodes'
 
 
-def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client, monkeypatch):
+def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(
+    client, monkeypatch, offline_distributed_discovery
+):
     fallback_message = {
         'role': 'assistant',
         'content': 'local fallback response',
@@ -545,9 +574,7 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
         'api.v1.compute_provider.generate_response',
         lambda _model, messages, **_options: messages + [fallback_message],
     )
-
-    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
-    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+    monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '1')
 
     response = client.post(
         '/api/v1/chat/completions',
@@ -558,20 +585,14 @@ def test_api_v1_chat_completion_distributed_provider_falls_back_to_local(client,
     )
 
     assert response.status_code == 200
+    assert response.headers['X-Tokenplace-API-V1-Execution-Backend-Path'] == 'fallback_local_in_process'
     assert response.get_json()['choices'][0]['message']['content'] == 'local fallback response'
 
 
-def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monkeypatch):
-    monkeypatch.setenv('TOKENPLACE_API_V1_COMPUTE_PROVIDER', 'distributed')
-    monkeypatch.setenv('TOKENPLACE_DISTRIBUTED_COMPUTE_URL', 'https://compute.example')
+def test_api_v1_chat_completion_distributed_no_fallback_returns_503(
+    client, monkeypatch, offline_distributed_discovery
+):
     monkeypatch.setenv('TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK', '0')
-
-    monkeypatch.setattr(
-        'api.v1.routes.get_api_v1_compute_provider',
-        lambda: importlib.import_module('api.v1.compute_provider').DistributedApiV1ComputeProvider(
-            base_url='https://compute.example'
-        ),
-    )
 
     local_generate = MagicMock(side_effect=AssertionError('local generation should not run'))
     monkeypatch.setattr('api.v1.compute_provider.generate_response', local_generate)
@@ -585,13 +606,8 @@ def test_api_v1_chat_completion_distributed_no_fallback_returns_503(client, monk
     )
 
     assert response.status_code == 503
-    assert response.get_json()['error']['code'] in {
-        'no_registered_compute_nodes',
-        'compute_node_unreachable',
-    }
+    assert response.get_json()['error']['code'] == 'compute_node_unreachable'
     local_generate.assert_not_called()
-
-
 
 
 def test_api_v1_chat_completion_local_provider_rejects_unsupported_model(client, monkeypatch):

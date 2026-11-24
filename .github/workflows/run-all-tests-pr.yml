@@ -39,9 +39,13 @@ jobs:
         run: python scripts/validate_dependencies.py
 
       - name: Install Python dependencies
+        env:
+          # Match CI's CPU-portable source build instead of restoring a wheel
+          # tuned for a different hosted runner's instruction set.
+          CMAKE_ARGS: '-DGGML_NATIVE=OFF'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install --no-cache-dir --no-binary=llama-cpp-python -r requirements.txt
 
       - name: Install Valkey server
         run: |

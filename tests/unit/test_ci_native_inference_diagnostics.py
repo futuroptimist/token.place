@@ -71,6 +71,122 @@ def test_missing_private_target_is_reported_without_fallback(monkeypatch):
     }
 
 
+def test_private_distribution_selection_handles_absent_and_oversized_libraries(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "desktop-target"
+    root.mkdir()
+    oversized = Path("llama_cpp/lib/oversized.so")
+    absent = Path("llama_cpp/lib/absent.so")
+
+    class Distribution:
+        metadata = {"Name": "LLAMA_CPP_PYTHON"}
+        version = "1.2.3"
+        files = [oversized, absent]
+
+        def read_text(self, name):
+            assert name == "WHEEL"
+            return None
+
+        def locate_file(self, item):
+            assert item in self.files
+            return root / item.name
+
+    class Unrelated(Distribution):
+        metadata = {"Name": "not-the-requested-distribution"}
+
+    def distributions(*, path):
+        assert path == [str(root)]
+        return [Unrelated(), Distribution()]
+
+    class LargeStat:
+        st_size = 256 * 1024 * 1024 + 1
+
+    original_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == root / oversized.name:
+            return LargeStat()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(diag.metadata, "distributions", distributions)
+    report = diag.package_metadata("llama-cpp-python", str(root))
+
+    assert report == {
+        "name": "llama-cpp-python",
+        "version": "1.2.3",
+        "wheel_tags": [],
+        "native_files": [
+            {
+                "name": oversized.name,
+                "size": LargeStat.st_size,
+                "hash": "omitted: size limit",
+            },
+            {"name": absent.name, "error": "FileNotFoundError"},
+        ],
+    }
+
+
+def test_collector_reports_only_supplied_host_metadata(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    monkeypatch.setattr(diag.sys, "argv", ["diagnostics"])
+    monkeypatch.setattr(diag.platform, "python_version", lambda: "3.12.0")
+    monkeypatch.setattr(diag.platform, "machine", lambda: "fixture-arch")
+    monkeypatch.setattr(diag.platform, "release", lambda: "fixture-kernel")
+    cpu_path = tmp_path / "cpuinfo"
+    cpu_path.write_text("model name: fixture CPU\nprivate: omit-me\n")
+    open_path = Path.open
+
+    def open_fixture(path, *args, **kwargs):
+        if path == Path("/proc/cpuinfo"):
+            path = cpu_path
+        return open_path(path, *args, **kwargs)
+
+    def metadata_fixture(name, directory=None):
+        return {"name": name, "source": directory}
+
+    monkeypatch.setattr(Path, "open", open_fixture)
+    monkeypatch.setattr(diag, "package_metadata", metadata_fixture)
+    diag.main()
+
+    assert json.loads(capsys.readouterr().out) == {
+        "python": "3.12.0",
+        "architecture": "fixture-arch",
+        "kernel": "fixture-kernel",
+        "cpu": {"model name": "fixture CPU"},
+        "packages": [
+            {"name": name, "source": None}
+            for name in ("llama-cpp-python", "numpy", "pip")
+        ],
+        "desktop_target_packages": [
+            {"name": name, "source": ".token_place_desktop_site"}
+            for name in ("llama-cpp-python", "numpy")
+        ],
+    }
+
+
+def test_bound_mode_does_not_collect_host_metadata(monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    monkeypatch.setattr(
+        diag.sys, "argv", ["diagnostics", "--bound-worker-output"]
+    )
+    calls = []
+    monkeypatch.setattr(diag, "bound_worker_output", calls.append)
+    monkeypatch.setattr(
+        diag, "package_metadata", lambda *_: pytest.fail("metadata lookup")
+    )
+
+    diag.main()
+
+    assert calls == [Path(".ci-native-diagnostics")]
+    assert capsys.readouterr().out == ""
+
+
 def test_collector_refuses_non_hosted_execution(monkeypatch):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     with pytest.raises(SystemExit, match="GitHub-hosted"):

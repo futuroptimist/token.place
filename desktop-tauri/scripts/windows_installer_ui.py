@@ -28,5 +28,3 @@ def nsis_ui_action(controls, *, uninstaller, fresh, directory_selected, owner_ob
         if label in allowed and token not in sent:
             return token, button, []
     return None
-
-

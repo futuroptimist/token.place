@@ -7696,7 +7696,7 @@ def _mock_msi_location_registry(monkeypatch, guard, tmp_path):
     rows = [{'Root': 1, 'Key': key, 'Name': name, 'Type': 18} for name in ('', 'InstallDir')]
 
     @contextmanager
-    def open_key(hive, subkey, reserved, access):
+    def open_key(_hive, subkey, reserved, access):
         yield subkey, access & 0x300, access
 
     def query(handle, name):

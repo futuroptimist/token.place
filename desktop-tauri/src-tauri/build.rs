@@ -1,3 +1,5 @@
+mod cargo_profile;
+
 use std::process::Command;
 
 fn build_windows_ownership_helper() {
@@ -9,7 +11,8 @@ fn build_windows_ownership_helper() {
     }
     println!("cargo:rerun-if-changed=installers/ownership.cpp");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let profile = out.ancestors().nth(3).expect("Cargo profile directory");
+    let profile = cargo_profile::cargo_profile_dir(&out)
+        .expect("Cargo profile directory above OUT_DIR's build ancestor");
     let compiler = cc::Build::new().cpp(true).static_crt(true).get_compiler();
     for (suffix, dll) in [("exe", false), ("dll", true)] {
         let output = profile.join(format!("token-place-desktop-tauri.exe.ownership.{suffix}"));
@@ -41,6 +44,11 @@ fn build_windows_ownership_helper() {
                 .expect("Existing MSVC toolchain required for installer ownership helper")
                 .success(),
             "Installer ownership helper compilation failed"
+        );
+        assert!(
+            output.is_file(),
+            "Installer ownership helper was not generated at {}",
+            output.display()
         );
     }
 }

@@ -32,6 +32,8 @@ def routing(monkeypatch):
     monkeypatch.setattr(routes.encryption_manager, "encrypt_message", Mock(return_value={"ciphertext": "opaque"}))
     app = Flask(__name__)
     app.config["TESTING"] = True
+    app.register_blueprint(routes.v1_bp)
+    app.register_blueprint(routes.openai_v1_bp)
     app.add_url_rule("/chat", view_func=lambda: routes._handle_chat_completion_request(
         __import__("flask").request.get_json()
     ), methods=["POST"])

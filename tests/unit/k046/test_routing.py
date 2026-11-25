@@ -101,6 +101,35 @@ def test_n05_n13_n21_plain_full_bridge_rejects_before_routing(routing, payload, 
     error(routing.client.post("/chat", json=payload(False)), 400, "encrypted_request_required")
 
 
+@pytest.mark.parametrize("path", ["/api/v1/completions", "/v1/completions"])
+@pytest.mark.parametrize("mode", [None, "local", "distributed"])
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_text_completion_rejects_full_bridge_before_routing(routing, payload, monkeypatch, path, mode, encrypted):
+    if mode is not None:
+        monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", mode)
+    monkeypatch.setenv("TOKENPLACE_API_V1_DESTINATION_PROFILE", "general")
+    monkeypatch.setenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", "1")
+    monkeypatch.setattr(routing.routes, "get_api_v1_compute_provider", forbid)
+    monkeypatch.setattr(routing.routes, "resolve_api_v1_routing", forbid)
+    body = payload(encrypted=encrypted)
+    body["prompt"] = "synthetic prompt"
+    response = routing.client.post(path, json=body)
+    error(response, 400, "bridge_text_completions_unsupported")
+    assert response.get_json()["error"]["param"] == "metadata"
+    routing.local.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/api/v1/completions", "/v1/completions"])
+@pytest.mark.parametrize("markers", ["none", "target", "path"])
+def test_text_completion_without_full_bridge_keeps_local_behavior(routing, payload, path, markers):
+    body = payload(encrypted=False, markers=markers)
+    body["prompt"] = "synthetic prompt"
+    response = routing.client.post(path, json=body)
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["choices"][0]["text"] == "synthetic local result"
+    routing.local.assert_called_once()
+
+
 def test_n07_invalid_mode_is_safe_and_reads_no_target(routing, payload, monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "opaque-invalid-value")
     lock_distributed(monkeypatch, routing.cp, include_local=True)

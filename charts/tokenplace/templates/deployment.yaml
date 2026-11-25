@@ -84,7 +84,6 @@ spec:
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" (printf "%v" .Values.relay.workers))
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
                 "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" (join "," .Values.rateLimit.trustedProxies))
-                "TOKENPLACE_API_V1_COMPUTE_PROVIDER" (dict "name" "TOKENPLACE_API_V1_COMPUTE_PROVIDER" "value" "distributed")
                 "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK" (dict "name" "TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK" "value" "0")
                 "TOKENPLACE_API_V1_DESTINATION_PROFILE" (dict "name" "TOKENPLACE_API_V1_DESTINATION_PROFILE" "value" "bridge")
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)
@@ -100,6 +99,9 @@ spec:
                 "XDG_STATE_HOME" (dict "name" "XDG_STATE_HOME" "value" "/tmp/.local/state")
           }}
           {{- $mergedEnv := deepCopy $defaultEnv }}
+          {{- if not .Values.envFrom }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_API_V1_COMPUTE_PROVIDER" (dict "name" "TOKENPLACE_API_V1_COMPUTE_PROVIDER" "value" "distributed") }}
+          {{- end }}
           {{- if and .Values.ingress.enabled .Values.ingress.host }}
           {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_PUBLIC_URL" (dict "name" "TOKENPLACE_RELAY_PUBLIC_URL" "value" (printf "https://%s" .Values.ingress.host)) }}
           {{- end }}

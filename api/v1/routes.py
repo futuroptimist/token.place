@@ -542,6 +542,15 @@ def _handle_text_completion_request(data):
                 status_code=400,
             )
 
+        if _has_desktop_bridge_intent(data.get("metadata")):
+            return format_error_response(
+                "Desktop bridge requests must use encrypted chat completions.",
+                error_type="invalid_request_error",
+                param="metadata",
+                code="bridge_text_completions_unsupported",
+                status_code=400,
+            )
+
         requested_model_id = data.get("model")
         validate_required_fields(data, ["model"])
         validate_field_type(data, "model", str)

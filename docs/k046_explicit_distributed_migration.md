@@ -28,7 +28,10 @@ Both metadata markers (`inference_target=desktop_bridge_api_v1_e2ee` and
 `relay_path=api_v1_e2ee`) declare bridge intent. They cannot grant distributed
 permission. Full bridge intent requires a valid encrypted request and, after
 validation and moderation, explicit distributed mode. A single marker is inert.
-Under distributed mode, full bridge intent tightens fallback to false.
+Under distributed mode, full bridge intent tightens fallback to false. The
+legacy text completions endpoints (`/api/v1/completions` and
+`/v1/completions`) do not accept bridge intent, even if the request sets
+`encrypted`. Use the encrypted chat completions endpoint instead.
 
 Request Host, forwarded-host headers, peer address and metadata URLs never
 supply a destination. Loopback self-dispatch requires an operator-selected URL.
@@ -90,10 +93,14 @@ runtime is activated by this change.
 ## Explicit launch examples
 
 The canonical [relay chart](../charts/tokenplace/templates/deployment.yaml)
-defaults to `distributed`, fallback `0`, and profile `bridge`, using its existing
-same-pod internal URL. `env` and `extraEnv` overrides still apply afterward;
-an explicit `local` override remains local. Helm rendering and rollout have not
-been performed for this change.
+defaults to `distributed` only when `envFrom` is empty. When `envFrom` is
+configured, the chart leaves the mode unset so a ConfigMap or Secret can supply
+it without being shadowed. If none supplies it, the mode defaults to local
+unless the operator explicitly enables the bootstrap guardrail. To opt in to
+distributed routing, set the mode to `distributed` in the imported settings or
+via `env` or `extraEnv`. Explicit `env` overrides imported values, and
+`extraEnv` overrides both. The chart still defaults to fallback `0` and
+profile `bridge`, using its existing same-pod internal URL.
 
 Generic Docker and manual entrypoints remain mode-neutral. An operator choosing
 a bridge launch can use this example, replacing the synthetic destination with
@@ -127,7 +134,8 @@ prepared but not executed.
 | --- | --- | --- |
 | 400 | `distributed_routing_disabled` | Full valid bridge intent under explicit local mode. |
 | 400 | `explicit_distributed_mode_required` | Full valid bridge intent under unset/blank mode. |
-| 400 | `encrypted_request_required` | Plaintext claims full encrypted bridge intent. |
+| 400 | `encrypted_request_required` | Plaintext chat request claims full encrypted bridge intent. |
+| 400 | `bridge_text_completions_unsupported` | A legacy text completion claims full bridge intent. |
 | 400 | Existing envelope validation codes | Invalid encrypted envelope or decoded messages. |
 | 400 | `untrusted_relay_origin` | Strict bridge has no configured target. |
 | 503 | `invalid_compute_provider_configuration` | Unknown operator mode. |

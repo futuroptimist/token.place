@@ -77,6 +77,41 @@ def test_defaults_render_no_service_monitor_and_no_metrics_token() -> None:
     assert env["TOKENPLACE_METRICS_MODE"]["value"] == "normal"
 
 
+@pytest.mark.parametrize("reference_type", ("configMapRef", "secretRef"))
+def test_provider_mode_from_envfrom_is_not_shadowed(reference_type: str) -> None:
+    docs = _render("--set", f"envFrom[0].{reference_type}.name=operator-local-settings")
+    deployment = _kind(docs, "Deployment")[0]
+    relay = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert relay["envFrom"] == [{reference_type: {"name": "operator-local-settings"}}]
+    env = _env_by_name(deployment)
+    assert "TOKENPLACE_API_V1_COMPUTE_PROVIDER" not in env
+    assert env["TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK"]["value"] == "0"
+    assert env["TOKENPLACE_API_V1_DESTINATION_PROFILE"]["value"] == "bridge"
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ([], "distributed"),
+        (["--set", "env.TOKENPLACE_API_V1_COMPUTE_PROVIDER=local"], "local"),
+        (
+            [
+                "--set", "envFrom[0].configMapRef.name=operator-settings",
+                "--set", "env.TOKENPLACE_API_V1_COMPUTE_PROVIDER=local",
+                "--set", "extraEnv[0].name=TOKENPLACE_API_V1_COMPUTE_PROVIDER",
+                "--set", "extraEnv[0].value=distributed",
+            ],
+            "distributed",
+        ),
+    ],
+)
+def test_provider_mode_chart_default_and_explicit_override_precedence(
+    overrides: list[str], expected: str,
+) -> None:
+    deployment = _kind(_render(*overrides), "Deployment")[0]
+    assert _env_by_name(deployment)["TOKENPLACE_API_V1_COMPUTE_PROVIDER"]["value"] == expected
+
+
 @pytest.mark.parametrize("mode", ("normal", "degraded"))
 def test_metrics_mode_renders_reviewed_startup_value(mode: str) -> None:
     docs = _render("--set", f"metrics.mode={mode}")

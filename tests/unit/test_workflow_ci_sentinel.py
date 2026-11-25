@@ -740,7 +740,9 @@ def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_ins
     ], "ordinary desktop-operator PR validation must not start macOS jobs"
     assert "desktop-operator-packaged-inspect-python39-linux" in jobs
     python39_job = jobs["desktop-operator-packaged-inspect-python39-linux"]
-    assert python39_job["runs-on"] == "ubuntu-latest"
+    # Keep the runner that supplies Python 3.9 and the desktop WebKit driver.
+    assert python39_job["runs-on"] == "ubuntu-24.04"
+    assert jobs["desktop-operator-e2e"]["runs-on"] == "ubuntu-24.04"
     assert "3.9" == python39_job["steps"][1]["with"]["python-version"]
     assert "TOKEN_PLACE_INSPECT_ONLY" in yaml.dump(python39_job, sort_keys=True)
 

@@ -125,10 +125,6 @@ jobs:
         working-directory: desktop-tauri
         run: npm run build
 
-      - name: Build desktop binary (debug, no bundle)
-        working-directory: desktop-tauri
-        run: npm run tauri build -- --debug --no-bundle
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -156,6 +152,11 @@ jobs:
 
       - name: Run full Rust suite
         run: cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
+
+      # Cargo integration tests can overwrite target/debug with a dev-mode binary.
+      - name: Build desktop binary (debug, no bundle)
+        working-directory: desktop-tauri
+        run: npm run tauri build -- --debug --no-bundle
 
       - name: Run desktop operator UI e2e
         env:

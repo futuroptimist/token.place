@@ -752,6 +752,20 @@ def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_ins
     assert "test_desktop_no_relay_autostart_e2e.py" not in linux_runs
 
 
+def test_desktop_operator_builds_webview_binary_after_rust_tests() -> None:
+    workflow = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    steps = workflow["jobs"]["desktop-operator-e2e"]["steps"]
+    commands = [step.get("run", "") for step in steps]
+    rust_tests = [i for i, command in enumerate(commands) if "cargo test" in command]
+    tauri_build = commands.index("npm run tauri build -- --debug --no-bundle")
+    ui_test = commands.index("xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py")
+
+    assert rust_tests and max(rust_tests) < tauri_build < ui_test, (
+        "Cargo integration tests can replace the Tauri binary with a development "
+        "build. Build the binary with embedded frontend assets after Rust tests."
+    )
+
+
 def test_retired_legacy_electron_desktop_packaging_workflow_stays_removed() -> None:
     legacy_workflow = WORKFLOW_DIR / "desktop.yml"
     assert not legacy_workflow.exists(), (

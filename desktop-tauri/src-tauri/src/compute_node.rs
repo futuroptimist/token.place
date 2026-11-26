@@ -4627,6 +4627,9 @@ mod tests {
 
     #[test]
     fn benchmark_tokenizer_env_is_paired_validated_and_bridge_scoped() {
+        let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
+            .lock()
+            .expect("runtime bootstrap env test lock");
         let temp = TempDir::new().expect("tempdir");
         let request = temp.path().join("tokenizer-request.json");
         let evidence = temp.path().join("tokenizer-evidence.json");

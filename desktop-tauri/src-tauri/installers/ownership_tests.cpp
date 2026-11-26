@@ -72,9 +72,39 @@ int wmain(int argc, wchar_t** argv) {
             other.root = a + L"-separate";
             check(true, msi, a, {own, other}, false);
         }
+        auto check_removal = [&](bool expected, bool msi, const tp::wstring& target,
+                                 std::vector<tp::Owner> owners, const tp::wstring& identity) {
+            bool allowed = true;
+            try { tp::authorize_uninstall(msi, target, owners, identity); }
+            catch (const tp::Failure&) { allowed = false; }
+            tp::require(allowed == expected);
+            ++cases;
+        };
+        for (bool msi : {false, true}) {
+            const tp::Owner owner{msi, !msi, a, L"registered"};
+            const tp::Owner disjoint{!msi, msi, b, L"other"};
+            check_removal(true, msi, a, {owner}, owner.identity);
+            check_removal(true, msi, a, {owner, disjoint}, owner.identity);
+            check_removal(false, msi, a, {}, owner.identity);
+            check_removal(false, msi, b, {owner}, owner.identity);
+            check_removal(false, msi, a, {owner}, L"different");
+            check_removal(false, msi, a, {owner}, L"");
+            check_removal(false, msi, a, {owner, owner}, owner.identity);
+            check_removal(false, msi, a, {{msi, msi, a, owner.identity}}, owner.identity);
+            check_removal(false, msi, a, {{!msi, msi, a, owner.identity}}, owner.identity);
+        }
         auto root = tp::fs::absolute(argv[1]);
         tp::require(!tp::fs::exists(root));
         tp::fs::create_directories(root / L"exists");
+        tp::verify_uninstall_directory((root / L"exists").wstring() + L"\\");
+        ++cases;
+        for (auto invalid : {root / L"missing", root.root_path(), tp::fs::path(L"relative")}) {
+            bool rejected = false;
+            try { tp::verify_uninstall_directory(invalid.wstring()); }
+            catch (const tp::Failure&) { rejected = true; }
+            tp::require(rejected);
+            ++cases;
+        }
         for (auto unknown : {root / L"missing.exe", root / L"exists"}) {
             bool rejected = false;
             try { tp::process_image(unknown.wstring()); }

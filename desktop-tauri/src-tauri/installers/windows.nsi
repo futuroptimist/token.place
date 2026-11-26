@@ -425,16 +425,21 @@ Function TokenPlaceRefuse
   Quit
 FunctionEnd
 !define TOKEN_PLACE_RUNNING_MESSAGE "TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped."
-!macro TokenPlaceProcessGuard PREFIX
-Function ${PREFIX}TokenPlaceCheckProcesses
+!define TOKEN_PLACE_UNINSTALL_MESSAGE "TOKEN_PLACE_UNINSTALL_REFUSED: The registered token.place installation and its folder could not be verified. Confirm the install location or contact support before retrying. Nothing was removed."
+!macro TokenPlaceGuard PREFIX ACTION MODE MESSAGE
+Function ${PREFIX}${ACTION}
   Push $0
   ClearErrors
-  ExecWait '"$PLUGINSDIR\ownership.exe" --processes "$INSTDIR" "${MAINBINARYNAME}.exe"' $0
+  !if "${MODE}" == "uninstall"
+    ExecWait '"$PLUGINSDIR\ownership.exe" --uninstall "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe"' $0
+  !else
+    ExecWait '"$PLUGINSDIR\ownership.exe" --processes "$INSTDIR" "${MAINBINARYNAME}.exe"' $0
+  !endif
   ${If} ${Errors}
     StrCpy $0 1638
   ${EndIf}
   ${If} $0 != 0
-    DetailPrint "${TOKEN_PLACE_RUNNING_MESSAGE}"
+    DetailPrint "${MESSAGE}"
     System::Call 'kernel32::GetStdHandle(i -11)p.r0'
     ${If} $0 == 0
     ${OrIf} $0 == -1
@@ -443,21 +448,22 @@ Function ${PREFIX}TokenPlaceCheckProcesses
     ${EndIf}
     ${If} $0 != 0
     ${AndIf} $0 != -1
-      FileWrite $0 "${TOKEN_PLACE_RUNNING_MESSAGE}$\r$\n"
+      FileWrite $0 "${MESSAGE}$\r$\n"
     ${EndIf}
-    IfSilent tp_process_refusal
+    IfSilent tp_guard_refusal
     ${If} $PassiveMode != 1
-      MessageBox MB_OK|MB_ICONSTOP "${TOKEN_PLACE_RUNNING_MESSAGE}"
+      MessageBox MB_OK|MB_ICONSTOP "${MESSAGE}"
     ${EndIf}
-    tp_process_refusal:
+    tp_guard_refusal:
     SetErrorLevel 1638
     Quit
   ${EndIf}
   Pop $0
 FunctionEnd
 !macroend
-!insertmacro TokenPlaceProcessGuard ""
-!insertmacro TokenPlaceProcessGuard "un."
+!insertmacro TokenPlaceGuard "" TokenPlaceCheckProcesses processes "${TOKEN_PLACE_RUNNING_MESSAGE}"
+!insertmacro TokenPlaceGuard "un." TokenPlaceCheckProcesses processes "${TOKEN_PLACE_RUNNING_MESSAGE}"
+!insertmacro TokenPlaceGuard "un." TokenPlaceCheckOwnership uninstall "${TOKEN_PLACE_UNINSTALL_MESSAGE}"
 ; TOKEN_PLACE_GUARD_END
 
 Function .onInit
@@ -770,11 +776,13 @@ FunctionEnd
 
 Section Uninstall
   Call un.TokenPlaceCheckProcesses
+  Call un.TokenPlaceCheckOwnership
 
   !ifmacrodef NSIS_HOOK_PREUNINSTALL
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
+  Call un.TokenPlaceCheckOwnership
   Call un.TokenPlaceCheckProcesses
 
   ; Delete the app directory and its content from disk

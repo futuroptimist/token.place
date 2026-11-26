@@ -381,7 +381,8 @@ def test_msi_predecessor_policy_uses_registered_exact_identity_before_removal():
     assert 'database_property(session, database.value, L"ProductCode")' in source
     assert "MsiGetSummaryInformationW" in source
     verify = source.split("UINT __stdcall TokenPlaceVerify", 1)[1].split("UINT __stdcall TokenPlaceProcesses", 1)[0]
-    assert verify.index("tp::authorize") < verify.index("verify_predecessor_protection") < verify.index("return ERROR_SUCCESS")
+    install = verify.split("auto target = target_path(session)", 1)[1]
+    assert install.index("tp::authorize") < install.index("verify_predecessor_protection") < install.index("return ERROR_SUCCESS")
     assert "tp::predecessor_message" in verify
     harness = (ROOT / "desktop-tauri/scripts/test_windows_installer_coexistence.py").read_text(encoding="utf-8")
     assert 'seeds = {"msi": packages["msi"], "nsis": previous["nsis"]}' in harness
@@ -420,3 +421,28 @@ def test_msi_predecessor_diagnostics_preserve_refusal_and_summary_outputs():
     assert "INSTALLMESSAGE_INFO" in helper and "tp::require(false)" in helper
     assert 'L"registered-patches-empty"' in helper and "ERROR_NO_MORE_ITEMS" in helper
     assert "tp::verify_predecessor(installed, current, audited_predecessors, machine, clean)" in helper
+
+
+def test_full_uninstall_checks_ownership_before_mutation_in_both_formats():
+    nsis = (TEMPLATES / "windows.nsi").read_text(encoding="utf-8")
+    body = nsis.split("Section Uninstall\n", 1)[1].split("SectionEnd", 1)[0]
+    first, second = [match.start() for match in re.finditer(r"Call un.TokenPlaceCheckOwnership", body)]
+    assert first < body.index("NSIS_HOOK_PREUNINSTALL") < second < body.index('Delete "$INSTDIR')
+    assert '--uninstall "$INSTDIR" "${PRODUCTNAME}" "${MANUFACTURER}" "${MAINBINARYNAME}.exe"' in nsis
+    assert "TOKEN_PLACE_UNINSTALL_REFUSED" in nsis
+
+    wix = (TEMPLATES / "windows.wxs").read_text(encoding="utf-8")
+    block = wix.split("<!-- TOKEN_PLACE_GUARD_BEGIN -->", 1)[1].split("<!-- TOKEN_PLACE_GUARD_END -->", 1)[0]
+    root = ET.fromstring("<Product>" + block + "</Product>")
+    action = root.find("CustomAction[@Id='TokenPlaceVerify']")
+    assert action.attrib["Execute"] == "immediate" and action.attrib["Return"] == "check"
+    gate = root.find("InstallExecuteSequence/Custom[@Action='TokenPlaceVerify']")
+    assert gate.attrib["Before"] == "InstallInitialize" and gate.text == "1"
+
+    source = (TEMPLATES / "ownership.cpp").read_text(encoding="utf-8")
+    verify = source.split("UINT __stdcall TokenPlaceVerify", 1)[1].split("UINT __stdcall TokenPlaceProcesses", 1)[0]
+    remove = verify.split('L"REMOVE"', 1)[1].split("auto target = target_path(session)", 1)[0]
+    assert 'L"ALL"' in remove
+    assert 'database_property(session, database.value, L"ProductCode")' in remove
+    assert "tp::verify_uninstall_target(true" in remove and "tp::uninstall_message" in remove
+    assert 'L"--uninstall"' in source and "tp::verify_uninstall_target(false" in source

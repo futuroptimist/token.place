@@ -62,6 +62,16 @@ New NSIS uninstallers always preserve per-user settings and models because the
 namespace can be used by another installation. They no longer offer the delete
 app-data checkbox. Existing path-scoped shortcut removal remains in place.
 
+Full uninstalls require an intact, matching registration in the installer's
+scope and a matching resolved removal directory. A disjoint competing owner
+does not prevent uninstall. A missing or contradictory registration or a
+reparse-point removal path or subtree refuses with
+`TOKEN_PLACE_UNINSTALL_REFUSED` before removal. Resolve a damaged registration or
+folder through support before retrying. MSI checks full removal after
+`InstallValidate` and before `InstallInitialize`, using the authored ProductCode;
+NSIS checks before and after its pre-uninstall hook. The normal MSI and NSIS
+uninstall paths are exercised on the hosted Windows runner.
+
 These checks run immediately before mutation; they are not a system-wide lock
 against concurrent administrator changes. Test fixtures are disposable hosted
 Windows state. Single-owner harness assertions remain strict; mixed-owner tests
@@ -93,6 +103,7 @@ Native API references:
 - [MsiGetTargetPath](https://learn.microsoft.com/en-us/windows/win32/api/msiquery/nf-msiquery-msigettargetpathw)
 - [GetFinalPathNameByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
 - [CostFinalize sequencing](https://learn.microsoft.com/en-us/windows/win32/msi/costfinalize-action)
+- [Full removal sequencing](https://learn.microsoft.com/en-us/windows/win32/msi/remove)
 
 Running-app checks use Toolhelp discovery plus limited process-image queries.
 A matching main-executable basename with inaccessible/unknown identity refuses;

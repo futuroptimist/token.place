@@ -19,6 +19,7 @@ namespace tp {
 using std::wstring;
 namespace fs = std::filesystem;
 constexpr auto message = L"TOKEN_PLACE_COMPETING_INSTALLER: token.place desktop ownership could not be verified. Uninstall the existing version first, or choose an empty, separate installation folder. Your existing app, settings and models have not been changed.";
+constexpr auto uninstall_message = L"TOKEN_PLACE_UNINSTALL_REFUSED: The registered token.place installation and its folder could not be verified. Confirm the install location or contact support before retrying. Nothing was removed.";
 constexpr auto running_message = L"TOKEN_PLACE_APP_RUNNING: Close token.place before installing or uninstalling, then retry. The app may be running or its process identity could not be verified. No process was stopped.";
 constexpr auto predecessor_message = L"TOKEN_PLACE_UNSAFE_MSI_PREDECESSOR: Automatic upgrade of this token.place MSI is not supported because its shutdown protection could not be verified. Close token.place and uninstall the existing version first, then run this installer again. This attempt has not changed your existing app, settings or models and has not stopped any process.";
 // Pinned Tauri 2.10.1: UUIDv5(DNS, product_name + ".exe.app.x64").
@@ -186,6 +187,33 @@ bool authorize(bool msi, const wstring& target, const std::vector<Owner>& owners
     return false;
 }
 
+// Removal never inherits fresh-install or retained-upgrade authority.
+void authorize_uninstall(bool msi, const wstring& target, const std::vector<Owner>& owners,
+                         const wstring& identity) {
+    require(!target.empty() && !identity.empty());
+    require(authorize(msi, target, owners, false));
+    require(std::any_of(owners.begin(), owners.end(), [&](const Owner& owner) {
+        return owner.msi == msi && (msi ? !owner.current_user : owner.current_user) &&
+            equal(owner.root, target) && equal(owner.identity, identity);
+    }));
+}
+
+void verify_uninstall_directory(const wstring& target) {
+    // Require the actual removal path to be a directory without reparse-point
+    // components, before inspecting its contents. A volume root is not an app.
+    auto path = fs::path(target);
+    for (const auto& part : path.relative_path())
+        require(part != L"." && part != L"..");
+    if (!path.has_filename() && path != path.root_path()) path = path.parent_path();
+    require(path.is_absolute() && path.has_root_name() && path != path.root_path());
+    for (auto current = path; current != current.root_path(); current = current.parent_path()) {
+        DWORD attributes = GetFileAttributesW(current.c_str());
+        require(attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(attributes & FILE_ATTRIBUTE_REPARSE_POINT));
+    }
+    verify_owned_tree(path.wstring());
+}
+
 #ifndef TOKEN_PLACE_POLICY_TEST
 struct Key {
     HKEY value = nullptr;
@@ -298,6 +326,13 @@ std::vector<Owner> inventory(const wstring& name, const wstring& publisher,
         require(std::any_of(owners.begin(), owners.end(), [&](const Owner& owner) { return owner.msi && equal(owner.identity, product); }));
     return owners;
 }
+void verify_uninstall_target(bool msi, const wstring& target, const wstring& name,
+                             const wstring& publisher, const wstring& binary,
+                             const wstring& identity) {
+    authorize_uninstall(msi, canonical(target), inventory(name, publisher, binary), identity);
+    verify_uninstall_directory(target);
+}
+
 #endif
 } // namespace tp
 
@@ -430,6 +465,20 @@ extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceResolve(MSIHANDLE sess
 }
 extern "C" __declspec(dllexport) UINT __stdcall TokenPlaceVerify(MSIHANDLE session) {
     try {
+        // After InstallValidate, REMOVE reflects full feature removal even if
+        // selected in the UI. Use authored identity, not public MSI properties.
+        if (tp::equal(property(session, L"REMOVE"), L"ALL")) {
+            try {
+                MsiHandle database{MsiGetActiveDatabase(session)};
+                tp::require(database.value != 0);
+                tp::verify_uninstall_target(true, target_path(session),
+                    database_property(session, database.value, L"ProductName"),
+                    database_property(session, database.value, L"Manufacturer"),
+                    packaged_binary(session),
+                    database_property(session, database.value, L"ProductCode"));
+                return ERROR_SUCCESS;
+            } catch (...) { return refusal(session, tp::uninstall_message); }
+        }
         auto target = target_path(session);
         auto owners = tp::inventory(property(session, L"ProductName"), property(session, L"Manufacturer"), packaged_binary(session));
         auto own = related(session);
@@ -462,6 +511,10 @@ int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 4 && tp::equal(argv[1], L"--processes")) {
             tp::verify_not_running(argv[2], argv[3]);
+            return 0;
+        }
+        if (argc == 6 && tp::equal(argv[1], L"--uninstall")) {
+            tp::verify_uninstall_target(false, argv[2], argv[3], argv[4], argv[5], argv[3]);
             return 0;
         }
         tp::require(argc == 8);

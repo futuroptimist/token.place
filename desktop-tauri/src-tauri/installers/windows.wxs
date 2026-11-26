@@ -45,8 +45,8 @@
             <Custom Action="TokenPlaceResolve" Before="CostInitialize">NOT REMOVE~="ALL"</Custom>
             <!-- Includes uninstall; precedes FilesInUse and any old-product removal. -->
             <Custom Action="TokenPlaceProcesses" Before="InstallValidate">1</Custom>
-            <!-- Final resolved target, before MajorUpgrade removes any product. -->
-            <Custom Action="TokenPlaceVerify" Before="InstallInitialize">NOT REMOVE~="ALL"</Custom>
+            <!-- After removal mode is resolved; before InstallInitialize and file mutation. -->
+            <Custom Action="TokenPlaceVerify" Before="InstallInitialize">1</Custom>
         </InstallExecuteSequence>
         <!-- TOKEN_PLACE_GUARD_END -->
 
